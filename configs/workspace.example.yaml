@@ -1,0 +1,96 @@
+workspace_root: /data/omni3d
+random_seed: 42
+
+storage:
+  raw_root: /data/omni3d/raw
+  staging_root: /data/omni3d/staging
+  canonical_root: /data/omni3d/canonical
+  export_root: /data/omni3d/exports
+  catalog_path: /data/omni3d/catalog/catalog.duckdb
+
+runtime:
+  workers: 8
+  fail_fast: false
+  log_json: true
+  resume: true
+  remote:
+    host: null                        # SSH host (e.g. gpu-server, must be in ~/.ssh/config)
+    conda_env: null                   # conda env name on remote (e.g. sam3d)
+    work_dir: /tmp/guanwu_remote    # remote working directory
+    python: python3
+    conda_init: /root/miniconda3/etc/profile.d/conda.sh
+
+policies:
+  default_up_axis: Z
+  unit: meters
+  fail_on_unknown_license: false
+  generate_glb_preview: true
+  generate_mesh_stats: true
+  generate_pointcloud_preview: false
+  keep_raw_forever: true
+  allow_proxy_mesh_generation: true
+
+datasets:
+  scannetpp:
+    enabled: true
+    source:
+      mode: local
+      path: /datasets/scannetpp
+    splits: [train, val]
+
+  arkitscenes:
+    enabled: true
+    source:
+      mode: local
+      path: /datasets/ARKitScenes
+
+  objaverse_xl:
+    enabled: true
+    source:
+      mode: local
+      cache_dir: /datasets/objaverse_xl
+      object_ids_file: /data/lists/objaverse_sample.txt
+    filters:
+      max_objects: 10000
+      allowed_formats: [glb, gltf, obj]
+
+  partnet_mobility:
+    enabled: true
+    source:
+      mode: local
+      path: /datasets/partnet_mobility
+
+  maniskill3:
+    enabled: true
+    source:
+      mode: local
+      path: /datasets/maniskill3
+    options:
+      ingest_scene_assets: true
+      ingest_trajectories: true
+      render_derived_rgbd: false
+
+  robotwin2:
+    enabled: true
+    source:
+      mode: local
+      path: /datasets/robotwin2   # root of downloaded RoboTwin 2.0 dataset
+    options:
+      ingest_clean: true          # ingest clean-lighting episodes
+      ingest_randomized: true     # ingest domain-randomized episodes
+      remote_engine_export: true  # required: replay episodes on runtime.remote.host
+      remote_robotwin_root: null  # absolute RoboTwin repo path on the remote GPU machine
+      remote_source_root: null    # optional mirrored dataset root on remote; skips episode upload
+      remote_embodiment: aloha-agilex
+      remote_usdc_fps: 30.0
+      remote_video_fps: 10
+      remote_default_seed: 0      # fallback when seed.txt is unavailable
+      render_views: false         # render generated camera videos during materialize
+      generated_static_camera_count: 0
+      generated_trajectory_camera_count: 0
+      generated_camera_motion: random-static
+      camera_trajectory_kind: orbit360
+      trajectory_kind_mode: fixed # fixed or random trajectory kind selection
+      view_resolution: [768, 768]
+      camera_seed: null           # optional fixed seed for generated camera sampling
+      force_remote_export: false  # rerun even when scene.usdz/views match current options

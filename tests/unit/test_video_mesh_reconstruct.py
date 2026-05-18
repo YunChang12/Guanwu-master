@@ -148,6 +148,27 @@ def test_mesh_reconstruct_attempts_all_zaiwu_movable_rigid_candidates(tmp_path: 
     assert set(meshes_payload) == {"obj_000005"}
 
 
+def test_mesh_reconstruct_uses_extended_sam3d_per_object_timeout(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    captured: dict[str, float] = {}
+
+    class _FakeAdapter:
+        pass
+
+    def _fake_build_adapter(settings, *, materialization_root, materialization_mode, per_object_timeout_sec):  # type: ignore[no-untyped-def]
+        _ = settings, materialization_root, materialization_mode
+        captured["per_object_timeout_sec"] = float(per_object_timeout_sec)
+        return _FakeAdapter()
+
+    monkeypatch.setattr(
+        "guanwu.video.project.executor.build_zaiwu_sam3d_adapter",
+        _fake_build_adapter,
+    )
+
+    assert isinstance(executor._get_zaiwu_sam3d(), _FakeAdapter)
+    assert captured["per_object_timeout_sec"] == 300.0
+
+
 def test_mesh_reconstruct_errors_when_sam3d_service_not_ready(tmp_path: Path, monkeypatch) -> None:
     executor = _build_mesh_reconstruct_executor(tmp_path)
 

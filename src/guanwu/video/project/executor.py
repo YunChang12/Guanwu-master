@@ -62,7 +62,7 @@ from guanwu.video.project.services import PipelineServices, VideoFrameReader, bu
 from guanwu.video.registry import NATURAL_VIDEO_DATASET_ID
 
 
-_ZAIWU_SAM3D_PER_OBJECT_TIMEOUT_SEC = 90.0
+_ZAIWU_SAM3D_PER_OBJECT_TIMEOUT_SEC = 300.0
 _POSE_OPTIMIZE_MIN_BBOX_AREA_PX = 5000.0
 _POSE_MATCH_MIN_BBOX_AREA_PX = 500.0
 _POSE_TRACK_SCALE_PRIOR_MIN_FRAMES = 2
@@ -907,7 +907,11 @@ class ProjectExecutor:
                 )
                 slam_result = adapter.run_slam(
                     video_path=self.context.config.project.input_video,
-                    fps_override=15.0,
+                    export_depth_every_frame=True,
+                    depth_export_stride=1,
+                    pose_export_stride=1,
+                    extract_every_input_frame=True,
+                    frame_stride=1,
                 )
                 if pit_cfg.depth_provider == "wildgs" and not slam_result.get("depth_maps_dir"):
                     raise RuntimeError(

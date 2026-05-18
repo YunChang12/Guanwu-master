@@ -903,6 +903,11 @@ class ZaiwuWildGSAdapter:
         intrinsics: dict | None = None,
         fps_override: float | None = None,
         run_id: str | None = None,
+        export_depth_every_frame: bool | None = None,
+        depth_export_stride: int | None = None,
+        pose_export_stride: int | None = None,
+        extract_every_input_frame: bool | None = None,
+        frame_stride: int | None = None,
     ) -> dict[str, Any]:
         if not video_path:
             raise ValueError("Zaiwu WildGS jobs currently require video_path input.")
@@ -917,6 +922,16 @@ class ZaiwuWildGSAdapter:
             payload["fps_override"] = float(fps_override)
         if run_id:
             payload["run_id"] = str(run_id)
+        if export_depth_every_frame is not None:
+            payload["export_depth_every_frame"] = bool(export_depth_every_frame)
+        if depth_export_stride is not None:
+            payload["depth_export_stride"] = int(depth_export_stride)
+        if pose_export_stride is not None:
+            payload["pose_export_stride"] = int(pose_export_stride)
+        if extract_every_input_frame is not None:
+            payload["extract_every_input_frame"] = bool(extract_every_input_frame)
+        if frame_stride is not None:
+            payload["frame_stride"] = int(frame_stride)
 
         result = self.gateway.run_service_job(
             self.service_id,

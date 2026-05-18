@@ -1209,6 +1209,11 @@ class MCPWildGSAdapter:
         intrinsics: dict | None = None,
         fps_override: float | None = None,
         run_id: str | None = None,
+        export_depth_every_frame: bool | None = None,
+        depth_export_stride: int | None = None,
+        pose_export_stride: int | None = None,
+        extract_every_input_frame: bool | None = None,
+        frame_stride: int | None = None,
     ) -> dict[str, Any]:
         """Run WildGS-SLAM and return local paths to the outputs.
 
@@ -1272,6 +1277,16 @@ class MCPWildGSAdapter:
             args["fps_override"] = fps_override
         if run_id:
             args["run_id"] = run_id
+        if export_depth_every_frame is not None:
+            args["export_depth_every_frame"] = bool(export_depth_every_frame)
+        if depth_export_stride is not None:
+            args["depth_export_stride"] = int(depth_export_stride)
+        if pose_export_stride is not None:
+            args["pose_export_stride"] = int(pose_export_stride)
+        if extract_every_input_frame is not None:
+            args["extract_every_input_frame"] = bool(extract_every_input_frame)
+        if frame_stride is not None:
+            args["frame_stride"] = int(frame_stride)
 
         logger.info("[MCPWildGS] Calling wildgs_run_slam ...")
         res = sync_call_mcp(self.url, "wildgs_run_slam", args, sse_read_timeout=7200)

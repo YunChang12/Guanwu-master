@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tarfile
 
 import httpx
 
@@ -247,6 +248,51 @@ class _FakeArtifactJobGateway(_FakeJobGateway):
         return super().download_bytes(service_id, file_id)
 
 
+class _FakeWildGSGateway(_FakeJobGateway):
+    def run_service_job(  # type: ignore[override]
+        self,
+        service_id: str,
+        operation: str,
+        payload: dict,
+        *,
+        requested_by: str = "guanwu",
+        execution_labels: dict[str, str] | None = None,
+        timeout_sec: float | None = None,
+    ) -> dict:
+        self.jobs.append((service_id, operation, payload))
+        if service_id == "services.wildgs_slam" and operation == "wildgs_run_slam":
+            return {
+                "camera_poses_file_id": "outputs/camera_poses.jsonl",
+                "depth_maps_file_id": "outputs/depth_maps.tar.gz",
+                "num_frames": 2,
+                "slam_quality": 0.9,
+            }
+        return super().run_service_job(
+            service_id,
+            operation,
+            payload,
+            requested_by=requested_by,
+            execution_labels=execution_labels,
+            timeout_sec=timeout_sec,
+        )
+
+    def download_bytes(self, service_id: str, file_id: str) -> bytes:  # type: ignore[override]
+        self.downloads.append((service_id, file_id))
+        if file_id == "outputs/camera_poses.jsonl":
+            return b'{"frame":0}\n{"frame":1}\n'
+        if file_id == "outputs/depth_maps.tar.gz":
+            import io
+
+            payload = io.BytesIO()
+            with tarfile.open(fileobj=payload, mode="w:gz") as handle:
+                data = b"fake"
+                info = tarfile.TarInfo("depth_maps/00000.npy")
+                info.size = len(data)
+                handle.addfile(info, io.BytesIO(data))
+            return payload.getvalue()
+        return super().download_bytes(service_id, file_id)
+
+
 def test_zaiwu_gateway_resolves_service_sse_url_after_start() -> None:
     client = _FakeGateway()
 
@@ -254,6 +300,36 @@ def test_zaiwu_gateway_resolves_service_sse_url_after_start() -> None:
 
     assert sse_url == "http://zaiwu.local:19007/sse"
     assert client.start_calls == 1
+
+
+def test_zaiwu_wildgs_adapter_requests_dense_depth_export(tmp_path) -> None:
+    gateway = _FakeWildGSGateway()
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+    adapter = ZaiwuWildGSAdapter(
+        gateway,
+        service_id="services.wildgs_slam",
+        output_root=str(tmp_path / "wildgs"),
+    )
+
+    adapter.run_slam(
+        video_path=str(video_path),
+        fps_override=15.0,
+        export_depth_every_frame=True,
+        depth_export_stride=1,
+        pose_export_stride=1,
+        extract_every_input_frame=True,
+        frame_stride=1,
+    )
+
+    assert gateway.jobs
+    _service_id, operation, payload = gateway.jobs[-1]
+    assert operation == "wildgs_run_slam"
+    assert payload["export_depth_every_frame"] is True
+    assert payload["depth_export_stride"] == 1
+    assert payload["pose_export_stride"] == 1
+    assert payload["extract_every_input_frame"] is True
+    assert payload["frame_stride"] == 1
 
 
 def test_zaiwu_gateway_runs_job_until_success() -> None:

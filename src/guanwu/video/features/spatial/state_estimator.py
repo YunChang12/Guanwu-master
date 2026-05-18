@@ -10,6 +10,7 @@ from guanwu.video.core.instance_matching import bbox_iou, deduplicate_instances,
 from guanwu.video.core.schema import AffordanceState, Geometry, ObjectNode, PhysicsState, Pose3D, Provenance, SemanticState
 from guanwu.video.core.types import DetectedInstance, FrameDetections
 from guanwu.video.core.logger import get_logger
+from guanwu.video.features.spatial.alignment_utils import resolve_depth_map_path
 
 logger = get_logger(__name__)
 
@@ -309,9 +310,8 @@ class WildGSDepthProvider:
     def _load(self, frame_idx: int) -> Any:
         if frame_idx in self._cache:
             return self._cache[frame_idx]
-        # WildGS uses 5-digit zero-padded names
-        path = self._dir / f"{frame_idx:05d}.npy"
-        if not path.exists():
+        path = resolve_depth_map_path(self._dir, frame_idx)
+        if path is None:
             return None
         depth = self._np.load(str(path))
         self._cache[frame_idx] = depth

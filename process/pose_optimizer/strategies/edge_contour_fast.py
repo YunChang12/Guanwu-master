@@ -967,6 +967,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         report["render_validation"] = render_validation_outputs
     if args.profile_timings:
         report["profiling"] = fast.combine_profile_stats([proxy_evaluator, full_evaluator])
+    report["refined_pose_candidates"] = [
+        temporal_fast.refined_pose_candidate_summary(item[0], t_world_from_cam=t_world_from_cam)
+        for item in refined_results
+    ]
     with (output_dir / "optimization_report.json").open("w", encoding="utf-8") as f:
         json.dump(fast.to_builtin(report), f, indent=2)
     fast.cleanup_result_images(output_dir)

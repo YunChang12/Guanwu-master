@@ -1054,6 +1054,10 @@ def compute_bbox_area_trend_from_geometry_lift(
                     "center_x": 0.5 * (x1 + x2),
                     "center_y": 0.5 * (y1 + y2),
                     "area": width * height,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
                 }
             )
             break
@@ -1068,6 +1072,7 @@ def compute_bbox_area_trend_from_geometry_lift(
         return None
     frames = frames[valid]
     areas = areas[valid]
+    valid_observations = [row for row, keep in zip(observations, valid.tolist()) if keep]
     log_areas = np.log(np.maximum(1.0, areas))
     centered_frames = frames - float(frame_idx)
     try:
@@ -1076,6 +1081,20 @@ def compute_bbox_area_trend_from_geometry_lift(
         return None
     ratio = float(areas[-1] / max(1.0, areas[0]))
     confidence = float(np.clip(abs(math.log(max(1e-6, ratio))) / math.log(1.8), 0.0, 1.0))
+    diffs = np.diff(areas)
+    nonzero_diffs = diffs[np.abs(diffs) > max(1.0, float(np.median(areas)) * 0.01)]
+    if int(nonzero_diffs.size) > 0:
+        direction_sign = 1.0 if slope >= 0.0 else -1.0
+        monotonicity = float(np.mean((nonzero_diffs * direction_sign) >= 0.0))
+    else:
+        monotonicity = 1.0
+    tail_count = min(3, len(valid_observations))
+    tail_rows = valid_observations[-tail_count:] if tail_count > 0 else []
+    truncated_tail = any(float(row.get("y2", 0.0) or 0.0) >= 358.0 for row in tail_rows)
+    if truncated_tail:
+        confidence *= 0.5
+    if monotonicity < 0.75:
+        confidence *= max(0.25, monotonicity)
     if abs(slope) < 0.015 or confidence < 0.15:
         direction = "stable"
     elif slope > 0.0:
@@ -1093,6 +1112,8 @@ def compute_bbox_area_trend_from_geometry_lift(
         "last_area": float(areas[-1]),
         "area_ratio": ratio,
         "sample_count": int(len(areas)),
+        "monotonicity": monotonicity,
+        "truncated_tail": bool(truncated_tail),
     }
 
 

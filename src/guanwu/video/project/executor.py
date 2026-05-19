@@ -64,8 +64,31 @@ from guanwu.video.registry import NATURAL_VIDEO_DATASET_ID
 
 _ZAIWU_SAM3D_PER_OBJECT_TIMEOUT_SEC = 300.0
 _POSE_OPTIMIZE_MIN_BBOX_AREA_PX = 5000.0
-_POSE_MATCH_MIN_BBOX_AREA_PX = 500.0
+_POSE_MATCH_MIN_BBOX_AREA_PX = 800.0
 _POSE_TRACK_SCALE_PRIOR_MIN_FRAMES = 2
+_EDGE_POSE_HEADING_METRIC_KEYS = (
+    "heading_prior_score",
+    "heading_prior_angle_error_deg",
+    "heading_prior_confidence",
+    "heading_planar_score",
+    "heading_front_sign_enabled",
+    "heading_front_sign_confidence",
+    "heading_candidate_forward_sign",
+    "heading_semantic_front_sign",
+    "heading_tail_light_front_sign",
+    "heading_tail_light_flipped",
+    "heading_front_sign_hard_rejected",
+    "heading_front_angle_penalty",
+    "heading_front_sign_penalty",
+    "heading_depth_trend_score",
+    "heading_depth_trend_direction",
+    "heading_depth_trend_confidence",
+    "heading_front_depth_cam",
+    "heading_prior_projected_vector_image",
+    "heading_prior_target_vector_image",
+    "effective_heading_prior_weight",
+    "effective_front_sign_penalty_weight",
+)
 
 
 class ProjectExecutor:
@@ -1330,11 +1353,14 @@ class ProjectExecutor:
         per_frame_path = out_dir / "per_frame_object_poses.json"
         mesh_canon_path = out_dir / "mesh_canonicalization.json"
         quality_path = out_dir / "pose_quality_report.json"
+        refined_traj_path = out_dir / "refined_object_trajectories.json"
         manifest_path = out_dir / "pose_optimizer_manifest.json"
+        refined_object_trajectories = self._refined_trajectories_from_pose_tracks(object_pose_tracks)
         self._json_dump(object_tracks_path, object_pose_tracks)
         self._json_dump(per_frame_path, per_frame_object_poses)
         self._json_dump(mesh_canon_path, mesh_canonicalization)
         self._json_dump(quality_path, pose_quality_report)
+        self._json_dump(refined_traj_path, refined_object_trajectories)
         self._json_dump(manifest_path, manifest)
         outputs = {
             "pose_optimizer_manifest": str(manifest_path),
@@ -1342,6 +1368,7 @@ class ProjectExecutor:
             "per_frame_object_poses": str(per_frame_path),
             "mesh_canonicalization": str(mesh_canon_path),
             "pose_quality_report": str(quality_path),
+            "refined_object_trajectories": str(refined_traj_path),
             "road_geometry": str(road_geometry_path),
             "tasks_dir": str(out_dir / "tasks"),
             "results_dir": str(out_dir / "results"),
@@ -1375,6 +1402,103 @@ class ProjectExecutor:
         if value in {"depth", "depth_temporal", "depth_icp", "depth_icp_temporal"}:
             return "depth_icp_temporal"
         return "edge_contour_fast_temporal"
+
+    @staticmethod
+    def _refined_trajectories_from_pose_tracks(object_pose_tracks: dict) -> dict[str, list[dict]]:
+        refined: dict[str, list[dict]] = {}
+        if not isinstance(object_pose_tracks, dict):
+            return refined
+        for obj_id, track in object_pose_tracks.items():
+            if not isinstance(track, dict):
+                continue
+            pose_source = str(track.get("pose_source") or "pose_optimize")
+            frames_out: list[dict] = []
+            for frame in track.get("frames", []) or []:
+                if not isinstance(frame, dict):
+                    continue
+                if not ProjectExecutor._valid_vec3_like(frame.get("centroid_world")):
+                    continue
+                if not ProjectExecutor._valid_vec3_like(frame.get("scale")):
+                    continue
+                rotation = frame.get("rotation_matrix") or track.get("rotation_matrix")
+                if not isinstance(rotation, list) or len(rotation) != 3:
+                    continue
+                center = [float(v) for v in frame["centroid_world"]]
+                scale = [float(v) for v in frame["scale"]]
+                try:
+                    frame_id = int(frame.get("frame_id") or 0)
+                except Exception:
+                    frame_id = 0
+                if frame_id <= 0:
+                    continue
+                refined_frame = {
+                    "frame_id": frame_id,
+                    "timestamp_sec": float(frame.get("timestamp_sec", 0.0) or 0.0),
+                    "centroid_world": center,
+                    "position_xyz": center,
+                    "rotation_matrix": rotation,
+                    "orientation_quat": frame.get("orientation_quat")
+                    or ProjectExecutor._rotation_matrix_to_quat_xyzw(rotation),
+                    "scale": scale,
+                    "confidence": float(frame.get("confidence", 0.0) or 0.0),
+                    "trajectory_source": "pose_optimize",
+                    "pose_source": str(frame.get("source") or pose_source),
+                    "geometry_status": frame.get("geometry_status", frame.get("source", pose_source)),
+                    "quality": frame.get("quality", {}),
+                }
+                if frame.get("T_world_from_object") is not None:
+                    refined_frame["T_world_from_object"] = frame.get("T_world_from_object")
+                frames_out.append(refined_frame)
+            if frames_out:
+                frames_out.sort(key=lambda item: int(item.get("frame_id") or 0))
+                refined[str(obj_id)] = frames_out
+        return refined
+
+    @staticmethod
+    def _merge_refined_object_trajectories(coarse: dict | None, refined: dict | None) -> dict[str, list[dict]]:
+        merged: dict[str, dict[int, dict]] = {}
+        for source_name, payload in (("geometry_lift", coarse), ("pose_optimize", refined)):
+            if not isinstance(payload, dict):
+                continue
+            for obj_id, records in payload.items():
+                if not isinstance(records, list):
+                    continue
+                obj_frames = merged.setdefault(str(obj_id), {})
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    try:
+                        frame_id = int(record.get("frame_id") or record.get("frame_idx") or 0)
+                    except Exception:
+                        continue
+                    if frame_id <= 0:
+                        continue
+                    normalized = dict(record)
+                    normalized["frame_id"] = frame_id
+                    if "timestamp_sec" not in normalized and "timestamp" in normalized:
+                        normalized["timestamp_sec"] = normalized.get("timestamp")
+                    if source_name == "pose_optimize":
+                        normalized["trajectory_source"] = "pose_optimize"
+                    else:
+                        normalized.setdefault("trajectory_source", "geometry_lift")
+                    obj_frames[frame_id] = normalized
+        return {
+            obj_id: [frames[fid] for fid in sorted(frames)]
+            for obj_id, frames in sorted(merged.items())
+            if frames
+        }
+
+    @staticmethod
+    def _prepare_usd_object_mesh_vertices(vertices):
+        import numpy as np
+
+        verts = np.asarray(vertices, dtype=np.float64)
+        if verts.ndim != 2 or verts.shape[1] != 3:
+            return verts.copy()
+        # Pose optimizer rotations are solved in the mesh's native local
+        # axes.  Do not mirror local Z here; that would make a visually
+        # correct pose render as front/back reversed in USD.
+        return verts - verts.mean(axis=0, keepdims=True)
 
     @staticmethod
     def _pose_resume_results() -> bool:
@@ -1555,14 +1679,11 @@ class ProjectExecutor:
                 scene_up=scene_up,
                 road_geometry=road_geometry,
             )
-            track_scale_prior = self._pose_track_scale_prior(
-                seed_track,
-                source="seed_track_median_scale",
-            )
-            if track_scale_prior:
-                for seed in seed_track:
-                    if isinstance(seed, dict):
-                        seed["scale"] = list(track_scale_prior["scale"])
+            # Seed tracks come from depth/object-track bootstrapping and can be
+            # very noisy for small or truncated vehicles.  Keep them as pose
+            # initializers only; scale priors are promoted later from accepted
+            # high-quality pose optimizer results.
+            track_scale_prior = None
             mesh_basis = seed_meta.get("mesh_basis")
             if mesh_basis is None:
                 mesh_basis = np.eye(3, dtype=np.float64).tolist()
@@ -1576,6 +1697,12 @@ class ProjectExecutor:
             object_failed = 0
             previous_accepted: dict | None = None
             frame_records: dict[str, dict] = {}
+            candidate_records_by_frame: dict[int, list[dict]] = {}
+            trajectory_selection_summary: dict = {
+                "enabled": target_window_radius > 0,
+                "applied": False,
+                "reason": "not_evaluated",
+            }
 
             for frame_id in frame_ids:
                 inst = self._get_instance_for_frame(obj_id, int(frame_id), detection_frames)
@@ -1694,6 +1821,25 @@ class ProjectExecutor:
                     timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
                     run_info=run_info,
                 )
+                candidate_records = self._edge_pose_candidate_records_from_report(
+                    obj_id=obj_id,
+                    frame_id=int(frame_id),
+                    report=report,
+                    report_path=report_path,
+                    result_dir=result_dir,
+                    task_path=task_path,
+                    timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
+                    run_info=run_info,
+                )
+                accepted_candidate_records = []
+                for candidate_record in candidate_records:
+                    candidate_report = self._pose_optimizer_report_from_candidate(report, candidate_record)
+                    candidate_decision = self._pose_optimizer_acceptance(candidate_report)
+                    candidate_record["base_acceptance"] = candidate_decision
+                    if candidate_decision.get("accepted"):
+                        accepted_candidate_records.append(candidate_record)
+                if accepted_candidate_records:
+                    candidate_records_by_frame[int(frame_id)] = accepted_candidate_records
                 pose_record["status"] = "accepted" if decision.get("accepted") else "rejected"
                 pose_record["reason"] = decision.get("reason", "")
 
@@ -1702,17 +1848,10 @@ class ProjectExecutor:
                     accepted_records.append(pose_record)
                     previous_accepted = pose_record
                     updated_scale_prior = self._pose_track_scale_prior(
-                        [
-                            *seed_track,
-                            *[
-                                {
-                                    "frame_id": int(rec.get("frame_id") or 0),
-                                    "scale": (rec.get("pose") or {}).get("scale"),
-                                }
-                                for rec in accepted_records
-                            ],
-                        ],
+                        accepted_records,
                         source="accepted_track_median_scale",
+                        require_high_quality=True,
+                        max_frame_id=int(frame_id),
                     )
                     if updated_scale_prior:
                         track_scale_prior = updated_scale_prior
@@ -1720,10 +1859,27 @@ class ProjectExecutor:
                 else:
                     rejected_frames += 1
                     object_rejected += 1
-                    rejected_dir = self._rename_rejected_pose_result_dir(results_dir, result_dir, task_id)
-                    pose_record["output_dir"] = str(rejected_dir)
-                    pose_record["report"] = str(rejected_dir / "optimization_report.json")
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
+
+            if candidate_records_by_frame:
+                old_accepted_count = len(accepted_records)
+                old_rejected_count = object_rejected
+                selected_records, trajectory_selection_summary = self._select_edge_pose_candidate_trajectory(
+                    candidate_records_by_frame,
+                    target_frame_id=target_frame_id,
+                )
+                if selected_records and any(int(rec.get("frame_id") or 0) == target_frame_id for rec in selected_records):
+                    accepted_records = selected_records
+                    for selected in accepted_records:
+                        frame_key = f"frame_{int(selected.get('frame_id') or 0):06d}"
+                        selected["status"] = "accepted"
+                        selected["reason"] = "trajectory_selected"
+                        frame_records[frame_key] = selected
+                    new_accepted_count = len(accepted_records)
+                    new_rejected_count = max(0, object_attempted - object_failed - new_accepted_count)
+                    accepted_frames += new_accepted_count - old_accepted_count
+                    rejected_frames += new_rejected_count - old_rejected_count
+                    object_rejected = new_rejected_count
 
             target_record = next(
                 (record for record in accepted_records if int(record.get("frame_id") or 0) == target_frame_id),
@@ -1743,7 +1899,11 @@ class ProjectExecutor:
                 skipped_objects += 1
                 continue
 
-            accepted_records, trajectory_refinement = self._stabilize_edge_pose_records(accepted_records)
+            accepted_records, stabilization_summary = self._stabilize_edge_pose_records(accepted_records)
+            trajectory_refinement = {
+                "selection": trajectory_selection_summary,
+                "stabilization": stabilization_summary,
+            }
             frames = [self._edge_pose_track_frame(record) for record in accepted_records]
             frames = [frame for frame in frames if frame is not None]
             frames.sort(key=lambda item: int(item.get("frame_id") or 0))
@@ -1833,11 +1993,14 @@ class ProjectExecutor:
         per_frame_path = out_dir / "per_frame_object_poses.json"
         mesh_canon_path = out_dir / "mesh_canonicalization.json"
         quality_path = out_dir / "pose_quality_report.json"
+        refined_traj_path = out_dir / "refined_object_trajectories.json"
         manifest_path = out_dir / "pose_optimizer_manifest.json"
+        refined_object_trajectories = self._refined_trajectories_from_pose_tracks(object_pose_tracks)
         self._json_dump(object_tracks_path, object_pose_tracks)
         self._json_dump(per_frame_path, per_frame_object_poses)
         self._json_dump(mesh_canon_path, mesh_canonicalization)
         self._json_dump(quality_path, pose_quality_report)
+        self._json_dump(refined_traj_path, refined_object_trajectories)
         self._json_dump(manifest_path, manifest)
 
         result_dir_count = sum(1 for item in results_dir.iterdir() if item.is_dir()) if results_dir.exists() else 0
@@ -1847,6 +2010,7 @@ class ProjectExecutor:
             "per_frame_object_poses": str(per_frame_path),
             "mesh_canonicalization": str(mesh_canon_path),
             "pose_quality_report": str(quality_path),
+            "refined_object_trajectories": str(refined_traj_path),
             "road_geometry": str(road_geometry_path),
             "tasks_dir": str(tasks_dir),
             "results_dir": str(results_dir),
@@ -3399,6 +3563,21 @@ class ProjectExecutor:
     ) -> dict:
         pose = report.get("optimized_corrected_pose_world", {})
         metrics = report.get("metrics", {})
+        record_metrics = {
+            "score": metrics.get("score"),
+            "mask_iou": metrics.get("mask_iou"),
+            "bbox_iou": metrics.get("bbox_iou"),
+            "bbox_center_error_px": metrics.get("bbox_center_error_px"),
+            "ground_contact_max_abs_m": metrics.get("ground_contact_max_abs_m"),
+            "top_distance_mean_m": metrics.get("top_distance_mean_m"),
+            "top_distance_min_m": metrics.get("top_distance_min_m"),
+            "roof_above_ground": metrics.get("roof_above_ground"),
+            "bbox_bottom_distance_m": metrics.get("bbox_bottom_distance_m"),
+            "upright_angle_error_deg": metrics.get("upright_angle_error_deg"),
+            "ground_hard_reject": metrics.get("ground_hard_reject"),
+            "projected_bbox": metrics.get("projected_bbox"),
+        }
+        record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
         return {
             "object_id": obj_id,
             "frame_id": int(frame_id),
@@ -3411,12 +3590,52 @@ class ProjectExecutor:
                 "rotation_matrix": pose.get("rotation_matrix"),
                 "scale": pose.get("scale"),
             },
-            "metrics": {
+            "metrics": record_metrics,
+            **run_info,
+        }
+
+    def _edge_pose_candidate_records_from_report(
+        self,
+        *,
+        obj_id: str,
+        frame_id: int,
+        report: dict,
+        report_path: Path,
+        result_dir: Path,
+        task_path: Path,
+        timestamp_sec: float,
+        run_info: dict,
+    ) -> list[dict]:
+        candidates = report.get("refined_pose_candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return [
+                self._edge_pose_record_from_report(
+                    obj_id=obj_id,
+                    frame_id=frame_id,
+                    report=report,
+                    report_path=report_path,
+                    result_dir=result_dir,
+                    task_path=task_path,
+                    timestamp_sec=timestamp_sec,
+                    run_info=run_info,
+                )
+            ]
+
+        records: list[dict] = []
+        for index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            pose = candidate.get("optimized_corrected_pose_world")
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+            if not isinstance(pose, dict):
+                continue
+            record_metrics = {
                 "score": metrics.get("score"),
                 "mask_iou": metrics.get("mask_iou"),
                 "bbox_iou": metrics.get("bbox_iou"),
                 "bbox_center_error_px": metrics.get("bbox_center_error_px"),
                 "ground_contact_max_abs_m": metrics.get("ground_contact_max_abs_m"),
+                "ground_contact_mean_abs_m": metrics.get("ground_contact_mean_abs_m"),
                 "top_distance_mean_m": metrics.get("top_distance_mean_m"),
                 "top_distance_min_m": metrics.get("top_distance_min_m"),
                 "roof_above_ground": metrics.get("roof_above_ground"),
@@ -3424,9 +3643,45 @@ class ProjectExecutor:
                 "upright_angle_error_deg": metrics.get("upright_angle_error_deg"),
                 "ground_hard_reject": metrics.get("ground_hard_reject"),
                 "projected_bbox": metrics.get("projected_bbox"),
-            },
-            **run_info,
-        }
+                "temporal_score": metrics.get("temporal_score"),
+                "temporal_loss": metrics.get("temporal_loss"),
+                "visible_mask_iou": metrics.get("visible_mask_iou"),
+                "visible_bbox_iou": metrics.get("visible_bbox_iou"),
+                "visible_contour_score": metrics.get("visible_contour_score"),
+                "final_selection_mode": metrics.get("final_selection_mode"),
+            }
+            record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
+            record = {
+                "object_id": obj_id,
+                "frame_id": int(frame_id),
+                "timestamp_sec": float(timestamp_sec),
+                "task": str(task_path),
+                "output_dir": str(result_dir),
+                "report": str(report_path),
+                "pose": {
+                    "translation_world": pose.get("translation_world"),
+                    "rotation_matrix": pose.get("rotation_matrix"),
+                    "scale": pose.get("scale"),
+                },
+                "metrics": record_metrics,
+                "candidate_index": int(index),
+                "candidate_rank": candidate.get("candidate_rank"),
+                "initializer_metadata": candidate.get("initializer_metadata", {}),
+                **run_info,
+            }
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _pose_optimizer_report_from_candidate(base_report: dict, candidate_record: dict) -> dict:
+        report = dict(base_report)
+        metrics = dict(base_report.get("metrics", {}) if isinstance(base_report.get("metrics"), dict) else {})
+        metrics.update(candidate_record.get("metrics", {}) if isinstance(candidate_record.get("metrics"), dict) else {})
+        report["metrics"] = metrics
+        report["optimized_corrected_pose_world"] = candidate_record.get("pose", {})
+        if candidate_record.get("initializer_metadata"):
+            report["best_initializer_metadata"] = candidate_record.get("initializer_metadata")
+        return report
 
     @staticmethod
     def _edge_pose_track_frame(record: dict) -> dict | None:
@@ -3503,13 +3758,27 @@ class ProjectExecutor:
         }
 
     @staticmethod
-    def _pose_track_scale_prior(records: list[dict], *, source: str) -> dict | None:
+    def _pose_track_scale_prior(
+        records: list[dict],
+        *,
+        source: str,
+        require_high_quality: bool = False,
+        max_frame_id: int | None = None,
+    ) -> dict | None:
         import numpy as np
 
         valid = []
         frame_ids = []
         for record in records or []:
             if not isinstance(record, dict):
+                continue
+            if max_frame_id is not None:
+                try:
+                    if int(record.get("frame_id") or 0) > int(max_frame_id):
+                        continue
+                except Exception:
+                    continue
+            if require_high_quality and not ProjectExecutor._pose_scale_prior_record_is_high_quality(record):
                 continue
             scale = record.get("scale")
             if scale is None and isinstance(record.get("pose"), dict):
@@ -3536,6 +3805,166 @@ class ProjectExecutor:
             "scale": [value, value, value],
             "sample_count": len(valid),
             "frame_ids": sorted({fid for fid in frame_ids if fid > 0}),
+        }
+
+    @staticmethod
+    def _pose_scale_prior_record_is_high_quality(record: dict) -> bool:
+        if record.get("status") not in {None, "accepted"}:
+            return False
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        try:
+            mask_iou = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
+            bbox_iou = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            center_error = float(metrics.get("bbox_center_error_px") or 1e9)
+        except Exception:
+            return False
+        return mask_iou >= 0.55 and bbox_iou >= 0.55 and center_error <= 80.0
+
+    @staticmethod
+    def _pose_optimizer_temporal_fallback_acceptance(report: dict, rejection: dict | None) -> dict:
+        reason = str((rejection or {}).get("reason") or "")
+        if "temporal_" not in reason:
+            return {"accepted": False, "reason": reason or "not_temporal_rejection"}
+        metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
+        try:
+            mask_iou = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
+            bbox_iou = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            center_error = float(metrics.get("bbox_center_error_px") or 1e9)
+        except Exception:
+            return {"accepted": False, "reason": "invalid_visual_fallback_metrics"}
+        if mask_iou >= 0.55 and bbox_iou >= 0.55 and center_error <= 80.0:
+            return {
+                "accepted": True,
+                "reason": f"visual_fallback_after_{reason}",
+                "low_confidence": True,
+            }
+        return {
+            "accepted": False,
+            "reason": f"visual_fallback_rejected_after_{reason}",
+            "low_confidence": True,
+        }
+
+    @staticmethod
+    def _edge_pose_heading_cost(metrics: dict) -> float:
+        try:
+            angle = float(metrics.get("heading_prior_angle_error_deg"))
+        except Exception:
+            return 0.0
+        if not math.isfinite(angle):
+            return 0.0
+        if not bool(metrics.get("heading_front_sign_enabled")):
+            return 0.0
+        try:
+            confidence = float(metrics.get("heading_front_sign_confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        if confidence <= 0.0:
+            return 0.0
+        if bool(metrics.get("heading_front_sign_hard_rejected")):
+            return 10.0
+        wrong_sign_penalty = max(0.0, angle - 90.0) / 90.0
+        soft_angle_penalty = min(angle, 90.0) / 180.0
+        return confidence * (4.0 * wrong_sign_penalty + 0.3 * soft_angle_penalty)
+
+    @staticmethod
+    def _select_edge_pose_candidate_trajectory(
+        frame_candidates: dict[int, list[dict]],
+        *,
+        target_frame_id: int,
+    ) -> tuple[list[dict], dict]:
+        import copy
+        import numpy as np
+
+        frames = sorted(int(fid) for fid, candidates in frame_candidates.items() if candidates)
+        if not frames:
+            return [], {"enabled": True, "applied": False, "reason": "no_candidates"}
+
+        def unary_cost(candidate: dict) -> float:
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+            score = float(metrics.get("score") or 0.0)
+            mask = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
+            bbox = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            center = float(metrics.get("bbox_center_error_px") or 120.0)
+            ground = metrics.get("ground_contact_max_abs_m")
+            ground_penalty = 0.0
+            if ground is not None:
+                ground_penalty = min(2.0, max(0.0, float(ground) - 0.12) * 2.0)
+            heading_penalty = ProjectExecutor._edge_pose_heading_cost(metrics)
+            return -score - 0.7 * mask - 0.35 * bbox + 0.004 * min(center, 200.0) + ground_penalty + heading_penalty
+
+        def transition_cost(prev: dict, cur: dict) -> float:
+            prev_pose = prev.get("pose") if isinstance(prev.get("pose"), dict) else {}
+            cur_pose = cur.get("pose") if isinstance(cur.get("pose"), dict) else {}
+            cost = 0.0
+            dt = max(1, abs(int(cur.get("frame_id") or 0) - int(prev.get("frame_id") or 0)))
+            if ProjectExecutor._valid_vec3_like(prev_pose.get("translation_world")) and ProjectExecutor._valid_vec3_like(cur_pose.get("translation_world")):
+                prev_t = np.asarray(prev_pose["translation_world"], dtype=np.float64)
+                cur_t = np.asarray(cur_pose["translation_world"], dtype=np.float64)
+                jump = float(np.linalg.norm(cur_t - prev_t)) / float(dt)
+                cost += min(12.0, (jump / 0.8) ** 2)
+            prev_r = prev_pose.get("rotation_matrix")
+            cur_r = cur_pose.get("rotation_matrix")
+            if isinstance(prev_r, list) and isinstance(cur_r, list):
+                jump_deg = ProjectExecutor._rotation_geodesic_deg(cur_r, prev_r)
+                if math.isfinite(jump_deg):
+                    cost += min(16.0, (jump_deg / 25.0) ** 2)
+                    if jump_deg > 90.0:
+                        cost += 6.0
+            if ProjectExecutor._valid_vec3_like(prev_pose.get("scale")) and ProjectExecutor._valid_vec3_like(cur_pose.get("scale")):
+                prev_s = float(np.median(np.asarray(prev_pose["scale"], dtype=np.float64)))
+                cur_s = float(np.median(np.asarray(cur_pose["scale"], dtype=np.float64)))
+                ratio = max(prev_s, cur_s) / max(1e-8, min(prev_s, cur_s))
+                cost += min(9.0, (math.log(max(ratio, 1e-8)) / 0.14) ** 2)
+            return cost
+
+        dp: list[list[float]] = []
+        parent: list[list[int | None]] = []
+        first = frames[0]
+        first_candidates = frame_candidates[first]
+        dp.append([unary_cost(candidate) for candidate in first_candidates])
+        parent.append([None for _ in first_candidates])
+        for frame_index, frame_id in enumerate(frames[1:], start=1):
+            candidates = frame_candidates[frame_id]
+            previous_candidates = frame_candidates[frames[frame_index - 1]]
+            row: list[float] = []
+            parent_row: list[int | None] = []
+            for candidate in candidates:
+                costs = [
+                    dp[frame_index - 1][prev_index] + transition_cost(previous, candidate)
+                    for prev_index, previous in enumerate(previous_candidates)
+                ]
+                best_prev = int(np.argmin(costs)) if costs else 0
+                row.append(unary_cost(candidate) + (costs[best_prev] if costs else 0.0))
+                parent_row.append(best_prev)
+            dp.append(row)
+            parent.append(parent_row)
+
+        last_index = int(np.argmin(dp[-1]))
+        selected_indices = [last_index]
+        for frame_index in range(len(frames) - 1, 0, -1):
+            prev_index = parent[frame_index][selected_indices[-1]]
+            selected_indices.append(0 if prev_index is None else int(prev_index))
+        selected_indices.reverse()
+
+        selected: list[dict] = []
+        for frame_id, index in zip(frames, selected_indices):
+            record = copy.deepcopy(frame_candidates[frame_id][index])
+            record["trajectory_selection"] = {
+                "enabled": True,
+                "candidate_index": int(index),
+                "dp_cost": float(dp[frames.index(frame_id)][index]),
+            }
+            selected.append(record)
+
+        return selected, {
+            "enabled": True,
+            "applied": True,
+            "method": "viterbi_candidate_trajectory",
+            "target_frame_id": int(target_frame_id),
+            "frame_ids": frames,
+            "selected_frame_count": len(selected),
+            "total_cost": float(min(dp[-1])),
         }
 
     @staticmethod
@@ -3761,12 +4190,17 @@ class ProjectExecutor:
                 "target_window_radius": int(target_window_radius),
             }
         else:
+            heading_window = 8
+            if target_window_radius is not None:
+                heading_window = max(1, int(target_window_radius))
             heading_prior = self._motion_heading_prior_for_track(
                 obj_id=obj_id,
                 frame_id=frame_id,
                 detection_frames=detection_frames,
+                window=heading_window,
             )
             if heading_prior:
+                heading_prior["target_window_radius"] = int(heading_window)
                 context["heading_prior"] = heading_prior
 
         road_plane = select_road_plane_for_frame(road_geometry, int(frame_id))
@@ -6161,9 +6595,7 @@ class ProjectExecutor:
             # Mesh vertices: SAM3D uses OpenGL convention (Y=up, -Z=forward).
             # USD also uses Y=up. But we flipped Z for world positions (WildGS Z=forward
             # → USD Z=-forward), so mesh Z must also be flipped to match the scene.
-            verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-            verts = verts - verts.mean(axis=0)
-            verts[:, 2] = -verts[:, 2]  # flip Z to match USD convention
+            verts = self._prepare_usd_object_mesh_vertices(obj_mesh.vertices)
 
             visual = UsdGeom.Xform.Define(stage, f"{obj_path}/Visual")
             vis_xf = UsdGeom.Xformable(visual.GetPrim())
@@ -6275,9 +6707,13 @@ class ProjectExecutor:
 
         object_trajectories: dict[str, list[dict]] = {}
         trajectory_path = geometry.outputs.get("object_trajectories")
+        pose_artifact = self.context.artifacts.get("pose.optimize")
+        refined_path = pose_artifact.outputs.get("refined_object_trajectories") if pose_artifact else None
+        refined_traj = self._json_load(refined_path) if refined_path and Path(refined_path).exists() else {}
         if trajectory_path:
             raw_traj = self._json_load(trajectory_path)
             if isinstance(raw_traj, dict):
+                raw_traj = self._merge_refined_object_trajectories(raw_traj, refined_traj)
                 for oid, track in raw_traj.items():
                     if not isinstance(track, list):
                         continue
@@ -6404,6 +6840,14 @@ class ProjectExecutor:
         pit_snapshot["vlm_priors"] = pit_snapshot["object_attrs"]
         pit_snapshot["physics_dynamics"] = self._json_load(dynamics.outputs["physics_dynamics"])
         pit_snapshot["alignment_frames"] = list(geometry_summary.get("frames", []))
+        pose_artifact = self.context.artifacts.get("pose.optimize")
+        refined_path = pose_artifact.outputs.get("refined_object_trajectories") if pose_artifact else None
+        if refined_path and Path(refined_path).exists():
+            refined_traj = self._json_load(refined_path)
+            raw_traj_path = geometry.outputs.get("object_trajectories")
+            raw_traj = self._json_load(raw_traj_path) if raw_traj_path else {}
+            pit_snapshot["object_trajectories"] = self._merge_refined_object_trajectories(raw_traj, refined_traj)
+            pit_snapshot["trajectory_source"] = "pose_optimize_refined"
 
         # Populate static background from WildGS for scene.export
         if geometry.outputs.get("wildgs_static_map"):
@@ -6576,6 +7020,16 @@ class ProjectExecutor:
 
         out_dir = self.context.stage_output_dir("materialize")
         workspace = self._workspace_config()
+        geometry_summary = self._json_load(geometry.outputs["summary"])
+        pose_artifact = self.context.artifacts.get("pose.optimize")
+        refined_path = pose_artifact.outputs.get("refined_object_trajectories") if pose_artifact else None
+        if refined_path and Path(refined_path).exists():
+            refined_traj = self._json_load(refined_path)
+            raw_traj_path = geometry.outputs.get("object_trajectories")
+            raw_traj = self._json_load(raw_traj_path) if raw_traj_path else {}
+            geometry_summary = dict(geometry_summary)
+            geometry_summary["object_trajectories"] = self._merge_refined_object_trajectories(raw_traj, refined_traj)
+            geometry_summary["object_trajectories_source"] = "pose_optimize_refined"
         report = materialize_video_project(
             project_root=self.context.paths.root,
             canonical_root=workspace.storage.canonical_root,
@@ -6585,7 +7039,7 @@ class ProjectExecutor:
             frame_index=self._json_load(frame_sample.outputs["frame_index"]),
             object_index=self._json_load(object_index.outputs["objects"]),
             object_attrs=self._json_load(object_attr.outputs["object_attrs"]),
-            geometry_summary=self._json_load(geometry.outputs["summary"]),
+            geometry_summary=geometry_summary,
             mesh_manifest=self._json_load(mesh.outputs["sam3d_meshes"]),
         )
         report_path = out_dir / "materialize_report.json"

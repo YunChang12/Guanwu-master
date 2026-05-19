@@ -681,6 +681,11 @@ def compute_road_and_heading_score(
         expected = -1.0 if area_trend.get("direction") == "approaching" else 1.0
         depth_score = float(np.clip(0.5 * (1.0 + expected * front_depth), 0.0, 1.0))
         trend_conf = float(np.clip(float(area_trend.get("confidence", 0.0) or 0.0), 0.0, 1.0))
+        trend_monotonicity = float(np.clip(float(area_trend.get("monotonicity", 1.0) or 0.0), 0.0, 1.0))
+        trend_reliable = (
+            trend_monotonicity >= float(getattr(args, "front_sign_depth_trend_min_monotonicity", 0.75))
+            and not bool(area_trend.get("truncated_tail"))
+        )
         penalty_weight = float(getattr(args, "front_sign_depth_trend_penalty", 0.45))
         front_sign_penalty = max(
             float(result.get("heading_front_sign_penalty") or 0.0),
@@ -692,6 +697,8 @@ def compute_road_and_heading_score(
             and not bool(truncation_info.get("is_truncated"))
             and front_confidence >= float(getattr(args, "front_sign_hard_gate_min_confidence", 0.25))
             and trend_conf >= float(getattr(args, "tail_light_motion_consistency_min_confidence", 0.60))
+            and trend_reliable
+            and float(result.get("heading_prior_angle_error_deg") or 180.0) >= float(getattr(args, "front_sign_depth_trend_hard_gate_min_heading_angle_deg", 45.0))
             and depth_score < depth_gate_score_min
         ):
             hard_reject = True
@@ -700,6 +707,9 @@ def compute_road_and_heading_score(
                 "heading_depth_trend_score": depth_score,
                 "heading_depth_trend_direction": area_trend.get("direction"),
                 "heading_depth_trend_confidence": trend_conf,
+                "heading_depth_trend_monotonicity": trend_monotonicity,
+                "heading_depth_trend_reliable": trend_reliable,
+                "heading_depth_trend_truncated_tail": bool(area_trend.get("truncated_tail")),
                 "heading_front_depth_cam": front_depth,
                 "heading_front_sign_penalty": front_sign_penalty,
                 "heading_front_sign_hard_rejected": hard_reject,
@@ -2229,6 +2239,33 @@ def candidate_satisfies_ground_constraint(result: dict[str, Any], args: argparse
     return float(mean_raw) <= mean_limit and float(max_raw) <= max_limit
 
 
+def front_sign_selection_penalty(result: dict[str, Any]) -> float:
+    if not bool(result.get("heading_front_sign_enabled")):
+        return 0.0
+    try:
+        angle = float(result.get("heading_prior_angle_error_deg"))
+    except Exception:
+        return 0.0
+    if not math.isfinite(angle):
+        return 0.0
+    try:
+        confidence = float(result.get("heading_front_sign_confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    if confidence <= 0.0:
+        return 0.0
+    if bool(result.get("heading_front_sign_hard_rejected")):
+        return 10.0
+    wrong_sign = max(0.0, angle - 90.0) / 90.0
+    soft_angle = min(angle, 90.0) / 180.0
+    return confidence * (0.5 * wrong_sign + 0.05 * soft_angle)
+
+
+def front_sign_rank_score(result: dict[str, Any]) -> float:
+    return float(result.get("score", -1e9)) - front_sign_selection_penalty(result)
+
+
 def choose_best_refined_result(
     refined_results: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -2240,7 +2277,11 @@ def choose_best_refined_result(
         bool(getattr(args, "final_ground_constrained_selection_enabled", True))
         and bool(truncation_info.get("is_truncated"))
     ):
-        return max(refined_results, key=lambda item: float(item.get("score", -1e9)))
+        selected = max(refined_results, key=front_sign_rank_score)
+        selected["final_front_sign_rank_score"] = front_sign_rank_score(selected)
+        selected["final_front_sign_selection_penalty"] = front_sign_selection_penalty(selected)
+        selected["final_selection_mode"] = "front_sign_consistent_rank"
+        return selected
     feasible = [item for item in refined_results if candidate_satisfies_ground_constraint(item, args)]
     if not feasible:
         selected = max(refined_results, key=lambda item: float(item.get("score", -1e9)))
@@ -2304,6 +2345,86 @@ def choose_best_refined_result(
             "min_quality_gate": min_quality_gate,
         }
     return max(visual_pool, key=lambda item: float(item.get("final_ground_constrained_rank_score", -1e9)))
+
+
+def refined_pose_candidate_summary(
+    result: dict[str, Any],
+    *,
+    t_world_from_cam: np.ndarray,
+) -> dict[str, Any]:
+    """Return a JSON-friendly pose candidate summary for window-level selection."""
+
+    uniform_scale = fast.make_uniform_scale(
+        fast.scale_to_uniform_scalar(np.asarray(result["scale"], dtype=np.float64))
+    )
+    translation_world, rotation_world = fast.camera_pose_to_world_pose(
+        np.asarray(t_world_from_cam, dtype=np.float64),
+        np.asarray(result["translation_cam"], dtype=np.float64),
+        np.asarray(result["rotation_cam"], dtype=np.float64),
+    )
+    metric_keys = [
+        "score",
+        "base_geometry_score",
+        "geometry_score",
+        "final_score",
+        "mask_iou",
+        "soft_mask_iou",
+        "bbox_iou",
+        "bbox_center_error_px",
+        "projected_bbox",
+        "temporal_score",
+        "temporal_loss",
+        "track_scale_prior_score",
+        "track_scale_prior_loss",
+        "track_scale_prior_value",
+        "edge_score",
+        "visible_mask_iou",
+        "visible_soft_mask_iou",
+        "visible_bbox_iou",
+        "visible_bbox_center_error_px",
+        "visible_contour_score",
+        "visible_profile_score",
+        "truncated_visual_quality_gate",
+        "ground_contact_score",
+        "ground_contact_mean_abs_m",
+        "ground_contact_max_abs_m",
+        "ground_gate_passed",
+        "ground_gate_rejected",
+        "bbox_bottom_distance_m",
+        "upright_score",
+        "upright_angle_error_deg",
+        "upright_gate_passed",
+        "upright_gate_rejected",
+        "heading_prior_score",
+        "heading_prior_angle_error_deg",
+        "heading_front_sign_enabled",
+        "heading_front_sign_confidence",
+        "heading_candidate_forward_sign",
+        "heading_semantic_front_sign",
+        "heading_tail_light_front_sign",
+        "heading_front_sign_hard_rejected",
+        "heading_front_sign_penalty",
+        "heading_front_angle_penalty",
+        "final_selection_mode",
+        "final_ground_constrained_selected",
+        "final_ground_constrained_rank_score",
+    ]
+    metrics = {key: result.get(key) for key in metric_keys if key in result}
+    return {
+        "candidate_rank": result.get("candidate_rank"),
+        "initializer_metadata": result.get("initializer_metadata", {}),
+        "optimized_camera_pose": {
+            "translation_cam": result["translation_cam"],
+            "rotation_cam": result["rotation_cam"],
+            "scale": uniform_scale,
+        },
+        "optimized_corrected_pose_world": {
+            "translation_world": translation_world,
+            "rotation_matrix": rotation_world,
+            "scale": uniform_scale,
+        },
+        "metrics": metrics,
+    }
 
 
 def save_temporal_edge_debug(
@@ -2950,6 +3071,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         report["render_validation"] = render_validation_outputs
     if args.profile_timings:
         report["profiling"] = fast.combine_profile_stats([proxy_evaluator, full_evaluator])
+    report["refined_pose_candidates"] = [
+        refined_pose_candidate_summary(item[0], t_world_from_cam=t_world_from_cam)
+        for item in refined_results
+    ]
     with (output_dir / "optimization_report.json").open("w", encoding="utf-8") as f:
         json.dump(fast.to_builtin(report), f, indent=2)
     fast.cleanup_result_images(output_dir)

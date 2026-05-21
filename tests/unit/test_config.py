@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from guanwu.core.config import WorkspaceConfig, load_config, StorageConfig
+from process.pose_optimizer.config import config_to_argv
 
 
 def test_default_config():
@@ -61,3 +62,7 @@ def test_dataset_config_defaults():
     cfg = WorkspaceConfig()
     # No datasets configured by default
     assert cfg.datasets == {}
+
+
+def test_pose_optimizer_config_to_argv_keeps_negative_axis_values() -> None:
+    assert config_to_argv({"world_up_axis": "-y"}) == ["--world_up_axis=-y"]

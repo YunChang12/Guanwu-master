@@ -9,9 +9,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import cv2
+import numpy as np
 
 from guanwu.core.config import WorkspaceConfig
 from guanwu.storage.catalog import Catalog
@@ -34,6 +37,10 @@ from guanwu.video.features.spatial.road_geometry import (
     estimate_road_geometry,
     intersect_camera_ray_with_plane,
     select_road_plane_for_frame,
+)
+from guanwu.video.features.spatial.scene_background_assets import (
+    generate_target_frame_background_assets,
+    load_background_asset_meshes,
 )
 from guanwu.video.features.simulation.usd_coordinate_convention import (
     USDCoordinateConvention,
@@ -1004,6 +1011,23 @@ class ProjectExecutor:
             "object_trajectories": str(object_traj_path),
         }
         self._json_dump(summary_path, summary_payload)
+        background_assets: dict = {}
+        try:
+            background_assets = generate_target_frame_background_assets(
+                summary_path=summary_path,
+                output_dir=out_dir / "background_assets",
+                target_frame_id=3,
+                depth_maps_dir=wildgs_outputs.get("depth_maps_dir"),
+                camera_trajectory_path=camera_path,
+                clean_depth_estimator=self._build_clean_background_depth_estimator(out_dir / "background_assets"),
+                grid_stride=4,
+            )
+            _logger.info(
+                "[geometry.lift] Generated target-frame background assets: %s",
+                background_assets.get("manifest_path"),
+            )
+        except Exception as exc:
+            _logger.warning("[geometry.lift] Target-frame background asset generation failed (non-fatal): %s", exc)
         outputs = {
             "summary": str(summary_path),
             "frames_dir": str(frames_root),
@@ -1020,16 +1044,112 @@ class ProjectExecutor:
             outputs["wildgs_depth_maps"] = wildgs_outputs["depth_maps_dir"]
         if wildgs_outputs.get("plots_dir"):
             outputs["wildgs_plots"] = wildgs_outputs["plots_dir"]
-        if wildgs_outputs.get("mesh_result", {}).get("mesh_dir"):
+        if wildgs_outputs.get("static_map_dir"):
+            outputs["wildgs_background_mesh"] = wildgs_outputs["static_map_dir"]
+        elif wildgs_outputs.get("mesh_result", {}).get("mesh_dir"):
             outputs["wildgs_background_mesh"] = wildgs_outputs["mesh_result"]["mesh_dir"]
+        if background_assets.get("manifest_path"):
+            outputs["background_assets_manifest"] = str(background_assets["manifest_path"])
+            outputs["background_assets_mesh_dir"] = str(background_assets["mesh_dir"])
         result_summary = {
             "frame_count": len(frame_entries),
             "object_count": len(latest_objects),
             "camera_samples": len(latest_snapshot.get("camera_trajectory", [])),
             "camera_provider": latest_snapshot.get("camera_provider", pit_cfg.camera_provider),
             "wildgs_slam_quality": wildgs_outputs.get("slam_quality"),
+            "background_assets_available": bool(background_assets.get("manifest_path")),
         }
         return self._base_result("geometry.lift", result_summary, outputs)
+
+    def _build_clean_background_depth_estimator(self, output_dir: Path):
+        if self._provider_mode() != "zaiwu":
+            return None
+        settings = self.context.config.settings
+        if not getattr(settings.zaiwu, "enabled", False):
+            return None
+
+        def estimate(clean_rgb_path: Path) -> dict[str, Any] | None:
+            return self._estimate_clean_background_depth_with_zaiwu(clean_rgb_path, output_dir=output_dir)
+
+        return estimate
+
+    def _estimate_clean_background_depth_with_zaiwu(self, clean_rgb_path: Path, *, output_dir: Path) -> dict[str, Any] | None:
+        service_id = str(self.context.config.settings.zaiwu.depth_service or "services.depth_anything3")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        video_path = output_dir / "_clean_target_rgb_for_depth.mp4"
+        depth_path = output_dir / "clean_target_depth_depth_anything3.npy"
+        try:
+            self._write_single_frame_depth_video(clean_rgb_path, video_path)
+            gateway = build_zaiwu_gateway_client(self.context.config.settings)
+            video_file_id = gateway.upload_file(service_id, video_path)
+            result = gateway.run_service_job(
+                service_id,
+                "estimate_from_video",
+                payload={"video_file_id": video_file_id, "sample_every_n": 1},
+                timeout_sec=max(1800.0, float(self.context.config.settings.zaiwu.job_timeout_sec or 0.0)),
+            )
+            output_file_id = str(result.get("output_file_id") or result.get("result_file_id") or "")
+            if not output_file_id:
+                _logger.warning("[geometry.lift] Depth Anything3 returned no depth artifact for clean background: %s", result)
+                return None
+            data = gateway.download_bytes(service_id, output_file_id)
+            depth_arr = self._decode_depth_anything_result(data)
+            if depth_arr is None:
+                _logger.warning("[geometry.lift] Depth Anything3 clean background artifact is not a valid depth array")
+                return None
+            np.save(depth_path, depth_arr.astype(np.float32))
+            return {
+                "depth_path": str(depth_path),
+                "source": "depth_anything3_clean_target_rgb",
+                "quality": {
+                    "depth_service": service_id,
+                    "depth_frame_count": int(1 if depth_arr.ndim == 2 else depth_arr.shape[0]),
+                    "depth_artifact_file_id": output_file_id,
+                },
+            }
+        except Exception as exc:
+            _logger.warning("[geometry.lift] Depth Anything3 clean background depth failed; falling back to WildGS depth: %s", exc)
+            return None
+
+    @staticmethod
+    def _write_single_frame_depth_video(image_path: Path, video_path: Path, *, fps: float = 1.0) -> None:
+        rgb = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if rgb is None:
+            raise ValueError(f"Failed to read clean background RGB for depth: {image_path}")
+        height, width = rgb.shape[:2]
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open temporary depth video writer: {video_path}")
+        try:
+            writer.write(rgb)
+        finally:
+            writer.release()
+
+    @staticmethod
+    def _decode_depth_anything_result(data: bytes):
+        import io
+
+        try:
+            arr = np.load(io.BytesIO(data))
+        except Exception:
+            tmp = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+            tmp_path = Path(tmp.name)
+            try:
+                tmp.write(data)
+                tmp.close()
+                arr = np.load(str(tmp_path))
+            finally:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+                tmp_path.unlink(missing_ok=True)
+        arr = np.asarray(arr)
+        if arr.ndim == 3:
+            arr = arr[0]
+        if arr.ndim != 2:
+            return None
+        return arr
 
     def _run_mesh_reconstruct(self) -> dict:
         geometry = self.context.artifacts.get("geometry.lift")
@@ -1123,7 +1243,7 @@ class ProjectExecutor:
             wildgs_poses=wildgs_poses,
             wildgs_K=wildgs_K,
             detection_frames=detection_frames,
-            world_up_axis="y",
+            world_up_axis="-y",
         )
         road_geometry_path = out_dir / "road_geometry.json"
         self._json_dump(road_geometry_path, road_geometry)
@@ -1178,7 +1298,6 @@ class ProjectExecutor:
                 skipped += 1
                 continue
             verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-            verts = verts - verts.mean(axis=0, keepdims=True)
 
             track_records = [
                 rec for rec in obj_traj.get(obj_id, [])
@@ -1496,9 +1615,9 @@ class ProjectExecutor:
         if verts.ndim != 2 or verts.shape[1] != 3:
             return verts.copy()
         # Pose optimizer rotations are solved in the mesh's native local
-        # axes.  Do not mirror local Z here; that would make a visually
-        # correct pose render as front/back reversed in USD.
-        return verts - verts.mean(axis=0, keepdims=True)
+        # axes and translation is the transform of that same local origin.
+        # Re-centering here changes the solved ground contact in scene export.
+        return verts.copy()
 
     @staticmethod
     def _pose_resume_results() -> bool:
@@ -1613,7 +1732,6 @@ class ProjectExecutor:
                 skipped_objects += 1
                 continue
             verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-            verts = verts - verts.mean(axis=0, keepdims=True)
 
             target_inst = self._get_instance_for_frame(obj_id, target_frame_id, detection_frames)
             target_bbox = (target_inst or {}).get("bbox_xyxy") or (target_inst or {}).get("bbox")
@@ -2074,10 +2192,10 @@ class ProjectExecutor:
         if candidates:
             up = np.mean(candidates, axis=0)
         else:
-            up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
         norm = float(np.linalg.norm(up))
         if norm < 1e-6:
-            up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
         else:
             up = up / norm
         return up
@@ -2151,13 +2269,13 @@ class ProjectExecutor:
         extents = np.ptp(np.asarray(verts, dtype=np.float64), axis=0)
         order = np.argsort(extents)
         # The only reliable semantic prior for current SAM3D vehicle meshes:
-        # local -Y points toward the roof. Keep this fixed everywhere.
+        # local +Y points toward the roof/up. Keep this fixed everywhere.
         up_idx = 1
         forward_idx = int(roles.get("forward_axis_idx", int(order[-1])))
         if forward_idx == up_idx:
             forward_idx = int(order[-1] if int(order[-1]) != up_idx else order[-2])
         roles["up_axis_idx"] = up_idx
-        roles["up_axis_sign"] = -1.0
+        roles["up_axis_sign"] = 1.0
         roles["forward_axis_idx"] = forward_idx
         # Front/back cannot be inferred reliably from bbox motion alone.  Use
         # the positive long axis as the primary hypothesis and keep the
@@ -2166,7 +2284,7 @@ class ProjectExecutor:
         roles["forward_axis_sign"] = forward_sign
 
         local_up = np.zeros(3, dtype=np.float64)
-        local_up[up_idx] = -1.0
+        local_up[up_idx] = 1.0
         local_forward = np.zeros(3, dtype=np.float64)
         local_forward[forward_idx] = forward_sign
         local_right = np.cross(local_up, local_forward)
@@ -2803,6 +2921,9 @@ class ProjectExecutor:
 
         wildgs_poses, wildgs_K = self._load_wildgs_poses(geometry)
         bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh"))
+        bg_meshes = load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
+        if not bg_meshes:
+            bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
 
         geo_summary = self._json_load(geometry.outputs["summary"])
         detection_frames = geo_summary.get("frames", [])
@@ -2817,7 +2938,14 @@ class ProjectExecutor:
         frame_scene_manifest_path = out_dir / "frame_scene_manifest.json"
 
         scene_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        if bg_mesh_path:
+        if bg_meshes:
+            for bg_name, bg_path in bg_meshes:
+                bg = trimesh.load(str(bg_path), force="mesh")
+                scene.add_geometry(bg, node_name=f"background_{bg_name}")
+                if bg_name == "road":
+                    scene_up = self._estimate_scene_up(np.asarray(bg.vertices, dtype=np.float64))
+                _logger.info("[scene.compose] Background %s: %d verts", bg_name, len(bg.vertices))
+        elif bg_mesh_path:
             bg = trimesh.load(str(bg_mesh_path), force="mesh")
             scene.add_geometry(bg, node_name="background")
             scene_up = self._estimate_scene_up(np.asarray(bg.vertices, dtype=np.float64))
@@ -2826,6 +2954,9 @@ class ProjectExecutor:
         pose_tracks = self._load_pose_track_outputs()
         if pose_tracks:
             selected_frame_id = self._pose_target_frame_id()
+            background_target_frame_id = self._background_assets_target_frame_id(geometry)
+            if background_target_frame_id is not None:
+                selected_frame_id = background_target_frame_id
             if selected_frame_id is None:
                 selected_frame_id = self._select_pose_track_scene_frame(pose_tracks.get("per_frame", {}))
             scene_manifest = self._compose_scene_from_pose_tracks(
@@ -2842,12 +2973,16 @@ class ProjectExecutor:
             self._json_dump(frame_scene_manifest_path, scene_manifest["frame_manifest"])
 
             glb_path = out_dir / "composed_scene.glb"
+            viewer_glb_path = out_dir / "composed_scene_viewer.glb"
             if len(scene.geometry) > 0:
                 scene.export(str(glb_path))
+                self._export_viewer_space_glb(scene, viewer_glb_path)
             else:
                 glb_path.write_bytes(b"")
+                viewer_glb_path.write_bytes(b"")
             outputs = {
                 "composed_scene_glb": str(glb_path),
+                "composed_scene_viewer_glb": str(viewer_glb_path),
                 "corrected_trajectories": str(traj_path),
                 "scene_manifest": str(manifest_path),
                 "frame_scene_manifest": str(frame_scene_manifest_path),
@@ -2855,7 +2990,8 @@ class ProjectExecutor:
             summary = {
                 "placed_objects": placed,
                 "total_objects": len(sam3d_meshes),
-                "has_background": bg_mesh_path is not None,
+                "has_background": bool(bg_meshes) or bg_mesh_path is not None,
+                "background_source": "background_assets" if bg_meshes else "wildgs",
                 "pose_source": self._pose_source_from_tracks(pose_tracks),
                 "selected_frame_id": selected_frame_id,
             }
@@ -2867,6 +3003,13 @@ class ProjectExecutor:
             )
 
         placed = 0
+        if bg_mesh_path is None and not bg_meshes:
+            bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh"))
+            if bg_mesh_path:
+                bg = trimesh.load(str(bg_mesh_path), force="mesh")
+                scene.add_geometry(bg, node_name="background")
+                scene_up = self._estimate_scene_up(np.asarray(bg.vertices, dtype=np.float64))
+                _logger.info("[scene.compose] Background: %d verts", len(bg.vertices))
         for obj_id, entry in sam3d_meshes.items():
             obj_node = object_nodes.get(obj_id)
             glb_path = self._find_glb(entry)
@@ -2883,7 +3026,6 @@ class ProjectExecutor:
             recon_frame = entry.get("reconstruction_frame_idx")
 
             verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-            verts = verts - verts.mean(axis=0, keepdims=True)
 
             pose_opt = self._accepted_pose_optimizer_record(pose_opt_manifest, obj_id)
             if pose_opt is not None:
@@ -3150,10 +3292,13 @@ class ProjectExecutor:
 
         # Export GLB
         glb_path = out_dir / "composed_scene.glb"
+        viewer_glb_path = out_dir / "composed_scene_viewer.glb"
         if len(scene.geometry) > 0:
             scene.export(str(glb_path))
+            self._export_viewer_space_glb(scene, viewer_glb_path)
         else:
             glb_path.write_bytes(b"")
+            viewer_glb_path.write_bytes(b"")
 
         self._json_dump(traj_path, corrected_trajectories)
 
@@ -3161,6 +3306,7 @@ class ProjectExecutor:
 
         outputs = {
             "composed_scene_glb": str(glb_path),
+            "composed_scene_viewer_glb": str(viewer_glb_path),
             "corrected_trajectories": str(traj_path),
             "scene_manifest": str(manifest_path),
         }
@@ -3168,6 +3314,41 @@ class ProjectExecutor:
         return self._base_result("scene.compose", summary, outputs)
 
     # ── scene.compose helpers ──
+
+    @staticmethod
+    def _scene_glb_viewer_coordinate_convention() -> USDCoordinateConvention:
+        return USDCoordinateConvention(
+            R_usd_from_world=np.diag([1.0, -1.0, -1.0]).astype(np.float64),
+            scene_up_world=np.array([0.0, -1.0, 0.0], dtype=np.float64),
+            scene_forward_world=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            ground_plane_offset_world=0.0,
+        )
+
+    @staticmethod
+    def _export_viewer_space_glb(scene, output_path: str | Path) -> None:
+        import trimesh
+
+        output_path = Path(output_path)
+        convention = ProjectExecutor._scene_glb_viewer_coordinate_convention()
+        viewer_scene = trimesh.Scene()
+        for name, geometry in scene.geometry.items():
+            if not isinstance(geometry, trimesh.Trimesh):
+                continue
+            mesh = geometry.copy()
+            verts = np.asarray(mesh.vertices, dtype=np.float64)
+            if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0:
+                mesh.vertices = convert_world_points_to_usd(verts, convention).astype(np.float32)
+            normals = getattr(mesh, "vertex_normals", None)
+            if normals is not None and len(normals) == len(mesh.vertices):
+                try:
+                    mesh.vertex_normals = convert_world_normals_to_usd(normals, convention)
+                except Exception:
+                    pass
+            viewer_scene.add_geometry(mesh, node_name=str(name))
+        if len(viewer_scene.geometry) > 0:
+            viewer_scene.export(str(output_path))
+        else:
+            output_path.write_bytes(b"")
 
     def _load_pose_track_outputs(self) -> dict | None:
         artifact = self.context.artifacts.get("pose.optimize")
@@ -3302,7 +3483,6 @@ class ProjectExecutor:
             scale = np.asarray(frame_pose.get("scale", track.get("scale", [1.0, 1.0, 1.0])), dtype=np.float64).reshape(3)
 
             verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-            verts = verts - verts.mean(axis=0, keepdims=True)
             verts_world = (rotation @ (verts * scale[None, :]).T).T + center[None, :]
             obj_mesh.vertices = verts_world.astype(np.float32)
             scene.add_geometry(obj_mesh, node_name=obj_id)
@@ -4550,7 +4730,6 @@ class ProjectExecutor:
         if obj_mesh is None or len(obj_mesh.vertices) == 0:
             return np.zeros((0, 2), dtype=np.float64)
         verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
-        verts = verts - verts.mean(axis=0, keepdims=True)
         if verts.shape[0] > 4000:
             verts = verts[np.linspace(0, verts.shape[0] - 1, 4000, dtype=int)]
         rotation = np.asarray(pose.get("rotation_matrix"), dtype=np.float64)
@@ -4962,11 +5141,44 @@ class ProjectExecutor:
     def _find_bg_mesh(bg_mesh_dir: str | None) -> "Path | None":
         if not bg_mesh_dir:
             return None
+        raw = Path(bg_mesh_dir)
+        if raw.is_file() and raw.exists():
+            return raw
         for name in ("background_mesh.ply", "background_mesh.obj"):
-            p = Path(bg_mesh_dir) / name
+            p = raw / name
             if p.exists():
                 return p
         return None
+
+    @staticmethod
+    def _find_bg_meshes(bg_mesh_dir: str | None) -> list[tuple[str, "Path"]]:
+        if not bg_mesh_dir:
+            return []
+        raw = Path(bg_mesh_dir)
+        if not raw.exists() or raw.is_file():
+            return []
+        ordered = [
+            ("road", raw / "road_mesh.obj"),
+            ("structures", raw / "structures_mesh.obj"),
+            ("far", raw / "far_mesh.obj"),
+        ]
+        out = [(name, path) for name, path in ordered if path.exists()]
+        return out if len(out) >= 2 else []
+
+    @staticmethod
+    def _background_assets_target_frame_id(geometry) -> int | None:
+        manifest = None if geometry is None else geometry.outputs.get("background_assets_manifest")
+        if not manifest:
+            return None
+        path = Path(manifest)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            value = data.get("target_frame_id")
+            return int(value) if value is not None else None
+        except Exception:
+            return None
 
     @staticmethod
     def _find_glb(entry: dict) -> "Path | None":
@@ -5624,7 +5836,7 @@ class ProjectExecutor:
 
         extents = np.ptp(arr, axis=0)
         order = np.argsort(extents)
-        # Current SAM3D vehicle GLBs encode local -Y as roof/up.
+        # Current SAM3D vehicle GLBs encode local +Y as roof/up.
         # Keep the axis fixed to Y and lock the sign to the verified semantic up.
         up_axis = 1
 
@@ -5645,15 +5857,15 @@ class ProjectExecutor:
         span = max(1e-6, high - low)
         low_count = int(np.count_nonzero(arr[:, up_axis] <= low + 0.28 * span))
         high_count = int(np.count_nonzero(arr[:, up_axis] >= high - 0.28 * span))
-        up_sign = -1.0
-        up_sign_source = "sam3d_vehicle_local_negative_y_roof_prior"
+        up_sign = 1.0
+        up_sign_source = "sam3d_vehicle_local_positive_y_roof_prior"
         try:
             if roles.get("up_axis_sign") is not None:
                 role_up_sign = -1.0 if float(roles.get("up_axis_sign")) < 0.0 else 1.0
                 up_sign_source = (
-                    "axis_roles_negative_y"
-                    if role_up_sign < 0.0
-                    else "semantic_negative_y_overrides_axis_roles"
+                    "axis_roles_positive_y"
+                    if role_up_sign > 0.0
+                    else "semantic_positive_y_overrides_axis_roles"
                 )
         except Exception:
             pass
@@ -6372,6 +6584,7 @@ class ProjectExecutor:
         bg_mesh_path,
         wildgs_poses,
         cam_traj,
+        bg_meshes=None,
         conversion_report_path=None,
     ):
         import numpy as np
@@ -6446,10 +6659,19 @@ class ProjectExecutor:
         UsdGeom.Xform.Define(stage, "/World")
         UsdGeom.Xform.Define(stage, "/World/Objects")
 
+        bg_meshes = list(bg_meshes or [])
         bg = None
         bg_verts_world = None
         scene_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        if bg_mesh_path:
+        if bg_meshes:
+            import trimesh
+
+            road_path = next((path for name, path in bg_meshes if name == "road"), bg_meshes[0][1])
+            bg = trimesh.load(str(road_path), force="mesh")
+            bg_verts_world = np.asarray(bg.vertices, dtype=np.float64)
+            if bg_verts_world.ndim == 2 and bg_verts_world.shape[0] >= 3:
+                scene_up = self._estimate_scene_up(bg_verts_world)
+        elif bg_mesh_path:
             import trimesh
 
             bg = trimesh.load(str(bg_mesh_path), force="mesh")
@@ -6473,7 +6695,29 @@ class ProjectExecutor:
             Path(conversion_report_path).write_text(json.dumps(coord_report, indent=2), encoding="utf-8")
 
         # Background mesh
-        if bg is not None and bg_verts_world is not None:
+        if bg_meshes:
+            import trimesh
+
+            UsdGeom.Xform.Define(stage, "/World/Background")
+            for bg_name, bg_part_path in bg_meshes:
+                bg_part = trimesh.load(str(bg_part_path), force="mesh")
+                verts_world = np.asarray(bg_part.vertices, dtype=np.float64)
+                if verts_world.ndim != 2 or len(verts_world) == 0:
+                    continue
+                bg_verts = convert_world_points_to_usd(verts_world, coord_convention)
+                prim_name = "".join(part.capitalize() for part in str(bg_name).replace("-", "_").split("_")) or "Mesh"
+                mesh_prim = UsdGeom.Mesh.Define(stage, f"/World/Background/{prim_name}")
+                mesh_prim.CreatePointsAttr(_usd_points(bg_verts))
+                mesh_prim.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(bg_part.faces)))
+                mesh_prim.CreateFaceVertexIndicesAttr(Vt.IntArray(bg_part.faces.flatten().tolist()))
+                _set_mesh_orientation(mesh_prim)
+                vc = getattr(bg_part.visual, "vertex_colors", None)
+                if vc is not None and len(vc) == len(bg_verts):
+                    _set_display_colors(mesh_prim, vc)
+                normals = getattr(bg_part, "vertex_normals", None)
+                if normals is not None and len(normals) == len(bg_verts):
+                    _set_normals(mesh_prim, convert_world_normals_to_usd(normals, coord_convention))
+        elif bg is not None and bg_verts_world is not None:
             bg_verts = convert_world_points_to_usd(bg_verts_world, coord_convention)
             UsdGeom.Xform.Define(stage, "/World/Background")
             mesh_prim = UsdGeom.Mesh.Define(stage, "/World/Background/Mesh")
@@ -6849,7 +7093,6 @@ class ProjectExecutor:
             pit_snapshot["object_trajectories"] = self._merge_refined_object_trajectories(raw_traj, refined_traj)
             pit_snapshot["trajectory_source"] = "pose_optimize_refined"
 
-        # Populate static background from WildGS for scene.export
         if geometry.outputs.get("wildgs_static_map"):
             import os
             static_map_dir = geometry.outputs["wildgs_static_map"]
@@ -6930,6 +7173,9 @@ class ProjectExecutor:
             sam3d_meshes = self._json_load(mesh_art.outputs["sam3d_meshes"])
             corrected_traj = self._json_load(compose.outputs["corrected_trajectories"])
             bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh")) if geometry else None
+            bg_meshes = load_background_asset_meshes(geometry.outputs.get("background_assets_manifest")) if geometry else []
+            if geometry and not bg_meshes:
+                bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
             cam_traj = self._json_load(geometry.outputs["camera_trajectory"]) if geometry else []
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
 
@@ -6942,6 +7188,7 @@ class ProjectExecutor:
                 bg_mesh_path,
                 wildgs_poses,
                 cam_traj,
+                bg_meshes=bg_meshes,
                 conversion_report_path=conversion_report_path,
             )
 

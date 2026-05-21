@@ -3111,7 +3111,7 @@ def add_fast_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fast_float32", action="store_true")
     parser.add_argument("--save_full_history", action="store_true")
     parser.add_argument("--profile_timings", action="store_true")
-    parser.add_argument("--world_up_axis", choices=["x", "y", "z"], default="y")
+    parser.add_argument("--world_up_axis", choices=["x", "y", "z", "+x", "+y", "+z", "-x", "-y", "-z"], default="-y")
     parser.add_argument("--proxy_face_count", type=int, default=1800)
     parser.add_argument("--top_k_candidates", type=int, default=8)
     parser.add_argument("--refine_top_k", type=int, default=3)

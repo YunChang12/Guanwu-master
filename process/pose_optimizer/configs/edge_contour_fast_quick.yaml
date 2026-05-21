@@ -26,7 +26,7 @@ disable_roi_iou: false
 fast_float32: true
 save_full_history: false
 profile_timings: false
-world_up_axis: y
+world_up_axis: "-y"
 proxy_face_count: 1800
 top_k_candidates: 16
 refine_top_k: 4
@@ -90,7 +90,7 @@ edge_topk_only: true
 road_constraint_enabled: true
 vehicle_mesh_axis_override_enabled: true
 vehicle_mesh_up_axis_idx: 1
-vehicle_mesh_up_sign: -1.0
+vehicle_mesh_up_sign: 1.0
 road_depth_fallback_enabled: true
 road_depth_ransac_max_points: 20000
 road_depth_ransac_iters: 96

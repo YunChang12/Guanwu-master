@@ -357,13 +357,15 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 def world_up_vector_from_arg(name: str) -> np.ndarray:
-    key = name.lower()
+    key = str(name or "").strip().lower()
+    sign = -1.0 if key.startswith("-") else 1.0
+    key = key[1:] if key[:1] in {"+", "-"} else key
     if key == "x":
-        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        return np.array([sign, 0.0, 0.0], dtype=np.float64)
     if key == "y":
-        return np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        return np.array([0.0, sign, 0.0], dtype=np.float64)
     if key == "z":
-        return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return np.array([0.0, 0.0, sign], dtype=np.float64)
     raise ValueError(f"Unsupported world_up_axis: {name}")
 
 
@@ -4155,8 +4157,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--world_up_axis",
-        choices=["x", "y", "z"],
-        default="y",
+        choices=["x", "y", "z", "+x", "+y", "+z", "-x", "-y", "-z"],
+        default="-y",
         help="World-space up axis used to build upright camera-frame initialization hypotheses.",
     )
     parser.add_argument("--proxy_face_count", type=int, default=1800)

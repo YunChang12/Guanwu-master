@@ -148,5 +148,9 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
             continue
         if isinstance(value, list):
             value = ",".join(str(item) for item in value)
-        argv.extend([option, str(value)])
+        value_text = str(value)
+        if value_text.startswith("-"):
+            argv.append(f"{option}={value_text}")
+        else:
+            argv.extend([option, value_text])
     return argv

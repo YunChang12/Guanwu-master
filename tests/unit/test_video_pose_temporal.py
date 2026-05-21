@@ -7,6 +7,7 @@ import numpy as np
 import guanwu.video.project.executor as project_executor
 from guanwu.video.project.executor import ProjectExecutor
 from process.pose_optimizer.strategies.temporal_fast import compute_road_and_heading_score, choose_best_refined_result
+from process.pose_optimizer.strategies.fast import world_up_vector_from_arg
 
 
 def _pose_record(
@@ -343,6 +344,42 @@ def test_pose_tracks_build_refined_object_trajectories() -> None:
     assert refined["obj_000001"][0]["pose_source"] == "edge_contour_fast_temporal"
 
 
+def test_vehicle_mesh_axis_prior_uses_local_positive_y_as_roof_up() -> None:
+    verts = np.asarray(
+        [
+            [x, y, z]
+            for x in (-1.0, 1.0)
+            for y in (-0.5, 0.5)
+            for z in (-2.0, 2.0)
+        ],
+        dtype=np.float64,
+    )
+    observations = [
+        {"frame_id": 1, "points": np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0], [1.0, 0.0, 1.0]])},
+        {"frame_id": 2, "points": np.asarray([[0.0, 0.0, 1.0], [0.0, 0.0, 3.0], [1.0, 0.0, 2.0]])},
+    ]
+
+    rotation, mesh_basis, _world_basis, axis_roles, _heading = ProjectExecutor._pose_track_object_rotation(
+        verts,
+        observations,
+        scene_up=np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+    )
+    prior = ProjectExecutor._mesh_axis_prior_for_pose_optimizer(verts, axis_roles=axis_roles)
+
+    assert axis_roles["up_axis_idx"] == 1
+    assert axis_roles["up_axis_sign"] == 1.0
+    assert np.allclose(mesh_basis[:, 1], [0.0, 1.0, 0.0])
+    assert float(rotation[:, 1] @ np.asarray([0.0, 1.0, 0.0])) > 0.99
+    assert prior["up_sign"] == 1.0
+    assert prior["up_sign_candidates"] == [1.0]
+    assert prior["lock_up_sign"] is True
+
+
+def test_signed_world_up_axis_supports_wildgs_negative_y_up() -> None:
+    np.testing.assert_allclose(world_up_vector_from_arg("-y"), [0.0, -1.0, 0.0])
+    np.testing.assert_allclose(world_up_vector_from_arg("+z"), [0.0, 0.0, 1.0])
+
+
 def test_refined_object_trajectories_override_geometry_by_frame() -> None:
     coarse = {
         "obj_000001": [
@@ -393,6 +430,21 @@ def test_usd_export_preserves_pose_optimizer_mesh_local_forward_axis() -> None:
     prepared = ProjectExecutor._prepare_usd_object_mesh_vertices(verts)
 
     assert prepared[1, 2] > prepared[0, 2]
+
+
+def test_usd_export_preserves_pose_optimizer_mesh_local_origin() -> None:
+    verts = np.asarray(
+        [
+            [10.0, 0.0, -1.0],
+            [12.0, 1.0, 3.0],
+            [11.0, -1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    prepared = ProjectExecutor._prepare_usd_object_mesh_vertices(verts)
+
+    np.testing.assert_allclose(prepared, verts)
 
 
 def test_pose_match_bbox_area_threshold_is_800_px() -> None:

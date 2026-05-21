@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import json
+from pathlib import Path
 
 import numpy as np
 
@@ -449,3 +451,141 @@ def test_usd_export_preserves_pose_optimizer_mesh_local_origin() -> None:
 
 def test_pose_match_bbox_area_threshold_is_800_px() -> None:
     assert project_executor._POSE_MATCH_MIN_BBOX_AREA_PX == 800.0
+
+
+def test_pose_target_frame_mode_reads_all_frames_env(monkeypatch) -> None:
+    monkeypatch.setenv("GUANWU_POSE_TARGET_FRAME_MODE", "all_frames")
+
+    assert ProjectExecutor._pose_target_frame_mode() == "all_frames"
+
+
+def test_pose_all_frame_candidate_frame_ids_keep_vehicle_frames_above_area() -> None:
+    detection_frames = [
+        {
+            "frame_idx": 1,
+            "instances": [
+                {
+                    "object_id": "obj_000001",
+                    "label": "car",
+                    "bbox_xyxy": [10.0, 10.0, 50.0, 50.0],
+                }
+            ],
+        },
+        {
+            "frame_idx": 2,
+            "instances": [
+                {
+                    "object_id": "obj_000001",
+                    "label": "car",
+                    "bbox_xyxy": [10.0, 10.0, 20.0, 20.0],
+                }
+            ],
+        },
+        {
+            "frame_idx": 3,
+            "instances": [
+                {
+                    "object_id": "obj_000001",
+                    "label": "fence",
+                    "bbox_xyxy": [0.0, 0.0, 200.0, 40.0],
+                }
+            ],
+        },
+        {
+            "frame_idx": 4,
+            "instances": [
+                {
+                    "object_id": "obj_000001",
+                    "label": "truck",
+                    "bbox_xyxy": [0.0, 0.0, 120.0, 80.0],
+                }
+            ],
+        },
+    ]
+
+    frame_ids = ProjectExecutor._pose_all_frame_candidate_frame_ids(
+        obj_id="obj_000001",
+        detection_frames=detection_frames,
+        min_bbox_area_px=800.0,
+    )
+
+    assert frame_ids == [1, 4]
+
+
+def test_pose_all_frame_candidate_frame_ids_read_detection_file(tmp_path: Path) -> None:
+    detections_path = tmp_path / "detections.json"
+    detections_path.write_text(
+        json.dumps(
+            {
+                "instances": [
+                    {
+                        "object_id": "obj_000001",
+                        "label": "car",
+                        "bbox_xyxy": [10.0, 10.0, 90.0, 70.0],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    frame_ids = ProjectExecutor._pose_all_frame_candidate_frame_ids(
+        obj_id="obj_000001",
+        detection_frames=[{"frame_idx": 7, "detections": str(detections_path)}],
+        min_bbox_area_px=800.0,
+    )
+
+    assert frame_ids == [7]
+
+
+def test_pose_dynamic_window_radius_expands_for_truncated_or_small_targets() -> None:
+    large_clear = {
+        "bbox_xyxy": [120.0, 80.0, 260.0, 180.0],
+        "image_width": 640,
+        "image_height": 360,
+    }
+    right_truncated = {
+        "bbox_xyxy": [540.0, 70.0, 640.0, 170.0],
+        "image_width": 640,
+        "image_height": 360,
+    }
+    small = {
+        "bbox_xyxy": [100.0, 80.0, 130.0, 120.0],
+        "image_width": 640,
+        "image_height": 360,
+    }
+
+    assert ProjectExecutor._pose_dynamic_window_radius(
+        large_clear,
+        {"bbox_area_px": 14000.0},
+        base_radius=2,
+        min_radius=1,
+        max_radius=4,
+    ) == 1
+    assert ProjectExecutor._pose_dynamic_window_radius(
+        right_truncated,
+        {"bbox_area_px": 10000.0},
+        base_radius=2,
+        min_radius=1,
+        max_radius=4,
+    ) == 3
+    assert ProjectExecutor._pose_dynamic_window_radius(
+        small,
+        {"bbox_area_px": 1200.0},
+        base_radius=2,
+        min_radius=1,
+        max_radius=4,
+    ) == 3
+
+
+def test_candidate_trajectory_selection_all_frames_does_not_require_target_frame() -> None:
+    selected, summary = ProjectExecutor._select_edge_pose_candidate_trajectory(
+        {
+            1: [_pose_record(frame_id=1, x=0.0, yaw_deg=0.0)],
+            4: [_pose_record(frame_id=4, x=0.5, yaw_deg=8.0)],
+        },
+        target_frame_id=None,
+    )
+
+    assert [record["frame_id"] for record in selected] == [1, 4]
+    assert summary["target_frame_id"] is None

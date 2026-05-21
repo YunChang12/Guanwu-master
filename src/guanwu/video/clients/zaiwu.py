@@ -61,9 +61,11 @@ def _is_retryable_job_poll_error(exc: Exception) -> bool:
             "bad gateway",
             "gateway timeout",
             "service unavailable",
+            "unknown job",
             "gateway error 502",
             "gateway error 503",
             "gateway error 504",
+            "gateway error 404",
         )
     )
 

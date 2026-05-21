@@ -1659,9 +1659,13 @@ class ProjectExecutor:
     ) -> dict:
         import numpy as np
 
-        if target_frame_id is None:
+        target_frame_mode = self._pose_target_frame_mode()
+        all_frames_mode = target_frame_mode == "all_frames"
+        dynamic_window_enabled = self._pose_env_bool("GUANWU_POSE_DYNAMIC_WINDOW", default=all_frames_mode)
+        dynamic_window_min_radius, dynamic_window_max_radius = self._pose_dynamic_window_bounds(target_window_radius)
+        if target_frame_id is None and not all_frames_mode:
             target_frame_id = self._select_dense_detection_frame(detection_frames)
-        target_frame_id = int(target_frame_id or 1)
+        target_frame_id = int(target_frame_id or 1) if target_frame_id is not None else None
         target_window_radius = int(max(0, target_window_radius))
         target_object_ids = self._pose_target_object_ids()
         max_target_objects = self._pose_max_target_objects()
@@ -1685,8 +1689,14 @@ class ProjectExecutor:
         manifest: dict[str, dict] = {
             "schema": "guanwu.pose_track.v1",
             "strategy": "edge_contour_fast_temporal",
+            "target_frame_mode": target_frame_mode,
             "target_frame_id": target_frame_id,
             "target_window_radius": target_window_radius,
+            "dynamic_window": {
+                "enabled": dynamic_window_enabled,
+                "min_radius": dynamic_window_min_radius,
+                "max_radius": dynamic_window_max_radius,
+            },
             "target_object_ids": sorted(target_object_ids) if target_object_ids else None,
             "max_target_objects": max_target_objects,
             "resume_results": resume_results,
@@ -1733,28 +1743,46 @@ class ProjectExecutor:
                 continue
             verts = np.asarray(obj_mesh.vertices, dtype=np.float64)
 
-            target_inst = self._get_instance_for_frame(obj_id, target_frame_id, detection_frames)
-            target_bbox = (target_inst or {}).get("bbox_xyxy") or (target_inst or {}).get("bbox")
-            target_obs = {"bbox": target_bbox, "bbox_area_px": self._bbox_area_px(target_bbox)}
-            if not self._is_target_frame_vehicle_candidate(target_inst, target_obs):
-                manifest["objects"][obj_id] = {
-                    "status": "skipped",
-                    "reason": "missing_target_vehicle_observation",
-                    "target_frame_id": target_frame_id,
-                    "target_bbox_area_px": target_obs["bbox_area_px"],
-                }
-                skipped_objects += 1
-                continue
-            if target_obs["bbox_area_px"] < _POSE_MATCH_MIN_BBOX_AREA_PX:
-                manifest["objects"][obj_id] = {
-                    "status": "skipped",
-                    "reason": "pose_match_bbox_area_too_small",
-                    "target_frame_id": target_frame_id,
-                    "target_bbox_area_px": target_obs["bbox_area_px"],
-                    "min_bbox_area_px": _POSE_MATCH_MIN_BBOX_AREA_PX,
-                }
-                skipped_objects += 1
-                continue
+            if all_frames_mode:
+                frame_ids = self._pose_all_frame_candidate_frame_ids(
+                    obj_id=obj_id,
+                    detection_frames=detection_frames,
+                    min_bbox_area_px=_POSE_MATCH_MIN_BBOX_AREA_PX,
+                )
+                if not frame_ids:
+                    manifest["objects"][obj_id] = {
+                        "status": "skipped",
+                        "reason": "missing_vehicle_observations_above_bbox_threshold",
+                        "target_frame_mode": target_frame_mode,
+                        "min_bbox_area_px": _POSE_MATCH_MIN_BBOX_AREA_PX,
+                    }
+                    skipped_objects += 1
+                    continue
+                target_inst = None
+                target_obs = {"bbox": None, "bbox_area_px": 0.0}
+            else:
+                target_inst = self._get_instance_for_frame(obj_id, int(target_frame_id), detection_frames)
+                target_bbox = (target_inst or {}).get("bbox_xyxy") or (target_inst or {}).get("bbox")
+                target_obs = {"bbox": target_bbox, "bbox_area_px": self._bbox_area_px(target_bbox)}
+                if not self._is_target_frame_vehicle_candidate(target_inst, target_obs):
+                    manifest["objects"][obj_id] = {
+                        "status": "skipped",
+                        "reason": "missing_target_vehicle_observation",
+                        "target_frame_id": target_frame_id,
+                        "target_bbox_area_px": target_obs["bbox_area_px"],
+                    }
+                    skipped_objects += 1
+                    continue
+                if target_obs["bbox_area_px"] < _POSE_MATCH_MIN_BBOX_AREA_PX:
+                    manifest["objects"][obj_id] = {
+                        "status": "skipped",
+                        "reason": "pose_match_bbox_area_too_small",
+                        "target_frame_id": target_frame_id,
+                        "target_bbox_area_px": target_obs["bbox_area_px"],
+                        "min_bbox_area_px": _POSE_MATCH_MIN_BBOX_AREA_PX,
+                    }
+                    skipped_objects += 1
+                    continue
 
             if max_target_objects is not None and selected_target_objects >= max_target_objects:
                 manifest["objects"][obj_id] = {
@@ -1766,15 +1794,16 @@ class ProjectExecutor:
                 continue
             selected_target_objects += 1
 
-            frame_ids = self._pose_temporal_window_frame_ids(
-                obj_id=obj_id,
-                target_frame_id=target_frame_id,
-                window_radius=target_window_radius,
-                detection_frames=detection_frames,
-            )
-            if target_frame_id not in frame_ids:
-                frame_ids.append(target_frame_id)
-                frame_ids = sorted(set(frame_ids))
+            if not all_frames_mode:
+                frame_ids = self._pose_temporal_window_frame_ids(
+                    obj_id=obj_id,
+                    target_frame_id=int(target_frame_id),
+                    window_radius=target_window_radius,
+                    detection_frames=detection_frames,
+                )
+                if int(target_frame_id) not in frame_ids:
+                    frame_ids.append(int(target_frame_id))
+                    frame_ids = sorted(set(frame_ids))
             if not frame_ids:
                 manifest["objects"][obj_id] = {
                     "status": "skipped",
@@ -1852,6 +1881,16 @@ class ProjectExecutor:
                     shutil.rmtree(result_dir)
                 result_dir.mkdir(parents=True, exist_ok=True)
                 bbox = inst.get("bbox_xyxy") or inst.get("bbox")
+                obs = {"bbox": bbox, "bbox_area_px": self._bbox_area_px(bbox)}
+                frame_window_radius = target_window_radius
+                if dynamic_window_enabled:
+                    frame_window_radius = self._pose_dynamic_window_radius(
+                        inst,
+                        obs,
+                        base_radius=target_window_radius,
+                        min_radius=dynamic_window_min_radius,
+                        max_radius=dynamic_window_max_radius,
+                    )
                 vehicle_pose_context = self._vehicle_pose_context_for_task(
                     obj_id=obj_id,
                     frame_id=int(frame_id),
@@ -1860,8 +1899,14 @@ class ProjectExecutor:
                     detection_frames=detection_frames,
                     road_geometry=road_geometry,
                     mesh_axis_prior=mesh_axis_prior,
-                    target_window_radius=target_window_radius,
+                    target_window_radius=frame_window_radius,
                 )
+                vehicle_pose_context["temporal_window"] = {
+                    "mode": target_frame_mode,
+                    "base_radius": int(target_window_radius),
+                    "radius": int(frame_window_radius),
+                    "dynamic": bool(dynamic_window_enabled),
+                }
                 if track_scale_prior:
                     vehicle_pose_context["track_scale_prior"] = track_scale_prior
                 task_path = self._write_pose_optimizer_sample(
@@ -1986,7 +2031,10 @@ class ProjectExecutor:
                     candidate_records_by_frame,
                     target_frame_id=target_frame_id,
                 )
-                if selected_records and any(int(rec.get("frame_id") or 0) == target_frame_id for rec in selected_records):
+                has_required_target = all_frames_mode or any(
+                    int(rec.get("frame_id") or 0) == int(target_frame_id) for rec in selected_records
+                )
+                if selected_records and has_required_target:
                     accepted_records = selected_records
                     for selected in accepted_records:
                         frame_key = f"frame_{int(selected.get('frame_id') or 0):06d}"
@@ -1999,23 +2047,35 @@ class ProjectExecutor:
                     rejected_frames += new_rejected_count - old_rejected_count
                     object_rejected = new_rejected_count
 
-            target_record = next(
-                (record for record in accepted_records if int(record.get("frame_id") or 0) == target_frame_id),
-                None,
-            )
+            target_record = None
+            if target_frame_id is not None:
+                target_record = next(
+                    (record for record in accepted_records if int(record.get("frame_id") or 0) == int(target_frame_id)),
+                    None,
+                )
             if target_record is None:
-                manifest["objects"][obj_id] = {
-                    "status": "skipped",
-                    "reason": "missing_accepted_target_pose",
-                    "target_frame_id": target_frame_id,
-                    "attempted_frame_count": object_attempted,
-                    "accepted_frame_count": len(accepted_records),
-                    "rejected_frame_count": object_rejected,
-                    "failed_frame_count": object_failed,
-                    "frames": frame_records,
-                }
-                skipped_objects += 1
-                continue
+                if all_frames_mode and accepted_records:
+                    target_record = max(
+                        accepted_records,
+                        key=lambda record: (
+                            float((record.get("metrics") or {}).get("mask_iou") or 0.0),
+                            float((record.get("metrics") or {}).get("bbox_iou") or 0.0),
+                            -float((record.get("metrics") or {}).get("bbox_center_error_px") or 1e9),
+                        ),
+                    )
+                else:
+                    manifest["objects"][obj_id] = {
+                        "status": "skipped",
+                        "reason": "missing_accepted_target_pose",
+                        "target_frame_id": target_frame_id,
+                        "attempted_frame_count": object_attempted,
+                        "accepted_frame_count": len(accepted_records),
+                        "rejected_frame_count": object_rejected,
+                        "failed_frame_count": object_failed,
+                        "frames": frame_records,
+                    }
+                    skipped_objects += 1
+                    continue
 
             accepted_records, stabilization_summary = self._stabilize_edge_pose_records(accepted_records)
             trajectory_refinement = {
@@ -2035,7 +2095,11 @@ class ProjectExecutor:
                 skipped_objects += 1
                 continue
 
-            target_frame = next(frame for frame in frames if int(frame["frame_id"]) == target_frame_id)
+            target_frame = None
+            if target_frame_id is not None:
+                target_frame = next((frame for frame in frames if int(frame["frame_id"]) == int(target_frame_id)), None)
+            if target_frame is None:
+                target_frame = max(frames, key=lambda frame: float(frame.get("confidence", 0.0) or 0.0))
             track_scale = self._median_pose_scale([frame.get("scale") for frame in frames])
             track_rotation = target_frame["rotation_matrix"]
             object_pose_tracks[obj_id] = {
@@ -2051,9 +2115,11 @@ class ProjectExecutor:
                 "heading": heading_info,
                 "target_frame_refinement": {
                     "status": "edge_contour_fast_temporal",
+                    "mode": target_frame_mode,
                     "target_frame_id": target_frame_id,
                     "window_radius": target_window_radius,
                     "accepted_frame_count": len(frames),
+                    "representative_frame_id": int(target_frame.get("frame_id") or 0),
                     "target_metrics": target_record.get("metrics", {}),
                     "trajectory_refinement": trajectory_refinement,
                 },
@@ -2086,6 +2152,7 @@ class ProjectExecutor:
             target_accepted_objects += 1
             manifest["objects"][obj_id] = {
                 "status": "tracked",
+                "target_frame_mode": target_frame_mode,
                 "target_frame_id": target_frame_id,
                 "attempted_frame_count": object_attempted,
                 "accepted_frame_count": len(frames),
@@ -2101,6 +2168,7 @@ class ProjectExecutor:
                 "frame_count": len(frames),
                 "accepted_frame_count": len(frames),
                 "mean_confidence": float(np.mean([frame.get("confidence", 0.0) for frame in frames])),
+                "target_frame_mode": target_frame_mode,
                 "target_frame_id": target_frame_id,
                 "target_confidence": float(target_frame.get("confidence", 0.0) or 0.0),
                 "target_metrics": target_record.get("metrics", {}),
@@ -2145,8 +2213,12 @@ class ProjectExecutor:
             "per_frame_count": len(per_frame_object_poses),
             "road_geometry_available": bool((road_geometry or {}).get("available")),
             "strategy": "edge_contour_fast_temporal",
+            "target_frame_mode": target_frame_mode,
             "target_frame_id": target_frame_id,
             "target_window_radius": target_window_radius,
+            "dynamic_window_enabled": dynamic_window_enabled,
+            "dynamic_window_min_radius": dynamic_window_min_radius,
+            "dynamic_window_max_radius": dynamic_window_max_radius,
             "selected_target_objects": selected_target_objects,
             "target_object_ids": sorted(target_object_ids) if target_object_ids else None,
             "max_target_objects": max_target_objects,
@@ -2162,8 +2234,10 @@ class ProjectExecutor:
             outputs,
             params={
                 "strategy": "edge_contour_fast_temporal",
+                "target_frame_mode": target_frame_mode,
                 "target_frame_id": target_frame_id,
                 "target_window_radius": target_window_radius,
+                "dynamic_window_enabled": dynamic_window_enabled,
                 "target_object_ids": sorted(target_object_ids) if target_object_ids else None,
                 "max_target_objects": max_target_objects,
                 "resume_results": resume_results,
@@ -2220,6 +2294,128 @@ class ProjectExecutor:
             return max(0, min(int(str(raw).strip()), 12))
         except ValueError:
             return 2
+
+    @staticmethod
+    def _pose_target_frame_mode() -> str:
+        if str(os.environ.get("GUANWU_POSE_ALL_FRAMES", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return "all_frames"
+        raw = str(os.environ.get("GUANWU_POSE_TARGET_FRAME_MODE", "")).strip().lower().replace("-", "_")
+        if raw in {"all", "all_frame", "all_frames", "full", "full_video", "sequence"}:
+            return "all_frames"
+        return "single_frame"
+
+    @staticmethod
+    def _pose_env_bool(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _pose_dynamic_window_bounds(base_radius: int) -> tuple[int, int]:
+        def read_int(name: str, default: int) -> int:
+            try:
+                return int(str(os.environ.get(name, default)).strip())
+            except ValueError:
+                return int(default)
+
+        min_radius = max(0, read_int("GUANWU_POSE_DYNAMIC_WINDOW_MIN_RADIUS", 1))
+        max_radius = max(min_radius, read_int("GUANWU_POSE_DYNAMIC_WINDOW_MAX_RADIUS", max(4, int(base_radius))))
+        return min_radius, min(max_radius, 12)
+
+    @staticmethod
+    def _pose_detection_entry_frame_id(entry: dict) -> int:
+        try:
+            return int(entry.get("frame_idx") or entry.get("frame_id") or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _pose_all_frame_candidate_frame_ids(
+        *,
+        obj_id: str,
+        detection_frames: list[dict],
+        min_bbox_area_px: float,
+    ) -> list[int]:
+        frame_ids: list[int] = []
+        for entry in detection_frames or []:
+            if not isinstance(entry, dict):
+                continue
+            frame_id = ProjectExecutor._pose_detection_entry_frame_id(entry)
+            if frame_id <= 0:
+                continue
+            instances = entry.get("instances")
+            if instances is None:
+                det_path = entry.get("detections")
+                if det_path and Path(det_path).exists():
+                    try:
+                        with open(det_path, "r", encoding="utf-8") as f:
+                            det = json.load(f)
+                        instances = det.get("instances", []) if isinstance(det, dict) else []
+                    except Exception:
+                        instances = []
+            for inst in instances or []:
+                if not isinstance(inst, dict) or inst.get("object_id") != obj_id:
+                    continue
+                bbox = inst.get("bbox_xyxy") or inst.get("bbox")
+                obs = {"bbox": bbox, "bbox_area_px": ProjectExecutor._bbox_area_px(bbox)}
+                if obs["bbox_area_px"] < float(min_bbox_area_px):
+                    continue
+                if not ProjectExecutor._is_target_frame_vehicle_candidate(inst, obs):
+                    continue
+                frame_ids.append(frame_id)
+                break
+        return sorted(set(frame_ids))
+
+    @staticmethod
+    def _pose_dynamic_window_radius(
+        inst: dict | None,
+        obs: dict | None,
+        *,
+        base_radius: int,
+        min_radius: int,
+        max_radius: int,
+    ) -> int:
+        radius = int(base_radius)
+        inst = inst if isinstance(inst, dict) else {}
+        obs = obs if isinstance(obs, dict) else {}
+        bbox = obs.get("bbox") or inst.get("bbox_xyxy") or inst.get("bbox")
+        try:
+            area = float(obs.get("bbox_area_px") or ProjectExecutor._bbox_area_px(bbox))
+        except Exception:
+            area = 0.0
+
+        truncated = bool(inst.get("is_truncated") or inst.get("truncated"))
+        truncation_info = inst.get("truncation_info")
+        if isinstance(truncation_info, dict):
+            truncated = truncated or bool(truncation_info.get("is_truncated") or truncation_info.get("touches_image_border"))
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+                width = inst.get("image_width") or inst.get("width")
+                height = inst.get("image_height") or inst.get("height")
+                if (width is None or height is None) and inst.get("mask_rle"):
+                    try:
+                        rle = json.loads(inst["mask_rle"]) if isinstance(inst["mask_rle"], str) else inst["mask_rle"]
+                        size = rle.get("size") if isinstance(rle, dict) else None
+                        if isinstance(size, (list, tuple)) and len(size) >= 2:
+                            height, width = int(size[0]), int(size[1])
+                    except Exception:
+                        pass
+                if width is not None and height is not None:
+                    w = float(width)
+                    h = float(height)
+                    truncated = truncated or x1 <= 1.0 or y1 <= 1.0 or x2 >= w - 1.0 or y2 >= h - 1.0
+            except Exception:
+                pass
+
+        if area >= 12000.0 and not truncated:
+            radius -= 1
+        if area > 0.0 and area < 2500.0:
+            radius += 1
+        if truncated:
+            radius += 1
+        return max(int(min_radius), min(int(max_radius), int(radius)))
 
     def _build_pose_track_observations(
         self,
@@ -4051,7 +4247,7 @@ class ProjectExecutor:
     def _select_edge_pose_candidate_trajectory(
         frame_candidates: dict[int, list[dict]],
         *,
-        target_frame_id: int,
+        target_frame_id: int | None,
     ) -> tuple[list[dict], dict]:
         import copy
         import numpy as np
@@ -4141,7 +4337,7 @@ class ProjectExecutor:
             "enabled": True,
             "applied": True,
             "method": "viterbi_candidate_trajectory",
-            "target_frame_id": int(target_frame_id),
+            "target_frame_id": int(target_frame_id) if target_frame_id is not None else None,
             "frame_ids": frames,
             "selected_frame_count": len(selected),
             "total_cost": float(min(dp[-1])),

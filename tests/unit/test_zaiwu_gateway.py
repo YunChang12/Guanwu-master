@@ -88,6 +88,20 @@ class _FlakyPollGateway(_FakeGateway):
         return super().get_job(job_id)
 
 
+class _UnknownJobOnceGateway(_FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self._poll_failures = 0
+
+    def get_job(self, job_id: str) -> dict:  # type: ignore[override]
+        if self._poll_failures == 0:
+            self._poll_failures += 1
+            raise RuntimeError(
+                "Zaiwu gateway error 404 for GET /api/v1/jobs/job-123: {'error': 'Unknown job: job-123'}"
+            )
+        return super().get_job(job_id)
+
+
 class _FakeGatewayRoutes(ZaiwuGatewayClient):
     def __init__(self) -> None:
         super().__init__(
@@ -349,6 +363,18 @@ def test_zaiwu_gateway_retries_transient_polling_errors() -> None:
 
     result = client.run_job(
         handler="services.depth_anything3.estimate_from_video",
+        payload={"video_file_id": "uploads/demo.mp4"},
+    )
+
+    assert result["output_file_id"] == "outputs/depth.npy"
+    assert client.job_calls >= 3
+
+
+def test_zaiwu_gateway_retries_transient_unknown_job_polling_error() -> None:
+    client = _UnknownJobOnceGateway()
+
+    result = client.run_job(
+        handler="services.wildgs_slam.wildgs_run_slam",
         payload={"video_file_id": "uploads/demo.mp4"},
     )
 

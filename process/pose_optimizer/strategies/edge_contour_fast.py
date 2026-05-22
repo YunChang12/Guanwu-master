@@ -351,12 +351,13 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     object_id, frame_idx = temporal_fast.parse_task_id_from_sample_dir(sample_dir)
     suffixes = temporal_fast.parse_suffixes(args.temporal_search_output_suffixes)
     temporal_prior = None
+    skip_disk_temporal_prior = temporal_fast.should_skip_disk_temporal_prior(vehicle_pose_context)
     if bool(args.temporal_enabled) and frame_idx > 1:
         temporal_prior = temporal_fast.load_prior_pose_payload(
             task.get("temporal_prior_pose"),
             t_world_from_cam=t_world_from_cam,
         )
-        if temporal_prior is None:
+        if temporal_prior is None and not skip_disk_temporal_prior:
             temporal_prior = temporal_fast.find_temporal_prior(
                 output_dir=output_dir,
                 object_id=object_id,
@@ -366,7 +367,9 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
                 t_world_from_cam=t_world_from_cam,
             )
 
-    if temporal_prior is None:
+    if temporal_prior is None and skip_disk_temporal_prior:
+        print(f"[temporal] disk prior disabled for all-frames candidate pass: {object_id}@{frame_idx:06d}")
+    elif temporal_prior is None:
         print(f"[temporal] no prior found for {object_id}@{frame_idx:06d}; falling back to fast-style scoring")
     else:
         print(

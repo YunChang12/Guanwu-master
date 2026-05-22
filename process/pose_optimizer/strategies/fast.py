@@ -1433,6 +1433,10 @@ def build_vehicle_pose_context(
         "heading_prior": dict(raw_context.get("heading_prior", {}) if isinstance(raw_context.get("heading_prior"), dict) else {}),
         "road_constraint": {"available": False, "reason": "missing_road_plane"},
     }
+    if isinstance(raw_context.get("temporal_window"), dict):
+        context["temporal_window"] = dict(raw_context["temporal_window"])
+    if "disable_disk_temporal_prior" in raw_context:
+        context["disable_disk_temporal_prior"] = bool(raw_context.get("disable_disk_temporal_prior"))
     if isinstance(raw_context.get("track_scale_prior"), dict):
         context["track_scale_prior"] = dict(raw_context["track_scale_prior"])
 

@@ -1843,6 +1843,8 @@ class ProjectExecutor:
             object_rejected = 0
             object_failed = 0
             previous_accepted: dict | None = None
+            previous_candidate_prior: dict | None = None
+            all_frame_prior_records: list[dict] = []
             frame_records: dict[str, dict] = {}
             candidate_records_by_frame: dict[int, list[dict]] = {}
             trajectory_selection_summary: dict = {
@@ -1891,6 +1893,27 @@ class ProjectExecutor:
                         min_radius=dynamic_window_min_radius,
                         max_radius=dynamic_window_max_radius,
                     )
+                local_seed_track = seed_track
+                local_seed_meta = seed_meta
+                if all_frames_mode:
+                    local_seed_frame_ids = self._pose_local_seed_frame_ids(
+                        frame_ids=frame_ids,
+                        current_frame_id=int(frame_id),
+                        window_radius=frame_window_radius,
+                    )
+                    local_seed_track, local_seed_meta = self._build_edge_pose_seed_track(
+                        obj_id=obj_id,
+                        frame_ids=local_seed_frame_ids,
+                        verts=verts,
+                        obj_traj=obj_traj,
+                        detection_frames=detection_frames,
+                        depth_maps_dir=depth_maps_dir,
+                        cam_traj=cam_traj,
+                        wildgs_poses=wildgs_poses,
+                        wildgs_K=wildgs_K,
+                        scene_up=scene_up,
+                        road_geometry=road_geometry,
+                    )
                 vehicle_pose_context = self._vehicle_pose_context_for_task(
                     obj_id=obj_id,
                     frame_id=int(frame_id),
@@ -1898,8 +1921,15 @@ class ProjectExecutor:
                     camera=camera,
                     detection_frames=detection_frames,
                     road_geometry=road_geometry,
-                    mesh_axis_prior=mesh_axis_prior,
-                    target_window_radius=frame_window_radius,
+                    mesh_axis_prior=self._mesh_axis_prior_for_pose_optimizer(
+                        verts,
+                        axis_roles=(
+                            local_seed_meta.get("axis_roles")
+                            if isinstance(local_seed_meta, dict)
+                            else axis_roles
+                        ),
+                    ),
+                    target_window_radius=target_window_radius,
                 )
                 vehicle_pose_context["temporal_window"] = {
                     "mode": target_frame_mode,
@@ -1919,9 +1949,12 @@ class ProjectExecutor:
                     glb_path=glb_path,
                     camera=camera,
                     object_node=object_nodes.get(obj_id),
-                    object_track=seed_track,
+                    object_track=local_seed_track,
                     vehicle_pose_context=vehicle_pose_context,
-                    temporal_prior_pose=self._edge_pose_temporal_prior_payload(previous_accepted),
+                    temporal_prior_pose=self._edge_pose_candidate_temporal_prior_payload(
+                        previous_candidate_prior if all_frames_mode else previous_accepted,
+                        all_frames_mode=all_frames_mode,
+                    ),
                 )
 
                 attempted_frames += 1
@@ -2007,17 +2040,29 @@ class ProjectExecutor:
                 pose_record["reason"] = decision.get("reason", "")
 
                 if decision.get("accepted"):
-                    accepted_frames += 1
-                    accepted_records.append(pose_record)
-                    previous_accepted = pose_record
-                    updated_scale_prior = self._pose_track_scale_prior(
-                        accepted_records,
-                        source="accepted_track_median_scale",
-                        require_high_quality=True,
-                        max_frame_id=int(frame_id),
-                    )
-                    if updated_scale_prior:
-                        track_scale_prior = updated_scale_prior
+                    if all_frames_mode:
+                        previous_candidate_prior = pose_record
+                        all_frame_prior_records.append(pose_record)
+                        updated_scale_prior = self._pose_track_scale_prior(
+                            all_frame_prior_records,
+                            source="accepted_track_median_scale",
+                            require_high_quality=True,
+                            max_frame_id=int(frame_id),
+                        )
+                        if updated_scale_prior:
+                            track_scale_prior = updated_scale_prior
+                    else:
+                        accepted_frames += 1
+                        accepted_records.append(pose_record)
+                        previous_accepted = pose_record
+                        updated_scale_prior = self._pose_track_scale_prior(
+                            accepted_records,
+                            source="accepted_track_median_scale",
+                            require_high_quality=True,
+                            max_frame_id=int(frame_id),
+                        )
+                        if updated_scale_prior:
+                            track_scale_prior = updated_scale_prior
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
                 else:
                     rejected_frames += 1
@@ -2337,12 +2382,15 @@ class ProjectExecutor:
         detection_frames: list[dict],
         min_bbox_area_px: float,
     ) -> list[int]:
+        frame_range = ProjectExecutor._pose_frame_id_range_filter()
         frame_ids: list[int] = []
         for entry in detection_frames or []:
             if not isinstance(entry, dict):
                 continue
             frame_id = ProjectExecutor._pose_detection_entry_frame_id(entry)
             if frame_id <= 0:
+                continue
+            if frame_range is not None and not (frame_range[0] <= frame_id <= frame_range[1]):
                 continue
             instances = entry.get("instances")
             if instances is None:
@@ -2366,6 +2414,26 @@ class ProjectExecutor:
                 frame_ids.append(frame_id)
                 break
         return sorted(set(frame_ids))
+
+    @staticmethod
+    def _pose_frame_id_range_filter() -> tuple[int, int] | None:
+        raw = str(os.environ.get("GUANWU_POSE_FRAME_ID_RANGE", "") or "").strip()
+        if not raw:
+            return None
+        text = raw.replace(":", "-").replace(",", "-")
+        parts = [part.strip() for part in text.split("-") if part.strip()]
+        if len(parts) != 2:
+            return None
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+        except ValueError:
+            return None
+        if start <= 0 or end <= 0:
+            return None
+        if end < start:
+            start, end = end, start
+        return start, end
 
     @staticmethod
     def _pose_dynamic_window_radius(
@@ -4134,6 +4202,48 @@ class ProjectExecutor:
         }
 
     @staticmethod
+    def _edge_pose_candidate_temporal_prior_payload(
+        previous: dict | None,
+        *,
+        all_frames_mode: bool,
+    ) -> dict | None:
+        if previous is None:
+            return None
+        # all_frames still must not read stale result folders from disk during
+        # candidate generation, but the current run's last accepted pose is a
+        # useful trust-region seed and mirrors the target-window path.
+        return ProjectExecutor._edge_pose_temporal_prior_payload(previous)
+
+    @staticmethod
+    def _pose_local_seed_frame_ids(
+        *,
+        frame_ids: list[int],
+        current_frame_id: int,
+        window_radius: int,
+    ) -> list[int]:
+        frames = sorted({int(fid) for fid in frame_ids if int(fid) > 0})
+        if not frames:
+            return [int(current_frame_id)]
+        radius = max(0, int(window_radius))
+        current = int(current_frame_id)
+        desired_count = max(1, radius * 2 + 1)
+        local = sorted(fid for fid in frames if abs(fid - current) <= radius)
+        if current in frames and current not in local:
+            local.append(current)
+            local.sort()
+        if local and len(local) < desired_count:
+            selected = set(local)
+            for fid in sorted(frames, key=lambda item: (abs(item - current), item)):
+                selected.add(fid)
+                if len(selected) >= desired_count:
+                    break
+            local = sorted(selected)
+        if local:
+            return local
+        nearest = min(frames, key=lambda fid: abs(fid - current))
+        return [nearest]
+
+    @staticmethod
     def _pose_track_scale_prior(
         records: list[dict],
         *,
@@ -4568,7 +4678,7 @@ class ProjectExecutor:
         else:
             heading_window = 8
             if target_window_radius is not None:
-                heading_window = max(1, int(target_window_radius))
+                heading_window = max(8, int(target_window_radius))
             heading_prior = self._motion_heading_prior_for_track(
                 obj_id=obj_id,
                 frame_id=frame_id,

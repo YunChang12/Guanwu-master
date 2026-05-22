@@ -8,7 +8,13 @@ import numpy as np
 
 import guanwu.video.project.executor as project_executor
 from guanwu.video.project.executor import ProjectExecutor
-from process.pose_optimizer.strategies.temporal_fast import compute_road_and_heading_score, choose_best_refined_result
+from process.pose_optimizer.strategies.temporal_fast import (
+    compute_road_and_heading_score,
+    choose_best_refined_result,
+    should_skip_disk_temporal_prior,
+    select_pareto_refine_candidates,
+)
+from process.pose_optimizer.strategies.fast import build_vehicle_pose_context
 from process.pose_optimizer.strategies.fast import world_up_vector_from_arg
 
 
@@ -232,6 +238,155 @@ def test_motion_heading_prior_respects_target_window_radius() -> None:
     assert prior["to_frame"] == 5
 
 
+def test_all_frames_seed_uses_local_window_frame_ids() -> None:
+    local = ProjectExecutor._pose_local_seed_frame_ids(
+        frame_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        current_frame_id=2,
+        window_radius=2,
+    )
+
+    assert local == [1, 2, 3, 4, 5]
+
+
+def test_all_frames_candidate_pass_can_use_in_memory_temporal_prior() -> None:
+    previous = _pose_record(frame_id=1, x=0.0, yaw_deg=-178.0, scale=2.5)
+
+    prior = ProjectExecutor._edge_pose_candidate_temporal_prior_payload(
+        previous,
+        all_frames_mode=True,
+    )
+
+    assert prior is not None
+    assert prior["source"] == "previous_accepted_pose_in_memory"
+    assert prior["frame_id"] == 1
+    assert prior["pose"]["scale"] == [2.5, 2.5, 2.5]
+
+
+def test_all_frames_scale_prior_uses_previous_accepted_records_only() -> None:
+    previous_records = [
+        _pose_record(frame_id=1, scale=2.50, mask_iou=0.91, bbox_iou=0.93),
+        _pose_record(frame_id=2, scale=2.60, mask_iou=0.92, bbox_iou=0.94),
+    ]
+
+    prior = ProjectExecutor._pose_track_scale_prior(
+        previous_records,
+        source="accepted_track_median_scale",
+        require_high_quality=True,
+        max_frame_id=3,
+    )
+
+    assert prior is not None
+    assert prior["frame_ids"] == [1, 2]
+    assert prior["sample_count"] == 2
+    assert prior["scale"] == [2.55, 2.55, 2.55]
+
+
+def test_all_frame_candidate_frame_ids_respect_optional_env_range(monkeypatch) -> None:
+    detections = []
+    for frame_id in range(1, 8):
+        detections.append(
+            {
+                "frame_id": frame_id,
+                "instances": [
+                    {
+                        "object_id": "obj_000003",
+                        "concept_label": "car",
+                        "bbox_xyxy": [10.0, 20.0, 90.0, 100.0],
+                    }
+                ],
+            }
+        )
+    monkeypatch.setenv("GUANWU_POSE_FRAME_ID_RANGE", "1-5")
+
+    frame_ids = ProjectExecutor._pose_all_frame_candidate_frame_ids(
+        obj_id="obj_000003",
+        detection_frames=detections,
+        min_bbox_area_px=1000.0,
+    )
+
+    assert frame_ids == [1, 2, 3, 4, 5]
+
+
+def test_vehicle_pose_context_heading_uses_long_track_window_despite_dynamic_radius() -> None:
+    detections = []
+    for frame_id in range(1, 12):
+        detections.append(
+            {
+                "frame_id": frame_id,
+                "instances": [
+                    {
+                        "object_id": "obj_000001",
+                        "bbox_xyxy": [
+                            200.0 - frame_id * 5.0,
+                            170.0 + frame_id * 9.0,
+                            300.0 - frame_id * 2.0,
+                            300.0 + frame_id * 8.0,
+                        ],
+                    }
+                ],
+            }
+        )
+
+    class DummyExecutor:
+        _vehicle_pose_context_for_task = ProjectExecutor._vehicle_pose_context_for_task
+        _motion_heading_prior_for_track = ProjectExecutor._motion_heading_prior_for_track
+
+        def _get_instance_for_frame(self, obj_id, frame_id, detection_frames):
+            for entry in detection_frames:
+                if entry.get("frame_id") != frame_id:
+                    continue
+                for inst in entry.get("instances", []):
+                    if inst.get("object_id") == obj_id:
+                        return inst
+            return None
+
+    context = DummyExecutor()._vehicle_pose_context_for_task(
+        obj_id="obj_000001",
+        frame_id=1,
+        bbox_xyxy=[195.0, 179.0, 298.0, 308.0],
+        camera={},
+        detection_frames=detections,
+        road_geometry=None,
+        target_window_radius=2,
+    )
+
+    prior = context["heading_prior"]
+    assert prior["target_window_radius"] >= 8
+    assert prior["to_frame"] >= 9
+    assert prior["displacement_px"] > 35.0
+
+
+def test_refine_candidate_selection_always_keeps_task_json_corrected_pose() -> None:
+    args = type("Args", (), {"pareto_refine_selection_enabled": True})()
+    candidates = [
+        {
+            "score": 2.0 - idx * 0.01,
+            "translation_cam": [float(idx), 0.0, 8.0],
+            "rotation_cam": np.eye(3).tolist(),
+            "scale": [1.0, 1.0, 1.0],
+            "initializer_metadata": {"source": "coarse_search"},
+        }
+        for idx in range(4)
+    ]
+    corrected = {
+        "score": 1.2,
+        "translation_cam": [99.0, 0.0, 8.0],
+        "rotation_cam": np.eye(3).tolist(),
+        "scale": [1.0, 1.0, 1.0],
+        "initializer_metadata": {"source": "task_json_corrected_pose"},
+    }
+
+    selected = select_pareto_refine_candidates(
+        [*candidates, corrected],
+        refine_top_k=4,
+        args=args,
+        truncation_info={"is_truncated": False},
+    )
+
+    assert len(selected) == 4
+    assert any(item["initializer_metadata"]["source"] == "task_json_corrected_pose" for item in selected)
+
+
 def test_depth_trend_does_not_hard_reject_good_heading_alignment() -> None:
     args = type(
         "Args",
@@ -313,6 +468,237 @@ def test_depth_trend_does_not_hard_reject_good_heading_alignment() -> None:
 
     assert result["heading_prior_angle_error_deg"] < 1e-6
     assert result["heading_front_sign_hard_rejected"] is False
+
+
+def test_all_frames_context_skips_disk_temporal_prior_lookup() -> None:
+    assert should_skip_disk_temporal_prior(
+        {
+            "temporal_window": {
+                "mode": "all_frames",
+                "dynamic": True,
+                "radius": 2,
+            }
+        }
+    )
+    assert not should_skip_disk_temporal_prior(
+        {
+            "temporal_window": {
+                "mode": "target_window",
+                "dynamic": True,
+                "radius": 2,
+            }
+        }
+    )
+
+
+def test_vehicle_pose_context_preserves_temporal_window_for_optimizer() -> None:
+    task = {
+        "object_id": "obj_000003",
+        "frame_idx": 2,
+        "vehicle_pose_context": {
+            "temporal_window": {
+                "mode": "all_frames",
+                "base_radius": 2,
+                "radius": 2,
+                "dynamic": True,
+            },
+            "heading_prior": {"enabled": False},
+        },
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "vehicle_mesh_axis_override_enabled": False,
+            "road_depth_fallback_enabled": False,
+        },
+    )()
+
+    context = build_vehicle_pose_context(
+        task=task,
+        sample_dir=Path("E:/QingYan/Guanwu-master2/workspace/projects/video/codex_allframes_20260521_1600/outputs/08_pose_optimize/tasks/obj_000003@000002"),
+        full_mask=np.zeros((10, 10), dtype=np.uint8),
+        json_bbox=[1.0, 1.0, 8.0, 8.0],
+        image_size=(10, 10),
+        intrinsics={"fx": 1.0, "fy": 1.0, "cx": 5.0, "cy": 5.0},
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        args=args,
+    )
+
+    assert context["temporal_window"]["mode"] == "all_frames"
+    assert should_skip_disk_temporal_prior(context)
+
+
+def test_bbox_motion_front_sign_does_not_penalize_same_half_plane_alignment() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "heading_prior_enabled": True,
+            "mesh_tail_light_front_sign_enabled": False,
+            "bbox_area_trend_front_sign_enabled": True,
+            "bbox_area_trend_front_sign_min_confidence": 0.75,
+            "bbox_area_trend_front_sign_min_monotonicity": 0.75,
+            "bbox_area_trend_front_sign_min_axis_confidence": 0.50,
+            "bbox_area_trend_front_sign_confidence_scale": 0.90,
+            "heading_prior_sigma_deg": 25.0,
+            "heading_prior_weight": 0.03,
+            "front_sign_heading_prior_weight": 0.10,
+            "front_sign_mismatch_penalty": 0.8,
+            "front_sign_angle_penalty_weight": 1.2,
+            "front_sign_hard_gate_enabled": True,
+            "front_sign_hard_gate_angle_deg": 120.0,
+            "front_sign_hard_gate_min_confidence": 0.25,
+            "front_sign_depth_trend_enabled": False,
+            "truncated_heading_prior_weight": 0.08,
+            "road_constraint_enabled": False,
+        },
+    )()
+    vehicle_pose_context = {
+        "heading_prior": {
+            "enabled": True,
+            "confidence": 0.35,
+            "vector_image": [0.7660444431, 0.6427876097],
+            "bbox_area_trend": {
+                "direction": "approaching",
+                "confidence": 1.0,
+                "monotonicity": 1.0,
+                "truncated_tail": False,
+            },
+        }
+    }
+    mesh_meta = {
+        "axis_prior": {
+            "forward_axis_idx": 2,
+            "forward_sign": 1.0,
+            "confidence": 0.75,
+        }
+    }
+    rotation_cam = np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    result = compute_road_and_heading_score(
+        translation_cam=np.zeros(3, dtype=np.float64),
+        rotation_cam=rotation_cam,
+        scale=np.ones(3, dtype=np.float64),
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        mesh_meta=mesh_meta,
+        vehicle_pose_context=vehicle_pose_context,
+        projected_bbox=[0.0, 0.0, 10.0, 10.0],
+        image_size=(640, 360),
+        truncation_info={"is_truncated": False},
+        initializer_metadata={},
+        args=args,
+    )
+
+    assert result["heading_front_sign_enabled"] is True
+    assert 40.0 < result["heading_prior_angle_error_deg"] < 60.0
+    assert result["heading_front_sign_hard_rejected"] is False
+    assert result["heading_front_angle_penalty"] == 0.0
+    assert result["heading_front_sign_penalty"] == 0.0
+
+
+def test_bbox_area_trend_enables_front_sign_without_tail_light_prior() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "heading_prior_enabled": True,
+            "mesh_tail_light_front_sign_enabled": True,
+            "mesh_tail_light_front_sign_min_confidence": 0.2,
+            "mesh_tail_light_front_sign_standalone_min_confidence": 0.75,
+            "mesh_tail_light_front_sign_standalone_min_density_ratio": 5.0,
+            "tail_light_motion_consistency_flip_enabled": True,
+            "tail_light_motion_consistency_min_confidence": 0.6,
+            "tail_light_motion_consistency_flip_margin": 0.2,
+            "heading_prior_sigma_deg": 25.0,
+            "heading_prior_weight": 0.03,
+            "front_sign_heading_prior_weight": 0.10,
+            "front_sign_mismatch_penalty": 0.8,
+            "front_sign_angle_penalty_weight": 1.2,
+            "front_sign_hard_gate_enabled": True,
+            "front_sign_hard_gate_angle_deg": 120.0,
+            "front_sign_hard_gate_min_confidence": 0.25,
+            "front_sign_depth_trend_enabled": True,
+            "front_sign_depth_trend_penalty": 0.45,
+            "front_sign_depth_trend_hard_gate_score_min": 0.35,
+            "front_sign_depth_trend_min_monotonicity": 0.75,
+            "front_sign_depth_trend_hard_gate_min_heading_angle_deg": 0.0,
+            "bbox_area_trend_front_sign_enabled": True,
+            "bbox_area_trend_front_sign_min_confidence": 0.75,
+            "bbox_area_trend_front_sign_min_monotonicity": 0.75,
+            "bbox_area_trend_front_sign_confidence_scale": 0.7,
+            "truncated_heading_prior_weight": 0.08,
+            "road_constraint_enabled": False,
+        },
+    )()
+    vehicle_pose_context = {
+        "heading_prior": {
+            "enabled": True,
+            "confidence": 0.35,
+            "vector_image": [1.0, 0.0],
+            "bbox_area_trend": {
+                "direction": "approaching",
+                "confidence": 1.0,
+                "monotonicity": 1.0,
+                "truncated_tail": False,
+            },
+        },
+        "mesh_tail_light_prior": {
+            "available": False,
+            "axis_idx": 2,
+            "front_sign": 1.0,
+            "confidence": 0.1,
+            "strong_available": False,
+            "density_ratio": 1.0,
+        },
+    }
+    mesh_meta = {
+        "axis_prior": {
+            "forward_axis_idx": 2,
+            "forward_sign": 1.0,
+        }
+    }
+
+    reversed_result = compute_road_and_heading_score(
+        translation_cam=np.zeros(3, dtype=np.float64),
+        rotation_cam=np.eye(3, dtype=np.float64),
+        scale=np.ones(3, dtype=np.float64),
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        mesh_meta=mesh_meta,
+        vehicle_pose_context=vehicle_pose_context,
+        projected_bbox=[0.0, 0.0, 10.0, 10.0],
+        image_size=(640, 360),
+        truncation_info={"is_truncated": False},
+        initializer_metadata={},
+        args=args,
+    )
+    correct_result = compute_road_and_heading_score(
+        translation_cam=np.zeros(3, dtype=np.float64),
+        rotation_cam=np.diag([1.0, 1.0, -1.0]),
+        scale=np.ones(3, dtype=np.float64),
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        mesh_meta=mesh_meta,
+        vehicle_pose_context=vehicle_pose_context,
+        projected_bbox=[0.0, 0.0, 10.0, 10.0],
+        image_size=(640, 360),
+        truncation_info={"is_truncated": False},
+        initializer_metadata={},
+        args=args,
+    )
+
+    assert reversed_result["heading_front_sign_enabled"] is True
+    assert reversed_result["heading_depth_trend_score"] < 0.35
+    assert reversed_result["heading_front_sign_hard_rejected"] is True
+    assert correct_result["heading_front_sign_enabled"] is True
+    assert correct_result["heading_depth_trend_score"] > 0.65
+    assert correct_result["heading_front_sign_hard_rejected"] is False
 
 
 def test_pose_tracks_build_refined_object_trajectories() -> None:

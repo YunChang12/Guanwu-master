@@ -272,6 +272,25 @@ def find_temporal_prior(
     return None
 
 
+def should_skip_disk_temporal_prior(vehicle_pose_context: dict[str, Any] | None) -> bool:
+    """Return True when temporal candidates must not read stale result dirs.
+
+    The all-frames pipeline first generates independent per-frame candidates and
+    only later chooses a smooth trajectory.  Looking up the previous frame from
+    disk during that candidate pass can make an early wrong heading become a
+    strong temporal seed for every later frame.
+    """
+
+    if not isinstance(vehicle_pose_context, dict):
+        return False
+    if bool(vehicle_pose_context.get("disable_disk_temporal_prior")):
+        return True
+    window = vehicle_pose_context.get("temporal_window")
+    if not isinstance(window, dict):
+        return False
+    return str(window.get("mode") or "").lower() == "all_frames"
+
+
 def rotation_angle_deg(rotation_delta: np.ndarray) -> float:
     value = (float(np.trace(rotation_delta)) - 1.0) * 0.5
     value = max(-1.0, min(1.0, value))
@@ -400,6 +419,7 @@ def compute_road_and_heading_score(
         "heading_prior_angle_error_deg": None,
         "heading_front_sign_enabled": False,
         "heading_front_sign_confidence": 0.0,
+        "heading_front_sign_source": None,
         "heading_candidate_forward_sign": None,
         "heading_semantic_front_sign": None,
         "heading_tail_light_front_sign": None,
@@ -558,6 +578,7 @@ def compute_road_and_heading_score(
     semantic_front_sign = forward_sign
     tail_front_sign = None
     tail_flipped = False
+    front_sign_source = None
     sign_mismatch = False
 
     if (
@@ -578,6 +599,7 @@ def compute_road_and_heading_score(
         )
         if front_confidence >= min_conf and (motion_target is not None or strong_tail_prior):
             front_sign_enabled = True
+            front_sign_source = "mesh_tail_light"
             tail_front_sign = -1.0 if float(tail_prior.get("front_sign", forward_sign)) < 0.0 else 1.0
             semantic_front_sign = tail_front_sign
             semantic_forward_cam = fast.normalize(rotation_cam @ fast.axis_vector(forward_axis, semantic_front_sign))
@@ -603,6 +625,39 @@ def compute_road_and_heading_score(
                     semantic_forward_cam = opposite_forward_cam
                     sign_mismatch = float(forward_sign) != float(semantic_front_sign)
 
+    if (
+        not front_sign_enabled
+        and bool(getattr(args, "bbox_area_trend_front_sign_enabled", True))
+        and isinstance(area_trend, dict)
+        and area_trend.get("direction") in ("approaching", "receding")
+        and not bool(area_trend.get("truncated_tail"))
+        and not bool(truncation_info.get("is_truncated"))
+    ):
+        trend_conf = float(np.clip(float(area_trend.get("confidence", 0.0) or 0.0), 0.0, 1.0))
+        trend_monotonicity = float(np.clip(float(area_trend.get("monotonicity", 1.0) or 0.0), 0.0, 1.0))
+        axis_confidence = float(np.clip(float(axis_prior.get("confidence", 1.0) or 0.0), 0.0, 1.0))
+        if (
+            trend_conf >= float(getattr(args, "bbox_area_trend_front_sign_min_confidence", 0.75))
+            and trend_monotonicity >= float(getattr(args, "bbox_area_trend_front_sign_min_monotonicity", 0.75))
+            and axis_confidence >= float(getattr(args, "bbox_area_trend_front_sign_min_axis_confidence", 0.50))
+        ):
+            front_sign_enabled = True
+            front_sign_source = "bbox_area_trend"
+            front_confidence = float(
+                np.clip(
+                    trend_conf
+                    * trend_monotonicity
+                    * axis_confidence
+                    * float(getattr(args, "bbox_area_trend_front_sign_confidence_scale", 0.90)),
+                    0.0,
+                    1.0,
+                )
+            )
+            semantic_front_sign = default_forward_sign
+            semantic_forward_cam = fast.normalize(rotation_cam @ fast.axis_vector(forward_axis, semantic_front_sign))
+            sign_mismatch = float(forward_sign) != float(semantic_front_sign)
+
+    bbox_motion_front_sign_only = front_sign_source == "bbox_area_trend"
     hard_reject = False
     heading_confidence = float(heading.get("confidence", 1.0) or 0.0) if heading_motion_enabled else 0.0
     heading_confidence = float(np.clip(heading_confidence, 0.0, 1.0))
@@ -611,6 +666,7 @@ def compute_road_and_heading_score(
             {
                 "heading_front_sign_enabled": True,
                 "heading_front_sign_confidence": front_confidence,
+                "heading_front_sign_source": front_sign_source,
                 "heading_candidate_forward_sign": forward_sign,
                 "heading_semantic_front_sign": semantic_front_sign,
                 "heading_tail_light_front_sign": tail_front_sign,
@@ -641,7 +697,14 @@ def compute_road_and_heading_score(
                         float(result.get("heading_front_sign_penalty") or 0.0),
                         float(getattr(args, "front_sign_mismatch_penalty", 0.80)) * confidence,
                     )
-                front_angle_penalty = float(getattr(args, "front_sign_angle_penalty_weight", 1.20)) * confidence * (1.0 - planar_score)
+                if bbox_motion_front_sign_only and angle < 90.0:
+                    weight = 0.0
+                else:
+                    front_angle_penalty = (
+                        float(getattr(args, "front_sign_angle_penalty_weight", 1.20))
+                        * confidence
+                        * (1.0 - planar_score)
+                    )
                 if (
                     bool(getattr(args, "front_sign_hard_gate_enabled", True))
                     and not bool(truncation_info.get("is_truncated"))
@@ -659,6 +722,7 @@ def compute_road_and_heading_score(
                     "effective_heading_prior_weight": weight,
                     "heading_front_sign_enabled": front_sign_enabled,
                     "heading_front_sign_confidence": front_confidence,
+                    "heading_front_sign_source": front_sign_source,
                     "heading_candidate_forward_sign": forward_sign,
                     "heading_semantic_front_sign": semantic_front_sign,
                     "heading_tail_light_front_sign": tail_front_sign,
@@ -2154,6 +2218,37 @@ def merge_temporal_seed(
     return selected
 
 
+def _force_source_candidate(
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    source: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return selected
+    if any(item.get("initializer_metadata", {}).get("source") == source for item in selected):
+        return selected[:limit]
+    source_item = next(
+        (item for item in candidates if item.get("initializer_metadata", {}).get("source") == source),
+        None,
+    )
+    if source_item is None:
+        return selected[:limit]
+    if len(selected) >= limit:
+        selected[-1] = source_item
+    else:
+        selected.append(source_item)
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for item in selected:
+        signature = fast.pose_signature(item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(item)
+    return unique[:limit]
+
+
 def select_pareto_refine_candidates(
     candidates: list[dict[str, Any]],
     refine_top_k: int,
@@ -2163,7 +2258,13 @@ def select_pareto_refine_candidates(
     if not candidates:
         return []
     if not bool(getattr(args, "pareto_refine_selection_enabled", True)) or not bool(truncation_info.get("is_truncated")):
-        return candidates[:refine_top_k]
+        limit = max(1, int(refine_top_k))
+        return _force_source_candidate(
+            candidates,
+            candidates[:limit],
+            "task_json_corrected_pose",
+            limit,
+        )
 
     source_candidates = list(candidates)
     if bool(getattr(args, "truncated_candidate_ground_gate_enabled", True)):
@@ -2226,6 +2327,7 @@ def select_pareto_refine_candidates(
         add(sorted(source_candidates, key=key_fn, reverse=True)[:quota])
 
     add(sorted(source_candidates, key=lambda item: float(item.get("score", -1e9)), reverse=True))
+    selected = _force_source_candidate(candidates, selected, "task_json_corrected_pose", limit)
     return selected[:limit]
 
 
@@ -2551,7 +2653,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     object_id, frame_idx = parse_task_id_from_sample_dir(sample_dir)
     suffixes = parse_suffixes(args.temporal_search_output_suffixes)
     temporal_prior = None
-    if bool(args.temporal_enabled) and frame_idx > 1:
+    skip_disk_temporal_prior = should_skip_disk_temporal_prior(vehicle_pose_context)
+    if bool(args.temporal_enabled) and frame_idx > 1 and not skip_disk_temporal_prior:
         temporal_prior = find_temporal_prior(
             output_dir=output_dir,
             object_id=object_id,
@@ -2561,7 +2664,9 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             t_world_from_cam=t_world_from_cam,
         )
 
-    if temporal_prior is None:
+    if temporal_prior is None and skip_disk_temporal_prior:
+        print(f"[temporal] disk prior disabled for all-frames candidate pass: {object_id}@{frame_idx:06d}")
+    elif temporal_prior is None:
         print(f"[temporal] no prior found for {object_id}@{frame_idx:06d}; falling back to fast-style scoring")
     else:
         print(
@@ -3256,6 +3361,13 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front_sign_depth_trend_weight", type=float, default=0.35)
     parser.add_argument("--front_sign_depth_trend_penalty", type=float, default=0.45)
     parser.add_argument("--front_sign_depth_trend_hard_gate_score_min", type=float, default=0.35)
+    parser.add_argument("--front_sign_depth_trend_min_monotonicity", type=float, default=0.75)
+    parser.add_argument("--front_sign_depth_trend_hard_gate_min_heading_angle_deg", type=float, default=45.0)
+    parser.add_argument("--bbox_area_trend_front_sign_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bbox_area_trend_front_sign_min_confidence", type=float, default=0.75)
+    parser.add_argument("--bbox_area_trend_front_sign_min_monotonicity", type=float, default=0.75)
+    parser.add_argument("--bbox_area_trend_front_sign_min_axis_confidence", type=float, default=0.50)
+    parser.add_argument("--bbox_area_trend_front_sign_confidence_scale", type=float, default=0.90)
     parser.add_argument("--front_sign_mismatch_penalty", type=float, default=0.80)
     parser.add_argument("--front_sign_angle_penalty_weight", type=float, default=1.20)
     parser.add_argument("--front_sign_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)

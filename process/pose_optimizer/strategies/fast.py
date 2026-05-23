@@ -1285,7 +1285,11 @@ def find_depth_map_for_task(sample_dir: Path, frame_idx: int) -> Path | None:
         if parent.name != "outputs":
             continue
         candidate = parent / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / frame_name
-        if candidate.exists():
+        try:
+            exists = candidate.exists()
+        except OSError:
+            continue
+        if exists:
             return candidate
     return None
 
@@ -1413,18 +1417,20 @@ def build_vehicle_pose_context(
     mesh_axis_prior = dict(raw_context.get("mesh_axis_prior") or {})
     if bool(getattr(args, "vehicle_mesh_axis_override_enabled", True)):
         up_axis = int(getattr(args, "vehicle_mesh_up_axis_idx", mesh_axis_prior.get("up_axis_idx", 1)))
-        up_sign = -1.0 if float(getattr(args, "vehicle_mesh_up_sign", mesh_axis_prior.get("up_sign", -1.0))) < 0 else 1.0
-        up_candidates = mesh_axis_prior.get("up_sign_candidates")
+        locked_up_sign = bool(mesh_axis_prior.get("lock_up_sign"))
+        raw_up_sign = mesh_axis_prior.get("up_sign") if locked_up_sign else getattr(args, "vehicle_mesh_up_sign", mesh_axis_prior.get("up_sign", -1.0))
+        up_sign = -1.0 if float(raw_up_sign) < 0 else 1.0
+        up_candidates = [up_sign] if locked_up_sign else mesh_axis_prior.get("up_sign_candidates")
         if not isinstance(up_candidates, list) or len(up_candidates) < 2:
-            up_candidates = [up_sign, -up_sign]
+            up_candidates = [up_sign] if locked_up_sign else [up_sign, -up_sign]
         mesh_axis_prior.update(
             {
                 "available": True,
                 "up_axis_idx": up_axis,
                 "up_sign": up_sign,
                 "up_sign_candidates": up_candidates,
-                "lock_up_sign": False,
-                "up_sign_source": "optimizer_vehicle_axis_preferred",
+                "lock_up_sign": locked_up_sign,
+                "up_sign_source": mesh_axis_prior.get("up_sign_source") if locked_up_sign else "optimizer_vehicle_axis_preferred",
             }
         )
     context = {

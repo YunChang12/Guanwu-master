@@ -9,12 +9,17 @@ import numpy as np
 import guanwu.video.project.executor as project_executor
 from guanwu.video.project.executor import ProjectExecutor
 from process.pose_optimizer.strategies.temporal_fast import (
+    classify_truncation_observability,
+    compute_visible_bbox_score,
+    compute_truncated_visual_quality_gate,
     compute_road_and_heading_score,
     choose_best_refined_result,
+    detect_truncation,
     should_skip_disk_temporal_prior,
     select_pareto_refine_candidates,
 )
 from process.pose_optimizer.strategies.fast import build_vehicle_pose_context
+from process.pose_optimizer.strategies.fast import find_depth_map_for_task
 from process.pose_optimizer.strategies.fast import world_up_vector_from_arg
 
 
@@ -74,6 +79,59 @@ def test_pose_track_scale_prior_ignores_seed_track_and_outliers() -> None:
     assert prior["sample_count"] == 2
     assert np.allclose(prior["scale"], [1.05, 1.05, 1.05])
     assert prior["frame_ids"] == [3, 4]
+
+
+def test_pose_track_scale_prior_excludes_low_observability_severe_truncation() -> None:
+    anchor_a = _pose_record(frame_id=1, scale=1.0, mask_iou=0.88, bbox_iou=0.88)
+    anchor_b = _pose_record(frame_id=2, scale=1.1, mask_iou=0.86, bbox_iou=0.86)
+    severe = _pose_record(frame_id=3, scale=2.5, mask_iou=0.82, bbox_iou=0.96)
+    severe["metrics"].update(
+        {
+            "truncation_severity": "severe",
+            "low_observability": True,
+            "visible_mask_iou": 0.82,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_mean_distance_px": 8.5,
+        }
+    )
+
+    prior = ProjectExecutor._pose_track_scale_prior(
+        [anchor_a, anchor_b, severe],
+        source="accepted_track_median_scale",
+        require_high_quality=True,
+        max_frame_id=3,
+    )
+
+    assert prior is not None
+    assert prior["sample_count"] == 2
+    assert np.allclose(prior["scale"], [1.05, 1.05, 1.05])
+    assert prior["frame_ids"] == [1, 2]
+
+
+def test_pose_temporal_anchor_excludes_low_observability_severe_truncation() -> None:
+    severe = _pose_record(frame_id=3, scale=2.5, mask_iou=0.82, bbox_iou=0.96)
+    severe["metrics"].update(
+        {
+            "truncation_severity": "severe",
+            "low_observability": True,
+            "visible_mask_iou": 0.82,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_mean_distance_px": 8.5,
+        }
+    )
+    light = _pose_record(frame_id=4, scale=1.05, mask_iou=0.86, bbox_iou=0.86)
+    light["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.84,
+            "visible_bbox_iou": 0.88,
+            "visible_contour_mean_distance_px": 4.0,
+        }
+    )
+
+    assert ProjectExecutor._pose_record_updates_temporal_anchor(severe) is False
+    assert ProjectExecutor._pose_record_updates_temporal_anchor(light) is True
 
 
 def test_temporal_candidate_trajectory_prefers_smooth_pose_over_visual_outlier() -> None:
@@ -136,6 +194,186 @@ def test_temporal_candidate_trajectory_prefers_front_sign_consistent_candidate()
     assert selected[0]["trajectory_selection"]["candidate_index"] == 1
 
 
+def test_temporal_candidate_trajectory_downweights_bbox_for_severe_truncation() -> None:
+    anchor = _pose_record(frame_id=6, x=0.0, yaw_deg=0.0, score=0.90, mask_iou=0.88, bbox_iou=0.88)
+    bbox_only = _pose_record(frame_id=7, x=0.1, yaw_deg=0.0, score=1.65, mask_iou=0.72, bbox_iou=0.98)
+    bbox_only["metrics"].update(
+        {
+            "truncation_severity": "severe",
+            "low_observability": True,
+            "visible_mask_iou": 0.72,
+            "visible_bbox_iou": 0.98,
+            "visible_contour_score": 0.11,
+            "visible_contour_mean_distance_px": 8.5,
+            "visible_profile_mean_distance_px": 11.0,
+        }
+    )
+    contour_consistent = _pose_record(frame_id=7, x=0.12, yaw_deg=3.0, score=1.30, mask_iou=0.78, bbox_iou=0.86)
+    contour_consistent["metrics"].update(
+        {
+            "truncation_severity": "severe",
+            "low_observability": True,
+            "visible_mask_iou": 0.78,
+            "visible_bbox_iou": 0.86,
+            "visible_contour_score": 0.42,
+            "visible_contour_mean_distance_px": 4.5,
+            "visible_profile_mean_distance_px": 7.5,
+        }
+    )
+
+    selected, summary = ProjectExecutor._select_edge_pose_candidate_trajectory(
+        {6: [anchor], 7: [bbox_only, contour_consistent]},
+        target_frame_id=7,
+    )
+
+    assert summary["selected_frame_count"] == 2
+    assert selected[1]["metrics"]["visible_contour_mean_distance_px"] == 4.5
+    assert selected[1]["trajectory_selection"]["candidate_index"] == 1
+
+
+def test_temporal_candidate_trajectory_prefers_visible_contour_for_bottom_truncation() -> None:
+    anchor = _pose_record(frame_id=6, x=0.0, yaw_deg=0.0, score=0.90, mask_iou=0.88, bbox_iou=0.88)
+    bbox_center_fit = _pose_record(frame_id=7, x=0.1, yaw_deg=0.0, score=1.70, mask_iou=0.84, bbox_iou=0.94)
+    bbox_center_fit["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.86,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_score": 0.32,
+            "visible_contour_mean_distance_px": 4.5,
+            "visible_profile_mean_distance_px": 6.3,
+            "bbox_center_error_px": 0.7,
+        }
+    )
+    contour_fit = _pose_record(frame_id=7, x=0.14, yaw_deg=4.0, score=0.70, mask_iou=0.96, bbox_iou=0.71)
+    contour_fit["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.96,
+            "visible_bbox_iou": 0.95,
+            "visible_contour_score": 0.72,
+            "visible_contour_mean_distance_px": 1.0,
+            "visible_profile_mean_distance_px": 2.2,
+            "bbox_center_error_px": 24.0,
+        }
+    )
+
+    selected, summary = ProjectExecutor._select_edge_pose_candidate_trajectory(
+        {6: [anchor], 7: [bbox_center_fit, contour_fit]},
+        target_frame_id=7,
+    )
+
+    assert summary["selected_frame_count"] == 2
+    assert selected[1]["metrics"]["visible_contour_mean_distance_px"] == 1.0
+    assert selected[1]["trajectory_selection"]["candidate_index"] == 1
+
+
+def test_temporal_candidate_trajectory_allows_small_rotation_jump_for_strong_bottom_truncation_contour() -> None:
+    anchor = _pose_record(frame_id=5, x=0.0, yaw_deg=0.0, score=0.90, mask_iou=0.88, bbox_iou=0.88)
+    bbox_center_fit = _pose_record(frame_id=6, x=0.1, yaw_deg=0.0, score=1.69, mask_iou=0.84, bbox_iou=0.94)
+    bbox_center_fit["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.86,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_score": 0.32,
+            "visible_contour_mean_distance_px": 4.5,
+            "visible_profile_mean_distance_px": 6.3,
+            "bbox_center_error_px": 0.7,
+        }
+    )
+    contour_fit = _pose_record(frame_id=6, x=0.25, yaw_deg=5.0, scale=1.10, score=0.69, mask_iou=0.96, bbox_iou=0.71)
+    contour_fit["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.96,
+            "visible_bbox_iou": 0.95,
+            "visible_contour_score": 0.72,
+            "visible_contour_mean_distance_px": 1.0,
+            "visible_profile_mean_distance_px": 2.2,
+            "bbox_center_error_px": 24.0,
+        }
+    )
+
+    selected, summary = ProjectExecutor._select_edge_pose_candidate_trajectory(
+        {5: [anchor], 6: [bbox_center_fit, contour_fit]},
+        target_frame_id=6,
+    )
+
+    assert summary["selected_frame_count"] == 2
+    assert selected[1]["metrics"]["visible_contour_mean_distance_px"] == 1.0
+    assert selected[1]["trajectory_selection"]["candidate_index"] == 1
+
+
+def test_temporal_candidate_trajectory_does_not_force_isolated_truncated_contour_jump() -> None:
+    anchor = _pose_record(frame_id=5, x=0.0, yaw_deg=0.0, score=0.90, mask_iou=0.88, bbox_iou=0.88)
+    bbox_center_fit = _pose_record(frame_id=6, x=0.1, yaw_deg=0.0, score=1.69, mask_iou=0.84, bbox_iou=0.94)
+    bbox_center_fit["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.86,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_score": 0.32,
+            "visible_contour_mean_distance_px": 4.5,
+            "visible_profile_mean_distance_px": 6.3,
+            "bbox_center_error_px": 0.7,
+        }
+    )
+    contour_anchor = _pose_record(frame_id=6, x=0.45, yaw_deg=5.0, scale=1.15, score=0.69, mask_iou=0.96, bbox_iou=0.71)
+    contour_anchor["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.96,
+            "visible_bbox_iou": 0.95,
+            "visible_contour_score": 0.72,
+            "visible_contour_mean_distance_px": 1.0,
+            "visible_profile_mean_distance_px": 2.2,
+            "bbox_center_error_px": 24.0,
+        }
+    )
+    next_bbox_path = _pose_record(frame_id=7, x=0.11, yaw_deg=1.0, scale=1.0, score=1.68, mask_iou=0.84, bbox_iou=0.94)
+    next_bbox_path["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.86,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_score": 0.34,
+            "visible_contour_mean_distance_px": 4.4,
+            "visible_profile_mean_distance_px": 6.1,
+            "bbox_center_error_px": 0.9,
+        }
+    )
+    next_contour_path = _pose_record(frame_id=7, x=0.2, yaw_deg=8.0, scale=1.0, score=1.34, mask_iou=0.86, bbox_iou=0.88)
+    next_contour_path["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.88,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_score": 0.39,
+            "visible_contour_mean_distance_px": 3.6,
+            "visible_profile_mean_distance_px": 5.2,
+            "bbox_center_error_px": 5.6,
+        }
+    )
+
+    selected, summary = ProjectExecutor._select_edge_pose_candidate_trajectory(
+        {5: [anchor], 6: [bbox_center_fit, contour_anchor], 7: [next_bbox_path, next_contour_path]},
+        target_frame_id=7,
+    )
+
+    assert summary["selected_frame_count"] == 3
+    assert selected[1]["metrics"]["visible_contour_mean_distance_px"] == 4.5
+    assert selected[1]["trajectory_selection"]["candidate_index"] == 0
+
+
 def test_optimizer_final_selection_prefers_front_sign_consistent_candidate() -> None:
     args = type(
         "Args",
@@ -170,6 +408,428 @@ def test_optimizer_final_selection_prefers_front_sign_consistent_candidate() -> 
     assert selected is not None
     assert selected["heading_prior_angle_error_deg"] == 6.0
     assert selected["final_selection_mode"] == "front_sign_consistent_rank"
+
+
+def test_truncation_observability_marks_bottom_contour_drift_as_severe() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "truncation_border_margin": 3,
+            "truncation_bbox_margin": 5,
+            "truncation_moderate_visible_mask_iou": 0.78,
+            "truncation_severe_visible_mask_iou": 0.70,
+            "truncation_moderate_contour_mean_px": 5.0,
+            "truncation_severe_contour_mean_px": 7.0,
+            "truncation_moderate_profile_mean_px": 8.0,
+            "truncation_severe_profile_mean_px": 10.0,
+            "truncation_area_drop_ratio": 0.72,
+        },
+    )()
+    mask = np.zeros((100, 160), dtype=np.uint8)
+    mask[34:100, 40:120] = 1
+
+    info = detect_truncation(
+        mask,
+        [40.0, 34.0, 120.0, 100.0],
+        (160, 100),
+        args,
+        prior_mask_area_px=None,
+    )
+    result = classify_truncation_observability(
+        info,
+        {
+            "visible_mask_iou": 0.75,
+            "visible_bbox_iou": 0.96,
+            "visible_contour_mean_distance_px": 8.5,
+            "visible_profile_mean_distance_px": 11.0,
+        },
+        args,
+    )
+
+    assert result["severity"] == "severe"
+    assert result["low_observability"] is True
+    assert "visible_contour" in result["reasons"]
+    assert info["truncation_severity"] == "severe"
+
+
+def test_truncated_visual_quality_gate_uses_visible_contour_and_mask() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "truncated_visual_quality_gate_enabled": True,
+            "truncated_visual_quality_gate_floor": 0.25,
+            "truncated_visual_gate_bbox_iou_min": 0.88,
+            "truncated_visual_gate_bbox_iou_softness": 0.08,
+            "truncated_visual_gate_center_error_px": 6.0,
+            "truncated_visual_gate_center_softness_px": 8.0,
+            "truncated_visual_gate_overflow_sigma_px": 32.0,
+            "truncated_visual_quality_penalty_weight": 0.08,
+            "truncated_visual_gate_visible_mask_iou_good": 0.78,
+            "truncated_visual_gate_visible_mask_iou_bad": 0.68,
+            "truncated_visual_gate_contour_mean_px_good": 4.5,
+            "truncated_visual_gate_contour_mean_px_bad": 7.0,
+            "truncated_visual_gate_profile_mean_px_good": 7.5,
+            "truncated_visual_gate_profile_mean_px_bad": 10.0,
+        },
+    )()
+
+    quality = compute_truncated_visual_quality_gate(
+        result={
+            "visible_bbox_iou": 0.97,
+            "visible_bbox_center_error_px": 2.0,
+            "projected_bbox": [20.0, 20.0, 130.0, 100.0],
+            "visible_mask_iou": 0.72,
+            "visible_contour_mean_distance_px": 8.5,
+            "visible_profile_mean_distance_px": 11.0,
+        },
+        image_size=(160, 100),
+        truncation_info={"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "severe"},
+        args=args,
+    )
+
+    assert quality["truncated_visual_quality_gate"] <= 0.35
+    assert "visible_contour" in quality["truncated_visual_quality_reason"]
+    assert "visible_profile" in quality["truncated_visual_quality_reason"]
+
+
+def test_bottom_truncation_quality_gate_does_not_floor_good_visible_mask_for_overflow() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "truncated_visual_quality_gate_enabled": True,
+            "truncated_visual_quality_gate_floor": 0.25,
+            "truncated_visual_gate_bbox_iou_min": 0.88,
+            "truncated_visual_gate_bbox_iou_softness": 0.08,
+            "truncated_visual_gate_center_error_px": 6.0,
+            "truncated_visual_gate_center_softness_px": 8.0,
+            "truncated_visual_gate_overflow_sigma_px": 32.0,
+            "truncated_visual_quality_penalty_weight": 0.08,
+            "truncated_visual_gate_visible_mask_iou_good": 0.78,
+            "truncated_visual_gate_visible_mask_iou_bad": 0.68,
+            "truncated_visual_gate_contour_mean_px_good": 4.5,
+            "truncated_visual_gate_contour_mean_px_bad": 7.0,
+            "truncated_visual_gate_profile_mean_px_good": 7.5,
+            "truncated_visual_gate_profile_mean_px_bad": 10.0,
+        },
+    )()
+
+    quality = compute_truncated_visual_quality_gate(
+        result={
+            "visible_bbox_iou": 0.95,
+            "visible_bbox_center_error_px": 2.0,
+            "projected_bbox": [20.0, 20.0, 130.0, 170.0],
+            "visible_mask_iou": 0.96,
+            "visible_contour_mean_distance_px": 1.0,
+            "visible_profile_mean_distance_px": 2.2,
+        },
+        image_size=(160, 100),
+        truncation_info={"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "light"},
+        args=args,
+    )
+
+    assert quality["truncated_visual_quality_gate"] > 0.80
+    assert quality["truncated_visual_overflow_factor"] < 1.0
+
+
+def test_truncated_visible_bbox_uses_visible_rendered_mask_bbox() -> None:
+    args = type("Args", (), {"ignore_truncated_border_band_px": 16})()
+    rendered_mask = np.zeros((100, 160), dtype=np.uint8)
+    rendered_mask[25:84, 45:115] = 1
+    rendered_mask[84:100, 20:150] = 1
+    target_mask = np.zeros((100, 160), dtype=np.uint8)
+    target_mask[25:84, 45:115] = 1
+
+    score = compute_visible_bbox_score(
+        projected_bbox=[20.0, 25.0, 150.0, 140.0],
+        target_bbox=[45.0, 25.0, 115.0, 100.0],
+        image_size=(160, 100),
+        truncation_info={"is_truncated": True, "truncation_sides": ["bottom"]},
+        args=args,
+        rendered_mask=rendered_mask,
+        target_mask=target_mask,
+    )
+
+    assert score["visible_projected_bbox"] == [45.0, 25.0, 115.0, 84.0]
+    assert score["visible_target_bbox"] == [45.0, 25.0, 115.0, 84.0]
+    assert score["visible_bbox_iou"] == 1.0
+
+
+def test_truncated_visible_bbox_falls_back_without_visible_mask() -> None:
+    args = type("Args", (), {"ignore_truncated_border_band_px": 16})()
+
+    score = compute_visible_bbox_score(
+        projected_bbox=[20.0, 25.0, 150.0, 140.0],
+        target_bbox=[45.0, 25.0, 115.0, 100.0],
+        image_size=(160, 100),
+        truncation_info={"is_truncated": True, "truncation_sides": ["bottom"]},
+        args=args,
+    )
+
+    assert score["visible_projected_bbox"] == [20.0, 25.0, 150.0, 84.0]
+    assert score["visible_target_bbox"] == [45.0, 25.0, 115.0, 84.0]
+
+
+def test_severe_bottom_truncation_disables_bbox_bottom_but_keeps_heading_prior() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "road_constraint_enabled": True,
+            "ground_contact_sample_count": 16,
+            "ground_contact_sample_percentile": 8.0,
+            "ground_contact_sigma_m": 0.18,
+            "ground_contact_hard_gate_enabled": True,
+            "ground_contact_hard_gate_mean_m": 0.30,
+            "ground_contact_hard_gate_max_m": 0.60,
+            "bbox_bottom_ground_sigma_m": 0.45,
+            "road_constraint_weight": 0.25,
+            "bbox_bottom_ground_weight": 0.15,
+            "bottom_truncated_ground_contact_weight_factor": 1.60,
+            "bottom_truncated_ground_weight_factor": 0.25,
+            "severe_bottom_truncated_bbox_bottom_weight_factor": 0.0,
+            "bottom_truncated_ground_soft_tolerance_m": 0.12,
+            "bottom_truncated_ground_penalty_weight": 0.35,
+            "bottom_truncated_ground_penalty_sigma_m": 0.18,
+            "upright_angle_sigma_deg": 10.0,
+            "upright_strong_penalty_angle_deg": 15.0,
+            "upright_hard_gate_max_angle_deg": 60.0,
+            "upright_hard_gate_enabled": True,
+            "upright_hard_gate_sigma_deg": 15.0,
+            "upright_hard_gate_penalty": 2.0,
+            "upright_weight": 0.10,
+            "heading_prior_enabled": True,
+            "heading_prior_sigma_deg": 25.0,
+            "heading_prior_weight": 0.06,
+            "front_sign_heading_prior_weight": 0.18,
+            "truncated_heading_prior_weight": 0.08,
+            "severe_truncation_heading_prior_weight": 0.18,
+            "heading_prior_lock_front_sign": False,
+            "mesh_tail_light_front_sign_enabled": False,
+            "bbox_area_trend_front_sign_enabled": False,
+            "front_sign_hard_gate_enabled": True,
+            "front_sign_hard_gate_min_confidence": 0.25,
+            "front_sign_hard_gate_angle_deg": 120.0,
+            "front_sign_depth_trend_enabled": False,
+            "world_up_axis": "y",
+        },
+    )()
+    vehicle_pose_context = {
+        "road_constraint": {
+            "available": True,
+            "road_plane": {"normal_world": [0.0, 1.0, 0.0], "offset": 0.0},
+            "bbox_bottom_ground": {"point_world": [0.0, 0.0, 8.0]},
+        },
+        "heading_prior": {
+            "enabled": True,
+            "confidence": 1.0,
+            "vector_image": [1.0, 0.0],
+            "source": "temporal_anchor",
+        },
+    }
+    mesh_meta = {
+        "axis_prior": {
+            "up_axis_idx": 1,
+            "up_sign": 1.0,
+            "forward_axis_idx": 2,
+            "forward_sign": 1.0,
+        },
+        "bounds": [[-1.0, 0.0, -2.0], [1.0, 1.0, 2.0]],
+    }
+
+    result = compute_road_and_heading_score(
+        translation_cam=np.array([0.0, 0.0, 8.0], dtype=np.float64),
+        rotation_cam=np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [-1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        scale=np.ones(3, dtype=np.float64),
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        mesh_meta=mesh_meta,
+        vehicle_pose_context=vehicle_pose_context,
+        projected_bbox=[20.0, 20.0, 120.0, 100.0],
+        image_size=(160, 100),
+        truncation_info={"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "severe"},
+        initializer_metadata={},
+        args=args,
+    )
+
+    assert result["effective_bbox_bottom_weight"] == 0.0
+    assert result["effective_ground_contact_weight"] > 0.0
+    assert result["effective_heading_prior_weight"] >= 0.18
+
+
+def test_severe_truncated_final_selection_rejects_bbox_only_candidate() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.055,
+            "final_ground_select_max_max_m": 0.12,
+            "truncated_final_visual_selection_enabled": True,
+            "truncated_final_visual_min_bbox_iou": 0.0,
+            "truncated_final_visual_min_quality_gate": 0.0,
+            "severe_truncation_final_gate_enabled": True,
+            "severe_truncation_visible_mask_iou_min": 0.68,
+            "severe_truncation_visible_contour_mean_px_max": 7.0,
+            "severe_truncation_visible_profile_mean_px_max": 10.0,
+            "severe_truncation_ground_mean_m_max": 0.085,
+            "severe_truncation_ground_max_m_max": 0.18,
+            "severe_truncation_upright_deg_max": 35.0,
+            "severe_truncation_yaw_jump_deg_max": 25.0,
+            "truncated_final_visual_mask_weight": 1.0,
+            "truncated_final_visual_contour_weight": 0.50,
+            "truncated_final_visual_bbox_weight": 0.02,
+            "truncated_final_visual_quality_weight": 0.05,
+            "truncated_final_visual_ground_mean_weight": 0.25,
+            "truncated_final_visual_ground_max_weight": 0.10,
+            "truncated_final_visual_score_weight": 0.03,
+        },
+    )()
+    bbox_only = {
+        "score": 1.9,
+        "visible_mask_iou": 0.72,
+        "visible_bbox_iou": 0.98,
+        "visible_contour_score": 0.11,
+        "visible_contour_mean_distance_px": 8.5,
+        "visible_profile_mean_distance_px": 11.0,
+        "truncated_visual_quality_gate": 0.95,
+        "ground_contact_mean_abs_m": 0.02,
+        "ground_contact_max_abs_m": 0.04,
+        "upright_angle_error_deg": 3.0,
+        "yaw_jump_from_anchor_deg": 6.0,
+    }
+    contour_consistent = {
+        "score": 1.5,
+        "visible_mask_iou": 0.78,
+        "visible_bbox_iou": 0.90,
+        "visible_contour_score": 0.42,
+        "visible_contour_mean_distance_px": 4.5,
+        "visible_profile_mean_distance_px": 7.5,
+        "truncated_visual_quality_gate": 0.92,
+        "ground_contact_mean_abs_m": 0.02,
+        "ground_contact_max_abs_m": 0.04,
+        "upright_angle_error_deg": 3.0,
+        "yaw_jump_from_anchor_deg": 6.0,
+    }
+
+    selected = choose_best_refined_result(
+        [bbox_only, contour_consistent],
+        args,
+        {"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "severe"},
+    )
+
+    assert selected is contour_consistent
+    assert bbox_only["severe_truncation_gate_passed"] is False
+    assert "visible_contour" in bbox_only["severe_truncation_gate_reasons"]
+
+
+def test_severe_truncated_final_selection_rejects_when_only_visible_bbox_matches() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.055,
+            "final_ground_select_max_max_m": 0.12,
+            "truncated_final_visual_selection_enabled": True,
+            "truncated_final_visual_min_bbox_iou": 0.0,
+            "truncated_final_visual_min_quality_gate": 0.0,
+            "severe_truncation_final_gate_enabled": True,
+            "severe_truncation_visible_mask_iou_min": 0.68,
+            "severe_truncation_visible_contour_mean_px_max": 7.0,
+            "severe_truncation_visible_profile_mean_px_max": 10.0,
+            "severe_truncation_ground_mean_m_max": 0.085,
+            "severe_truncation_ground_max_m_max": 0.18,
+            "severe_truncation_upright_deg_max": 35.0,
+            "severe_truncation_yaw_jump_deg_max": 25.0,
+            "severe_truncation_fallback_visible_mask_iou_min": 0.78,
+            "severe_truncation_fallback_visible_contour_mean_px_max": 5.0,
+            "severe_truncation_fallback_visible_profile_mean_px_max": 8.0,
+        },
+    )()
+    bbox_only = {
+        "score": 1.9,
+        "visible_mask_iou": 0.74,
+        "visible_bbox_iou": 1.0,
+        "visible_contour_score": 0.08,
+        "visible_contour_mean_distance_px": 8.3,
+        "visible_profile_mean_distance_px": 12.0,
+        "truncated_visual_quality_gate": 0.25,
+        "ground_contact_mean_abs_m": 0.01,
+        "ground_contact_max_abs_m": 0.03,
+        "upright_angle_error_deg": 3.0,
+    }
+
+    selected = choose_best_refined_result(
+        [bbox_only],
+        args,
+        {"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "severe"},
+    )
+
+    assert selected is None
+    assert bbox_only["severe_truncation_gate_passed"] is False
+    assert bbox_only["severe_truncation_fallback_rejected"] is True
+
+
+def test_severe_truncated_final_selection_rejects_tiny_visible_target_fraction() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.055,
+            "final_ground_select_max_max_m": 0.12,
+            "truncated_final_visual_selection_enabled": True,
+            "truncated_final_visual_min_bbox_iou": 0.0,
+            "truncated_final_visual_min_quality_gate": 0.0,
+            "severe_truncation_final_gate_enabled": True,
+            "severe_truncation_visible_mask_iou_min": 0.68,
+            "severe_truncation_visible_contour_mean_px_max": 7.0,
+            "severe_truncation_visible_profile_mean_px_max": 10.0,
+            "severe_truncation_visible_target_fraction_min": 0.18,
+            "severe_truncation_ground_mean_m_max": 0.085,
+            "severe_truncation_ground_max_m_max": 0.18,
+            "severe_truncation_upright_deg_max": 35.0,
+            "severe_truncation_yaw_jump_deg_max": 25.0,
+            "severe_truncation_fallback_visible_mask_iou_min": 0.76,
+            "severe_truncation_fallback_visible_contour_mean_px_max": 5.5,
+            "severe_truncation_fallback_visible_profile_mean_px_max": 8.5,
+            "severe_truncation_fallback_visible_target_fraction_min": 0.18,
+        },
+    )()
+    tiny_visible = {
+        "score": 1.7,
+        "visible_mask_iou": 0.95,
+        "visible_bbox_iou": 0.99,
+        "visible_contour_score": 0.80,
+        "visible_contour_mean_distance_px": 1.0,
+        "visible_profile_mean_distance_px": 2.0,
+        "visible_target_fraction": 0.07,
+        "truncated_visual_quality_gate": 0.97,
+        "ground_contact_mean_abs_m": 0.01,
+        "ground_contact_max_abs_m": 0.03,
+        "upright_angle_error_deg": 3.0,
+        "yaw_jump_from_anchor_deg": 3.0,
+    }
+
+    selected = choose_best_refined_result(
+        [tiny_visible],
+        args,
+        {"is_truncated": True, "truncation_sides": ["bottom"], "truncation_severity": "severe"},
+    )
+
+    assert selected is None
+    assert tiny_visible["severe_truncation_gate_passed"] is False
+    assert "visible_fraction" in tiny_visible["severe_truncation_gate_reasons"]
+    assert tiny_visible["severe_truncation_fallback_rejected"] is True
 
 
 def test_temporal_jump_rejection_can_fallback_to_high_quality_visual_pose() -> None:
@@ -529,6 +1189,54 @@ def test_vehicle_pose_context_preserves_temporal_window_for_optimizer() -> None:
     assert should_skip_disk_temporal_prior(context)
 
 
+def test_vehicle_pose_context_preserves_locked_mesh_up_sign() -> None:
+    task = {
+        "object_id": "obj_000003",
+        "frame_idx": 1,
+        "vehicle_pose_context": {
+            "mesh_axis_prior": {
+                "available": True,
+                "up_axis_idx": 1,
+                "up_sign": 1.0,
+                "up_sign_candidates": [1.0],
+                "lock_up_sign": True,
+                "up_sign_source": "sam3d_vehicle_local_positive_y_roof_prior",
+                "forward_axis_idx": 2,
+                "forward_sign": 1.0,
+                "forward_sign_candidates": [1.0, -1.0],
+                "right_axis_idx": 0,
+            },
+            "heading_prior": {"enabled": False},
+        },
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "vehicle_mesh_axis_override_enabled": True,
+            "vehicle_mesh_up_axis_idx": 1,
+            "vehicle_mesh_up_sign": -1.0,
+            "road_depth_fallback_enabled": False,
+        },
+    )()
+
+    context = build_vehicle_pose_context(
+        task=task,
+        sample_dir=Path("E:/QingYan/Guanwu-master2/workspace/projects/video/codex_allframes_20260521_1600/outputs/08_pose_optimize/tasks/obj_000003@000001"),
+        full_mask=np.zeros((10, 10), dtype=np.uint8),
+        json_bbox=[1.0, 1.0, 8.0, 8.0],
+        image_size=(10, 10),
+        intrinsics={"fx": 1.0, "fy": 1.0, "cx": 5.0, "cy": 5.0},
+        t_world_from_cam=np.eye(4, dtype=np.float64),
+        args=args,
+    )
+
+    prior = context["mesh_axis_prior"]
+    assert prior["up_sign"] == 1.0
+    assert prior["up_sign_candidates"] == [1.0]
+    assert prior["lock_up_sign"] is True
+
+
 def test_bbox_motion_front_sign_does_not_penalize_same_half_plane_alignment() -> None:
     args = type(
         "Args",
@@ -843,6 +1551,24 @@ def test_pose_target_frame_mode_reads_all_frames_env(monkeypatch) -> None:
     monkeypatch.setenv("GUANWU_POSE_TARGET_FRAME_MODE", "all_frames")
 
     assert ProjectExecutor._pose_target_frame_mode() == "all_frames"
+
+
+def test_find_depth_map_for_task_skips_inaccessible_candidates(tmp_path: Path, monkeypatch) -> None:
+    outputs_dir = tmp_path / "outputs"
+    sample_dir = outputs_dir / "08_pose_optimize" / "tasks" / "obj_000002@000003"
+    sample_dir.mkdir(parents=True)
+    inaccessible = outputs_dir / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / "00003.npy"
+
+    original_exists = Path.exists
+
+    def fake_exists(path: Path) -> bool:
+        if path == inaccessible:
+            raise PermissionError("access denied")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+
+    assert find_depth_map_for_task(sample_dir, 3) is None
 
 
 def test_pose_all_frame_candidate_frame_ids_keep_vehicle_frames_above_area() -> None:

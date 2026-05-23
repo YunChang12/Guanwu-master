@@ -31,17 +31,28 @@ TEMPORAL_EXTRA_HISTORY_KEYS = [
     "partial_score_boost",
     "visible_mask_iou",
     "visible_soft_mask_iou",
+    "visible_target_fraction",
+    "visible_target_area_px",
     "visible_bbox_iou",
     "visible_bbox_center_error_px",
     "visible_contour_score",
     "visible_contour_chamfer_score",
     "visible_profile_score",
     "visible_contour_mean_distance_px",
+    "visible_profile_mean_distance_px",
+    "visible_profile_coverage",
     "effective_visible_contour_weight",
+    "truncation_severity",
+    "low_observability",
+    "truncation_observability_score",
+    "truncation_observability_reasons",
     "truncated_visual_quality_gate",
     "truncated_visual_quality_reason",
     "truncated_visual_bbox_factor",
     "truncated_visual_center_factor",
+    "truncated_visual_mask_factor",
+    "truncated_visual_contour_factor",
+    "truncated_visual_profile_factor",
     "truncated_visual_overflow_factor",
     "truncated_visual_overflow_loss",
     "truncated_visual_quality_penalty",
@@ -518,6 +529,11 @@ def compute_road_and_heading_score(
             if "bottom" in sides:
                 ground_weight *= float(getattr(args, "bottom_truncated_ground_contact_weight_factor", 1.60))
                 bbox_weight *= float(getattr(args, "bottom_truncated_ground_weight_factor", 0.25))
+                severity = str(truncation_info.get("truncation_severity", "light"))
+                if severity == "moderate":
+                    bbox_weight *= float(getattr(args, "moderate_bottom_truncated_bbox_bottom_weight_factor", 0.40))
+                elif severity == "severe":
+                    bbox_weight *= float(getattr(args, "severe_bottom_truncated_bbox_bottom_weight_factor", 0.0))
                 tolerance = float(getattr(args, "bottom_truncated_ground_soft_tolerance_m", 0.12))
                 penalty_weight = float(getattr(args, "bottom_truncated_ground_penalty_weight", 0.35))
                 if mean_abs > tolerance:
@@ -705,15 +721,24 @@ def compute_road_and_heading_score(
                         * confidence
                         * (1.0 - planar_score)
                     )
+                hard_gate_blocked_for_truncation = (
+                    bool(truncation_info.get("is_truncated"))
+                    and angle < float(getattr(args, "front_sign_hard_gate_angle_deg", 120.0))
+                )
                 if (
                     bool(getattr(args, "front_sign_hard_gate_enabled", True))
-                    and not bool(truncation_info.get("is_truncated"))
+                    and not hard_gate_blocked_for_truncation
                     and confidence >= float(getattr(args, "front_sign_hard_gate_min_confidence", 0.25))
                     and angle >= float(getattr(args, "front_sign_hard_gate_angle_deg", 120.0))
                 ):
                     hard_reject = True
             if bool(truncation_info.get("is_truncated")):
                 weight = max(weight, float(getattr(args, "truncated_heading_prior_weight", 0.08)) * confidence)
+                if str(truncation_info.get("truncation_severity", "")) == "severe":
+                    weight = max(
+                        weight,
+                        float(getattr(args, "severe_truncation_heading_prior_weight", 0.18)) * max(confidence, heading_confidence),
+                    )
             result.update(
                 {
                     "heading_prior_score": score,
@@ -924,6 +949,179 @@ def compute_visible_mask_bonus(
     }
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _linear_factor(value: float | None, *, good: float, bad: float, higher_is_better: bool) -> float:
+    if value is None:
+        return 1.0
+    if higher_is_better:
+        if value >= good:
+            return 1.0
+        if value <= bad:
+            return 0.0
+        return float(np.clip((value - bad) / max(1e-6, good - bad), 0.0, 1.0))
+    if value <= good:
+        return 1.0
+    if value >= bad:
+        return 0.0
+    return float(np.clip(1.0 - (value - good) / max(1e-6, bad - good), 0.0, 1.0))
+
+
+def _truncation_severity_rank(severity: Any) -> int:
+    order = {"none": 0, "light": 1, "moderate": 2, "severe": 3}
+    return order.get(str(severity or "none").lower(), 0)
+
+
+def classify_truncation_observability(
+    truncation_info: dict[str, Any],
+    metrics: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Classify truncated targets by how much pose evidence remains visible."""
+
+    if not bool(truncation_info.get("is_truncated")):
+        result = {
+            "severity": "none",
+            "low_observability": False,
+            "score": 1.0,
+            "reasons": [],
+        }
+        truncation_info.update(
+            {
+                "truncation_severity": result["severity"],
+                "low_observability": result["low_observability"],
+                "truncation_observability_score": result["score"],
+                "truncation_observability_reasons": result["reasons"],
+            }
+        )
+        return result
+
+    metrics = metrics or {}
+    sides = set(truncation_info.get("truncation_sides") or [])
+    visible_mask = _finite_float(metrics.get("visible_mask_iou"))
+    visible_target_fraction = _finite_float(metrics.get("visible_target_fraction"))
+    visible_contour_mean = _finite_float(metrics.get("visible_contour_mean_distance_px"))
+    visible_profile_mean = _finite_float(metrics.get("visible_profile_mean_distance_px"))
+    area_drop_ratio = _finite_float(truncation_info.get("area_drop_ratio"))
+
+    moderate_mask = float(getattr(args, "truncation_moderate_visible_mask_iou", 0.78))
+    severe_mask = float(getattr(args, "truncation_severe_visible_mask_iou", 0.70))
+    moderate_contour = float(getattr(args, "truncation_moderate_contour_mean_px", 5.0))
+    severe_contour = float(getattr(args, "truncation_severe_contour_mean_px", 7.0))
+    moderate_profile = float(getattr(args, "truncation_moderate_profile_mean_px", 8.0))
+    severe_profile = float(getattr(args, "truncation_severe_profile_mean_px", 10.0))
+    severe_area_drop = float(getattr(args, "truncation_area_drop_ratio", 0.72))
+    moderate_visible_fraction = float(getattr(args, "truncation_moderate_visible_target_fraction", 0.35))
+    severe_visible_fraction = float(getattr(args, "truncation_severe_visible_target_fraction", 0.12))
+
+    score = 1.0
+    reasons: list[str] = []
+    severity_rank = 1
+
+    if "bottom" in sides:
+        reasons.append("bottom")
+    if "bottom" in sides and ({"left", "right"} & sides):
+        severity_rank = max(severity_rank, 3)
+        reasons.append("multi_side")
+
+    if area_drop_ratio is not None and area_drop_ratio < severe_area_drop:
+        severity_rank = max(severity_rank, 3)
+        score = min(score, max(0.0, area_drop_ratio / max(1e-6, severe_area_drop)))
+        reasons.append("area_drop")
+
+    if visible_mask is not None:
+        if visible_mask < severe_mask:
+            severity_rank = max(severity_rank, 3)
+            reasons.append("visible_mask")
+        elif visible_mask < moderate_mask:
+            severity_rank = max(severity_rank, 2)
+            reasons.append("visible_mask")
+        score = min(
+            score,
+            _linear_factor(
+                visible_mask,
+                good=moderate_mask,
+                bad=severe_mask,
+                higher_is_better=True,
+            ),
+        )
+
+    if visible_target_fraction is not None:
+        if visible_target_fraction < severe_visible_fraction:
+            severity_rank = max(severity_rank, 3)
+            reasons.append("visible_fraction")
+        elif visible_target_fraction < moderate_visible_fraction:
+            severity_rank = max(severity_rank, 2)
+            reasons.append("visible_fraction")
+        score = min(
+            score,
+            _linear_factor(
+                visible_target_fraction,
+                good=moderate_visible_fraction,
+                bad=severe_visible_fraction,
+                higher_is_better=True,
+            ),
+        )
+
+    if visible_contour_mean is not None:
+        if visible_contour_mean > severe_contour:
+            severity_rank = max(severity_rank, 3)
+            reasons.append("visible_contour")
+        elif visible_contour_mean > moderate_contour:
+            severity_rank = max(severity_rank, 2)
+            reasons.append("visible_contour")
+        score = min(
+            score,
+            _linear_factor(
+                visible_contour_mean,
+                good=moderate_contour,
+                bad=severe_contour,
+                higher_is_better=False,
+            ),
+        )
+
+    if visible_profile_mean is not None:
+        if visible_profile_mean > severe_profile:
+            severity_rank = max(severity_rank, 3)
+            reasons.append("visible_profile")
+        elif visible_profile_mean > moderate_profile:
+            severity_rank = max(severity_rank, 2)
+            reasons.append("visible_profile")
+        score = min(
+            score,
+            _linear_factor(
+                visible_profile_mean,
+                good=moderate_profile,
+                bad=severe_profile,
+                higher_is_better=False,
+            ),
+        )
+
+    severity = ("none", "light", "moderate", "severe")[int(np.clip(severity_rank, 0, 3))]
+    low_observability = severity_rank >= 2
+    result = {
+        "severity": severity,
+        "low_observability": bool(low_observability),
+        "score": float(np.clip(score, 0.0, 1.0)),
+        "reasons": sorted(set(reasons)),
+    }
+    truncation_info.update(
+        {
+            "truncation_severity": result["severity"],
+            "low_observability": result["low_observability"],
+            "truncation_observability_score": result["score"],
+            "truncation_observability_reasons": result["reasons"],
+        }
+    )
+    return result
+
+
 def compute_truncated_visual_quality_gate(
     *,
     result: dict[str, Any],
@@ -946,6 +1144,9 @@ def compute_truncated_visual_quality_gate(
             "truncated_visual_quality_reason": "not_truncated",
             "truncated_visual_bbox_factor": 1.0,
             "truncated_visual_center_factor": 1.0,
+            "truncated_visual_mask_factor": 1.0,
+            "truncated_visual_contour_factor": 1.0,
+            "truncated_visual_profile_factor": 1.0,
             "truncated_visual_overflow_factor": 1.0,
             "truncated_visual_overflow_loss": 0.0,
             "truncated_visual_quality_penalty": 0.0,
@@ -957,6 +1158,9 @@ def compute_truncated_visual_quality_gate(
             "truncated_visual_quality_reason": "disabled",
             "truncated_visual_bbox_factor": 1.0,
             "truncated_visual_center_factor": 1.0,
+            "truncated_visual_mask_factor": 1.0,
+            "truncated_visual_contour_factor": 1.0,
+            "truncated_visual_profile_factor": 1.0,
             "truncated_visual_overflow_factor": 1.0,
             "truncated_visual_overflow_loss": 0.0,
             "truncated_visual_quality_penalty": 0.0,
@@ -988,11 +1192,35 @@ def compute_truncated_visual_quality_gate(
         if "top" in sides:
             overflow_loss += (max(0.0, -py1) / overflow_sigma) ** 2
         if "bottom" in sides:
-            overflow_loss += (max(0.0, py2 - height) / overflow_sigma) ** 2
+            # Bottom truncation means the true extent is outside the image.
+            # Keep large overflow visible in diagnostics, but do not use it as
+            # a hard visual-quality gate for otherwise good visible masks.
+            overflow_loss += 0.15 * (max(0.0, py2 - height) / overflow_sigma) ** 2
     overflow_factor = float(math.exp(-min(60.0, overflow_loss)))
 
+    visible_mask = _finite_float(result.get("visible_mask_iou"))
+    mask_factor = _linear_factor(
+        visible_mask,
+        good=float(getattr(args, "truncated_visual_gate_visible_mask_iou_good", 0.78)),
+        bad=float(getattr(args, "truncated_visual_gate_visible_mask_iou_bad", 0.68)),
+        higher_is_better=True,
+    )
+    contour_factor = _linear_factor(
+        _finite_float(result.get("visible_contour_mean_distance_px")),
+        good=float(getattr(args, "truncated_visual_gate_contour_mean_px_good", 4.5)),
+        bad=float(getattr(args, "truncated_visual_gate_contour_mean_px_bad", 7.0)),
+        higher_is_better=False,
+    )
+    profile_factor = _linear_factor(
+        _finite_float(result.get("visible_profile_mean_distance_px")),
+        good=float(getattr(args, "truncated_visual_gate_profile_mean_px_good", 7.5)),
+        bad=float(getattr(args, "truncated_visual_gate_profile_mean_px_bad", 10.0)),
+        higher_is_better=False,
+    )
+
     floor = float(np.clip(getattr(args, "truncated_visual_quality_gate_floor", 0.25), 0.0, 1.0))
-    raw_gate = min(bbox_factor, center_factor, overflow_factor)
+    raw_gate = min(bbox_factor, center_factor, mask_factor, contour_factor, profile_factor)
+    raw_gate = max(0.0, raw_gate - 0.15 * (1.0 - overflow_factor))
     gate = float(np.clip(floor + (1.0 - floor) * raw_gate, floor, 1.0))
     penalty_weight = float(getattr(args, "truncated_visual_quality_penalty_weight", 0.08))
     penalty = penalty_weight * (1.0 - raw_gate)
@@ -1004,6 +1232,12 @@ def compute_truncated_visual_quality_gate(
         failed.append("visible_center")
     if overflow_factor < 0.999:
         failed.append("border_overflow")
+    if mask_factor < 0.999:
+        failed.append("visible_mask")
+    if contour_factor < 0.999:
+        failed.append("visible_contour")
+    if profile_factor < 0.999:
+        failed.append("visible_profile")
     reason = "passed" if not failed else ",".join(failed)
 
     return {
@@ -1011,6 +1245,9 @@ def compute_truncated_visual_quality_gate(
         "truncated_visual_quality_reason": reason,
         "truncated_visual_bbox_factor": bbox_factor,
         "truncated_visual_center_factor": center_factor,
+        "truncated_visual_mask_factor": mask_factor,
+        "truncated_visual_contour_factor": contour_factor,
+        "truncated_visual_profile_factor": profile_factor,
         "truncated_visual_overflow_factor": overflow_factor,
         "truncated_visual_overflow_loss": float(overflow_loss),
         "truncated_visual_quality_penalty": float(penalty),
@@ -1061,6 +1298,8 @@ def detect_truncation(
     if bottom_close and "bottom" not in sides:
         sides.append("bottom")
 
+    severity = "light" if is_truncated else "none"
+    low_observability = False
     return {
         "is_truncated": bool(is_truncated),
         "truncation_sides": sides,
@@ -1070,6 +1309,10 @@ def detect_truncation(
         "prior_mask_area_px": prior_mask_area_px,
         "area_drop_ratio": area_drop_ratio,
         "area_drop": bool(area_drop),
+        "truncation_severity": severity,
+        "low_observability": low_observability,
+        "truncation_observability_score": 1.0,
+        "truncation_observability_reasons": ["area_drop"] if area_drop else [],
     }
 
 
@@ -1110,12 +1353,21 @@ def _bbox_iou_xyxy(box_a: list[float], box_b: list[float]) -> float:
     return fast.bbox_iou(box_a, box_b)
 
 
+def _bbox_from_binary_mask(mask: np.ndarray) -> list[float] | None:
+    ys, xs = np.nonzero(mask.astype(bool))
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
+
+
 def compute_visible_bbox_score(
     projected_bbox: list[float],
     target_bbox: list[float],
     image_size: tuple[int, int],
     truncation_info: dict[str, Any],
     args: argparse.Namespace,
+    rendered_mask: np.ndarray | None = None,
+    target_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if not truncation_info.get("is_truncated"):
         bbox_iou = fast.bbox_iou(projected_bbox, target_bbox)
@@ -1131,6 +1383,21 @@ def compute_visible_bbox_score(
     projected = _clip_bbox_to_image(projected_bbox, image_size)
     target = _clip_bbox_to_image(target_bbox, image_size)
     band = max(0.0, float(getattr(args, "ignore_truncated_border_band_px", 0)))
+    visible = _visible_region_mask(image_size, truncation_info, args)
+
+    if rendered_mask is not None and target_mask is not None:
+        visible_rendered = np.logical_and(np.asarray(rendered_mask).astype(bool), visible)
+        visible_target = np.logical_and(np.asarray(target_mask).astype(bool), visible)
+        rendered_bbox = _bbox_from_binary_mask(visible_rendered)
+        target_mask_bbox = _bbox_from_binary_mask(visible_target)
+        if rendered_bbox is not None and target_mask_bbox is not None:
+            return {
+                "visible_bbox_iou": _bbox_iou_xyxy(rendered_bbox, target_mask_bbox),
+                "visible_bbox_center_error_px": fast.bbox_center_error(rendered_bbox, target_mask_bbox),
+                "visible_projected_bbox": rendered_bbox,
+                "visible_target_bbox": target_mask_bbox,
+                "visible_bbox_source": "visible_mask_bbox",
+            }
 
     if "left" in sides:
         projected[0] = max(projected[0], min(width, band))
@@ -1154,6 +1421,7 @@ def compute_visible_bbox_score(
         "visible_bbox_center_error_px": fast.bbox_center_error(projected, target),
         "visible_projected_bbox": projected,
         "visible_target_bbox": target,
+        "visible_bbox_source": "clipped_projected_bbox",
     }
 
 
@@ -1169,12 +1437,15 @@ def compute_partial_mask_score(
     target = target_mask.astype(bool)
     original_iou = fast.mask_iou(rendered_mask, target_mask)
     if not truncation_info.get("is_truncated"):
+        target_area = float(target.sum())
         return {
             "partial_mask_score": original_iou,
             "adjusted_mask_score": original_iou,
             "original_mask_iou": original_iou,
             "visible_mask_iou": original_iou,
             "visible_soft_mask_iou": fast.soft_mask_iou(rendered_mask, soft_target_mask) if soft_target_mask is not None else original_iou,
+            "visible_target_fraction": 1.0,
+            "visible_target_area_px": target_area,
         }
 
     visible = _visible_region_mask(image_size, truncation_info, args)
@@ -1210,6 +1481,9 @@ def compute_partial_mask_score(
             target_for_misses = eroded
 
     true_positive = float(np.logical_and(visible_rendered, visible_target).sum())
+    target_area = float(target.sum())
+    visible_target_area = float(visible_target.sum())
+    visible_target_fraction = 1.0 if target_area <= 0.0 else visible_target_area / target_area
     false_negative = float(np.logical_and(~visible_rendered, target_for_misses).sum())
     false_positive = float((np.logical_and(rendered, ~target).astype(np.float32) * false_positive_weight).sum())
     denom = true_positive + false_negative + false_positive
@@ -1225,6 +1499,8 @@ def compute_partial_mask_score(
         "original_mask_iou": float(original_iou),
         "visible_mask_iou": float(visible_mask_iou),
         "visible_soft_mask_iou": float(visible_soft_iou),
+        "visible_target_fraction": float(visible_target_fraction),
+        "visible_target_area_px": visible_target_area,
         "partial_score_boost": float(adjusted - original_iou),
         "partial_false_positive_weighted": false_positive,
         "partial_false_negative": false_negative,
@@ -1375,6 +1651,8 @@ def compute_truncated_bbox_constraint(
     image_size: tuple[int, int],
     truncation_info: dict[str, Any],
     args: argparse.Namespace,
+    visible_projected_bbox: list[float] | None = None,
+    visible_target_bbox: list[float] | None = None,
 ) -> dict[str, Any]:
     if not bool(args.truncated_bbox_constraint_enabled) or not truncation_info.get("is_truncated"):
         return {
@@ -1385,8 +1663,13 @@ def compute_truncated_bbox_constraint(
         }
 
     width, height = [float(v) for v in image_size]
-    px1, py1, px2, py2 = [float(v) for v in projected_bbox]
-    tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox]
+    visible_bbox_available = visible_projected_bbox is not None and visible_target_bbox is not None
+    if visible_bbox_available:
+        px1, py1, px2, py2 = [float(v) for v in visible_projected_bbox]
+        tx1, ty1, tx2, ty2 = [float(v) for v in visible_target_bbox]
+    else:
+        px1, py1, px2, py2 = [float(v) for v in projected_bbox]
+        tx1, ty1, tx2, ty2 = [float(v) for v in target_bbox]
     projected_cx = 0.5 * (px1 + px2)
     target_cx = 0.5 * (tx1 + tx2)
 
@@ -1400,7 +1683,7 @@ def compute_truncated_bbox_constraint(
         "right": ((px2 - tx2) / side_sigma) ** 2,
         "top": ((py1 - ty1) / top_sigma) ** 2,
         "center_x": ((projected_cx - target_cx) / center_sigma) ** 2,
-        "bottom_overflow": (max(0.0, py2 - height) / overflow_sigma) ** 2,
+        "bottom_overflow": (max(0.0, float(projected_bbox[3]) - height) / overflow_sigma) ** 2,
     }
 
     # For bottom-truncated objects, the bottom edge itself is unreliable, but
@@ -1418,6 +1701,7 @@ def compute_truncated_bbox_constraint(
         "truncated_bbox_loss": loss,
         "truncated_bbox_penalty": penalty,
         "truncated_bbox_components": {key: float(value) for key, value in components.items()},
+        "truncated_bbox_source": "visible_mask_bbox" if visible_bbox_available else "projected_bbox",
     }
 
 
@@ -1558,6 +1842,8 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
         result["partial_score_boost"] = None
         result["visible_mask_iou"] = None
         result["visible_soft_mask_iou"] = None
+        result["visible_target_fraction"] = None
+        result["visible_target_area_px"] = None
         result["visible_bbox_iou"] = None
         result["visible_bbox_center_error_px"] = None
         result["visible_contour_score"] = None
@@ -1631,6 +1917,10 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
         result["effective_upright_weight"] = 0.0
         result["effective_heading_prior_weight"] = 0.0
         result["is_truncated"] = bool(self.truncation_info.get("is_truncated", False))
+        result["truncation_severity"] = self.truncation_info.get("truncation_severity", "none")
+        result["low_observability"] = bool(self.truncation_info.get("low_observability", False))
+        result["truncation_observability_score"] = self.truncation_info.get("truncation_observability_score", 1.0)
+        result["truncation_observability_reasons"] = self.truncation_info.get("truncation_observability_reasons", [])
         result["prior_frame_id"] = self.temporal_prior.get("frame_idx") if self.temporal_prior else None
         if self.current_initializer_metadata:
             result["initializer_metadata"] = dict(self.current_initializer_metadata)
@@ -1661,6 +1951,8 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
                 image_size=self.image_size,
                 truncation_info=self.truncation_info,
                 args=self.temporal_args,
+                rendered_mask=rendered_mask,
+                target_mask=self.full_mask,
             )
             result.update(visible_bbox)
             contour = compute_visible_contour_score(
@@ -1678,6 +1970,15 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
                 args=self.temporal_args,
             )
             result.update(visual_quality)
+            observability = classify_truncation_observability(self.truncation_info, result, self.temporal_args)
+            result.update(
+                {
+                    "truncation_severity": observability["severity"],
+                    "low_observability": observability["low_observability"],
+                    "truncation_observability_score": observability["score"],
+                    "truncation_observability_reasons": observability["reasons"],
+                }
+            )
             visual_quality_gate = float(visual_quality["truncated_visual_quality_gate"])
             adjusted_mask_score = float(partial["adjusted_mask_score"])
             visible_soft_score = float(partial.get("visible_soft_mask_iou", adjusted_mask_score) or adjusted_mask_score)
@@ -1713,6 +2014,8 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
                 image_size=self.image_size,
                 truncation_info=self.truncation_info,
                 args=self.temporal_args,
+                visible_projected_bbox=result.get("visible_projected_bbox"),
+                visible_target_bbox=result.get("visible_target_bbox"),
             )
             result.update(truncated_bbox)
             final_score -= float(truncated_bbox.get("truncated_bbox_penalty") or 0.0)
@@ -1792,7 +2095,6 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
             ):
                 result[key] = float(result.get(key) or 0.0) * gate
             if bool(self.truncation_info.get("is_truncated")):
-                result["effective_heading_prior_weight"] = 0.0
                 result["heading_front_sign_penalty"] = 0.0
                 result["heading_front_angle_penalty"] = 0.0
             front_penalty_gate = 0.0 if bool(self.truncation_info.get("is_truncated")) else 1.0
@@ -2341,6 +2643,104 @@ def candidate_satisfies_ground_constraint(result: dict[str, Any], args: argparse
     return float(mean_raw) <= mean_limit and float(max_raw) <= max_limit
 
 
+def candidate_satisfies_severe_truncation_gate(result: dict[str, Any], args: argparse.Namespace) -> bool:
+    reasons: list[str] = []
+
+    def check_min(key: str, limit: float, reason: str) -> None:
+        value = _finite_float(result.get(key))
+        if value is None or value < limit:
+            reasons.append(reason)
+
+    def check_max(key: str, limit: float, reason: str) -> None:
+        value = _finite_float(result.get(key))
+        if value is None or value > limit:
+            reasons.append(reason)
+
+    check_max(
+        "ground_contact_mean_abs_m",
+        float(getattr(args, "severe_truncation_ground_mean_m_max", 0.085)),
+        "ground_mean",
+    )
+    check_max(
+        "ground_contact_max_abs_m",
+        float(getattr(args, "severe_truncation_ground_max_m_max", 0.18)),
+        "ground_max",
+    )
+    check_max(
+        "upright_angle_error_deg",
+        float(getattr(args, "severe_truncation_upright_deg_max", 35.0)),
+        "upright",
+    )
+    check_min(
+        "visible_mask_iou",
+        float(getattr(args, "severe_truncation_visible_mask_iou_min", 0.68)),
+        "visible_mask",
+    )
+    visible_fraction = _finite_float(result.get("visible_target_fraction"))
+    visible_fraction_min = float(getattr(args, "severe_truncation_visible_target_fraction_min", 0.12))
+    if visible_fraction is not None and visible_fraction < visible_fraction_min:
+        reasons.append("visible_fraction")
+    check_max(
+        "visible_contour_mean_distance_px",
+        float(getattr(args, "severe_truncation_visible_contour_mean_px_max", 7.0)),
+        "visible_contour",
+    )
+    profile = _finite_float(result.get("visible_profile_mean_distance_px"))
+    if profile is not None and profile > float(getattr(args, "severe_truncation_visible_profile_mean_px_max", 10.0)):
+        reasons.append("visible_profile")
+    yaw_jump = _finite_float(result.get("yaw_jump_from_anchor_deg"))
+    if yaw_jump is not None and yaw_jump > float(getattr(args, "severe_truncation_yaw_jump_deg_max", 25.0)):
+        reasons.append("yaw_jump")
+    if bool(result.get("heading_front_sign_hard_rejected")):
+        reasons.append("front_sign")
+
+    passed = not reasons
+    result["severe_truncation_gate_passed"] = passed
+    result["severe_truncation_gate_reasons"] = reasons
+    return passed
+
+
+def candidate_satisfies_severe_truncation_fallback(result: dict[str, Any], args: argparse.Namespace) -> bool:
+    reasons: list[str] = []
+
+    def check_min(key: str, limit: float, reason: str) -> None:
+        value = _finite_float(result.get(key))
+        if value is None or value < limit:
+            reasons.append(reason)
+
+    def check_max(key: str, limit: float, reason: str) -> None:
+        value = _finite_float(result.get(key))
+        if value is None or value > limit:
+            reasons.append(reason)
+
+    check_min(
+        "visible_mask_iou",
+        float(getattr(args, "severe_truncation_fallback_visible_mask_iou_min", 0.76)),
+        "visible_mask",
+    )
+    visible_fraction = _finite_float(result.get("visible_target_fraction"))
+    visible_fraction_min = float(getattr(args, "severe_truncation_fallback_visible_target_fraction_min", 0.12))
+    if visible_fraction is not None and visible_fraction < visible_fraction_min:
+        reasons.append("visible_fraction")
+    check_max(
+        "visible_contour_mean_distance_px",
+        float(getattr(args, "severe_truncation_fallback_visible_contour_mean_px_max", 5.5)),
+        "visible_contour",
+    )
+    check_max(
+        "visible_profile_mean_distance_px",
+        float(getattr(args, "severe_truncation_fallback_visible_profile_mean_px_max", 8.5)),
+        "visible_profile",
+    )
+    if reasons:
+        result["severe_truncation_fallback_rejected"] = True
+        result["severe_truncation_fallback_reasons"] = reasons
+        return False
+    result["severe_truncation_fallback_rejected"] = False
+    result["severe_truncation_fallback_reasons"] = []
+    return True
+
+
 def front_sign_selection_penalty(result: dict[str, Any]) -> float:
     if not bool(result.get("heading_front_sign_enabled")):
         return 0.0
@@ -2391,6 +2791,34 @@ def choose_best_refined_result(
         selected["final_ground_constrained_selected"] = False
         return selected
 
+    severe = str(truncation_info.get("truncation_severity", "")) == "severe"
+    if severe and bool(getattr(args, "severe_truncation_final_gate_enabled", True)):
+        gated = [item for item in feasible if candidate_satisfies_severe_truncation_gate(item, args)]
+        if gated:
+            feasible = gated
+        else:
+            for item in feasible:
+                item.setdefault("severe_truncation_gate_passed", False)
+                item.setdefault("severe_truncation_gate_reasons", ["fallback_no_gate_pass"])
+            fallback_pool = [
+                item for item in feasible if candidate_satisfies_severe_truncation_fallback(item, args)
+            ]
+            if not fallback_pool:
+                return None
+            fallback = max(
+                fallback_pool,
+                key=lambda item: (
+                    float(item.get("visible_mask_iou", item.get("mask_iou", 0.0)) or 0.0),
+                    -float(item.get("visible_contour_mean_distance_px", 1e9) or 1e9),
+                    float(item.get("visible_contour_score", 0.0) or 0.0),
+                    -float(item.get("yaw_jump_from_anchor_deg", 180.0) or 180.0),
+                ),
+            )
+            fallback["final_selection_mode"] = "severe_truncation_fallback"
+            fallback["final_ground_constrained_selected"] = True
+            fallback["low_confidence"] = True
+            return fallback
+
     if not bool(getattr(args, "truncated_final_visual_selection_enabled", True)):
         selected = max(feasible, key=lambda item: float(item.get("score", -1e9)))
         selected["final_selection_mode"] = "ground_feasible_score"
@@ -2411,6 +2839,8 @@ def choose_best_refined_result(
     mask_weight = float(getattr(args, "truncated_final_visual_mask_weight", 1.0))
     contour_weight = float(getattr(args, "truncated_final_visual_contour_weight", 0.35))
     bbox_weight = float(getattr(args, "truncated_final_visual_bbox_weight", 0.08))
+    if severe:
+        bbox_weight = float(getattr(args, "severe_truncated_final_visual_bbox_weight", 0.02))
     quality_weight = float(getattr(args, "truncated_final_visual_quality_weight", 0.05))
     ground_mean_weight = float(getattr(args, "truncated_final_visual_ground_mean_weight", 0.25))
     ground_max_weight = float(getattr(args, "truncated_final_visual_ground_max_weight", 0.10))
@@ -2482,11 +2912,37 @@ def refined_pose_candidate_summary(
         "edge_score",
         "visible_mask_iou",
         "visible_soft_mask_iou",
+        "visible_target_fraction",
+        "visible_target_area_px",
         "visible_bbox_iou",
         "visible_bbox_center_error_px",
+        "visible_projected_bbox",
+        "visible_target_bbox",
+        "visible_bbox_source",
         "visible_contour_score",
         "visible_profile_score",
+        "visible_contour_mean_distance_px",
+        "visible_profile_mean_distance_px",
+        "truncation_severity",
+        "low_observability",
+        "truncation_observability_score",
+        "truncation_observability_reasons",
         "truncated_visual_quality_gate",
+        "truncated_visual_quality_reason",
+        "truncated_visual_bbox_factor",
+        "truncated_visual_center_factor",
+        "truncated_visual_mask_factor",
+        "truncated_visual_contour_factor",
+        "truncated_visual_profile_factor",
+        "truncated_visual_overflow_factor",
+        "truncated_visual_overflow_loss",
+        "severe_truncation_gate_passed",
+        "severe_truncation_gate_reasons",
+        "truncated_bbox_score",
+        "truncated_bbox_loss",
+        "truncated_bbox_penalty",
+        "truncated_bbox_components",
+        "truncated_bbox_source",
         "ground_contact_score",
         "ground_contact_mean_abs_m",
         "ground_contact_max_abs_m",
@@ -2874,7 +3330,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         args,
         truncation_info,
     )
-    if selected_result is not None and selected_result is not best_result:
+    if selected_result is None:
+        best_result = None
+        best_history = []
+    elif selected_result is not best_result:
         best_result = selected_result
         for refined_result, history in refined_results:
             if refined_result is best_result:
@@ -2883,6 +3342,18 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
 
     if best_result is None:
         raise RuntimeError("No valid pose candidate survived refinement.")
+
+    if bool(truncation_info.get("is_truncated")):
+        truncation_info["truncation_severity"] = best_result.get("truncation_severity", truncation_info.get("truncation_severity"))
+        truncation_info["low_observability"] = bool(best_result.get("low_observability", truncation_info.get("low_observability", False)))
+        truncation_info["truncation_observability_score"] = best_result.get(
+            "truncation_observability_score",
+            truncation_info.get("truncation_observability_score"),
+        )
+        truncation_info["truncation_observability_reasons"] = best_result.get(
+            "truncation_observability_reasons",
+            truncation_info.get("truncation_observability_reasons", []),
+        )
 
     best_uniform_scale = fast.scale_to_uniform_scalar(np.asarray(best_result["scale"], dtype=np.float64))
     best_result["scale"] = fast.make_uniform_scale(best_uniform_scale)
@@ -3002,6 +3473,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "enabled": bool(args.partial_visibility_enabled),
         "is_truncated": bool(truncation_info.get("is_truncated")),
         "truncation_sides": truncation_info.get("truncation_sides", []),
+        "truncation_severity": truncation_info.get("truncation_severity", "none"),
+        "low_observability": bool(truncation_info.get("low_observability", False)),
+        "truncation_observability_score": truncation_info.get("truncation_observability_score"),
+        "truncation_observability_reasons": truncation_info.get("truncation_observability_reasons", []),
         "border_touch": truncation_info.get("border_touch", {}),
         "bbox_touch": truncation_info.get("bbox_touch", {}),
         "mask_area_px": truncation_info.get("mask_area_px"),
@@ -3014,6 +3489,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "partial_score_boost_cap": args.partial_score_boost_cap,
         "visible_mask_iou": best_result.get("visible_mask_iou"),
         "visible_soft_mask_iou": best_result.get("visible_soft_mask_iou"),
+        "visible_target_fraction": best_result.get("visible_target_fraction"),
+        "visible_target_area_px": best_result.get("visible_target_area_px"),
         "visible_bbox_iou": best_result.get("visible_bbox_iou"),
         "visible_bbox_center_error_px": best_result.get("visible_bbox_center_error_px"),
         "visible_contour_score": best_result.get("visible_contour_score"),
@@ -3027,15 +3504,22 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "truncated_visual_quality_reason": best_result.get("truncated_visual_quality_reason"),
         "truncated_visual_bbox_factor": best_result.get("truncated_visual_bbox_factor"),
         "truncated_visual_center_factor": best_result.get("truncated_visual_center_factor"),
+        "truncated_visual_mask_factor": best_result.get("truncated_visual_mask_factor"),
+        "truncated_visual_contour_factor": best_result.get("truncated_visual_contour_factor"),
+        "truncated_visual_profile_factor": best_result.get("truncated_visual_profile_factor"),
         "truncated_visual_overflow_factor": best_result.get("truncated_visual_overflow_factor"),
         "truncated_visual_overflow_loss": best_result.get("truncated_visual_overflow_loss"),
         "truncated_visual_quality_penalty": best_result.get("truncated_visual_quality_penalty"),
+        "severe_truncation_gate_passed": best_result.get("severe_truncation_gate_passed"),
+        "severe_truncation_gate_reasons": best_result.get("severe_truncation_gate_reasons"),
         "visible_projected_bbox": best_result.get("visible_projected_bbox"),
         "visible_target_bbox": best_result.get("visible_target_bbox"),
+        "visible_bbox_source": best_result.get("visible_bbox_source"),
         "truncated_bbox_score": best_result.get("truncated_bbox_score"),
         "truncated_bbox_loss": best_result.get("truncated_bbox_loss"),
         "truncated_bbox_penalty": best_result.get("truncated_bbox_penalty"),
         "truncated_bbox_components": best_result.get("truncated_bbox_components"),
+        "truncated_bbox_source": best_result.get("truncated_bbox_source"),
     }
     edge_report = {
         "enabled": bool(args.edge_score_enabled),
@@ -3135,6 +3619,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "visible_mask_bonus_weight": best_result.get("visible_mask_bonus_weight"),
             "visible_mask_iou": best_result.get("visible_mask_iou"),
             "visible_soft_mask_iou": best_result.get("visible_soft_mask_iou"),
+            "visible_target_fraction": best_result.get("visible_target_fraction"),
+            "visible_target_area_px": best_result.get("visible_target_area_px"),
             "visible_bbox_iou": best_result.get("visible_bbox_iou"),
             "visible_bbox_center_error_px": best_result.get("visible_bbox_center_error_px"),
             "visible_contour_score": best_result.get("visible_contour_score"),
@@ -3143,13 +3629,26 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "visible_contour_mean_distance_px": best_result.get("visible_contour_mean_distance_px"),
             "visible_profile_mean_distance_px": best_result.get("visible_profile_mean_distance_px"),
             "effective_visible_contour_weight": best_result.get("effective_visible_contour_weight"),
+            "truncation_severity": best_result.get("truncation_severity", truncation_info.get("truncation_severity")),
+            "low_observability": best_result.get("low_observability", truncation_info.get("low_observability")),
+            "truncation_observability_score": best_result.get("truncation_observability_score", truncation_info.get("truncation_observability_score")),
+            "truncation_observability_reasons": best_result.get("truncation_observability_reasons", truncation_info.get("truncation_observability_reasons")),
             "truncated_visual_quality_gate": best_result.get("truncated_visual_quality_gate"),
             "truncated_visual_quality_reason": best_result.get("truncated_visual_quality_reason"),
             "truncated_visual_bbox_factor": best_result.get("truncated_visual_bbox_factor"),
             "truncated_visual_center_factor": best_result.get("truncated_visual_center_factor"),
+            "truncated_visual_mask_factor": best_result.get("truncated_visual_mask_factor"),
+            "truncated_visual_contour_factor": best_result.get("truncated_visual_contour_factor"),
+            "truncated_visual_profile_factor": best_result.get("truncated_visual_profile_factor"),
             "truncated_visual_overflow_factor": best_result.get("truncated_visual_overflow_factor"),
             "truncated_visual_overflow_loss": best_result.get("truncated_visual_overflow_loss"),
             "truncated_visual_quality_penalty": best_result.get("truncated_visual_quality_penalty"),
+            "severe_truncation_gate_passed": best_result.get("severe_truncation_gate_passed"),
+            "severe_truncation_gate_reasons": best_result.get("severe_truncation_gate_reasons"),
+            "visible_projected_bbox": best_result.get("visible_projected_bbox"),
+            "visible_target_bbox": best_result.get("visible_target_bbox"),
+            "visible_bbox_source": best_result.get("visible_bbox_source"),
+            "truncated_bbox_source": best_result.get("truncated_bbox_source"),
             "final_ground_constrained_selected": best_result.get("final_ground_constrained_selected"),
             "final_ground_constrained_rank_score": best_result.get("final_ground_constrained_rank_score"),
             "final_selection_mode": best_result.get("final_selection_mode"),
@@ -3261,6 +3760,15 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ignore_truncated_border_band_px", type=int, default=8)
     parser.add_argument("--partial_iou_mode", default="visible_region")
     parser.add_argument("--partial_use_one_sided_distance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--truncation_moderate_visible_mask_iou", type=float, default=0.78)
+    parser.add_argument("--truncation_severe_visible_mask_iou", type=float, default=0.70)
+    parser.add_argument("--truncation_moderate_contour_mean_px", type=float, default=5.0)
+    parser.add_argument("--truncation_severe_contour_mean_px", type=float, default=7.0)
+    parser.add_argument("--truncation_moderate_profile_mean_px", type=float, default=8.0)
+    parser.add_argument("--truncation_severe_profile_mean_px", type=float, default=10.0)
+    parser.add_argument("--truncation_area_drop_ratio", type=float, default=0.72)
+    parser.add_argument("--truncation_moderate_visible_target_fraction", type=float, default=0.35)
+    parser.add_argument("--truncation_severe_visible_target_fraction", type=float, default=0.12)
     parser.add_argument("--truncated_bbox_constraint_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--truncated_bbox_weight", type=float, default=0.08)
     parser.add_argument("--truncated_bbox_top_sigma_px", type=float, default=10.0)
@@ -3291,6 +3799,8 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--road_constraint_weight", type=float, default=0.25)
     parser.add_argument("--bbox_bottom_ground_weight", type=float, default=0.15)
     parser.add_argument("--bottom_truncated_ground_weight_factor", type=float, default=0.25)
+    parser.add_argument("--moderate_bottom_truncated_bbox_bottom_weight_factor", type=float, default=0.40)
+    parser.add_argument("--severe_bottom_truncated_bbox_bottom_weight_factor", type=float, default=0.0)
     parser.add_argument("--bottom_truncated_ground_contact_weight_factor", type=float, default=1.60)
     parser.add_argument("--bottom_truncated_ground_soft_tolerance_m", type=float, default=0.12)
     parser.add_argument("--bottom_truncated_ground_penalty_weight", type=float, default=0.35)
@@ -3328,6 +3838,7 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--truncated_final_visual_mask_weight", type=float, default=1.0)
     parser.add_argument("--truncated_final_visual_contour_weight", type=float, default=0.35)
     parser.add_argument("--truncated_final_visual_bbox_weight", type=float, default=0.08)
+    parser.add_argument("--severe_truncated_final_visual_bbox_weight", type=float, default=0.02)
     parser.add_argument("--truncated_final_visual_quality_weight", type=float, default=0.05)
     parser.add_argument("--truncated_final_visual_ground_mean_weight", type=float, default=0.25)
     parser.add_argument("--truncated_final_visual_ground_max_weight", type=float, default=0.10)
@@ -3349,7 +3860,26 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--truncated_visual_gate_center_error_px", type=float, default=6.0)
     parser.add_argument("--truncated_visual_gate_center_softness_px", type=float, default=8.0)
     parser.add_argument("--truncated_visual_gate_overflow_sigma_px", type=float, default=32.0)
+    parser.add_argument("--truncated_visual_gate_visible_mask_iou_good", type=float, default=0.78)
+    parser.add_argument("--truncated_visual_gate_visible_mask_iou_bad", type=float, default=0.68)
+    parser.add_argument("--truncated_visual_gate_contour_mean_px_good", type=float, default=4.5)
+    parser.add_argument("--truncated_visual_gate_contour_mean_px_bad", type=float, default=7.0)
+    parser.add_argument("--truncated_visual_gate_profile_mean_px_good", type=float, default=7.5)
+    parser.add_argument("--truncated_visual_gate_profile_mean_px_bad", type=float, default=10.0)
     parser.add_argument("--truncated_visual_quality_penalty_weight", type=float, default=0.08)
+    parser.add_argument("--severe_truncation_final_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--severe_truncation_visible_mask_iou_min", type=float, default=0.68)
+    parser.add_argument("--severe_truncation_visible_contour_mean_px_max", type=float, default=7.0)
+    parser.add_argument("--severe_truncation_visible_profile_mean_px_max", type=float, default=10.0)
+    parser.add_argument("--severe_truncation_visible_target_fraction_min", type=float, default=0.12)
+    parser.add_argument("--severe_truncation_ground_mean_m_max", type=float, default=0.085)
+    parser.add_argument("--severe_truncation_ground_max_m_max", type=float, default=0.18)
+    parser.add_argument("--severe_truncation_upright_deg_max", type=float, default=35.0)
+    parser.add_argument("--severe_truncation_yaw_jump_deg_max", type=float, default=25.0)
+    parser.add_argument("--severe_truncation_fallback_visible_mask_iou_min", type=float, default=0.76)
+    parser.add_argument("--severe_truncation_fallback_visible_contour_mean_px_max", type=float, default=5.5)
+    parser.add_argument("--severe_truncation_fallback_visible_profile_mean_px_max", type=float, default=8.5)
+    parser.add_argument("--severe_truncation_fallback_visible_target_fraction_min", type=float, default=0.12)
     parser.add_argument("--heading_prior_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--heading_prior_weight", type=float, default=0.06)
     parser.add_argument("--front_sign_heading_prior_weight", type=float, default=0.18)
@@ -3377,6 +3907,7 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tail_light_motion_consistency_min_confidence", type=float, default=0.60)
     parser.add_argument("--tail_light_motion_consistency_flip_margin", type=float, default=0.20)
     parser.add_argument("--truncated_heading_prior_weight", type=float, default=0.08)
+    parser.add_argument("--severe_truncation_heading_prior_weight", type=float, default=0.18)
     parser.add_argument("--heading_prior_sigma_deg", type=float, default=25.0)
     parser.add_argument("--heading_prior_lock_front_sign", action=argparse.BooleanOptionalAction, default=False)
 

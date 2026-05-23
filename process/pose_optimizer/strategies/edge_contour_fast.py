@@ -597,7 +597,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         args,
         truncation_info,
     )
-    if selected_result is not None and selected_result is not best_result:
+    if selected_result is None:
+        best_result = None
+        best_history = []
+    elif selected_result is not best_result:
         best_result = selected_result
         for refined_result, history in refined_results:
             if refined_result is best_result:
@@ -608,6 +611,18 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("No valid pose candidate survived refinement.")
 
     # ── finalise ──
+    if bool(truncation_info.get("is_truncated")):
+        truncation_info["truncation_severity"] = best_result.get("truncation_severity", truncation_info.get("truncation_severity"))
+        truncation_info["low_observability"] = bool(best_result.get("low_observability", truncation_info.get("low_observability", False)))
+        truncation_info["truncation_observability_score"] = best_result.get(
+            "truncation_observability_score",
+            truncation_info.get("truncation_observability_score"),
+        )
+        truncation_info["truncation_observability_reasons"] = best_result.get(
+            "truncation_observability_reasons",
+            truncation_info.get("truncation_observability_reasons", []),
+        )
+
     best_uniform_scale = fast.scale_to_uniform_scalar(np.asarray(best_result["scale"], dtype=np.float64))
     best_result["scale"] = fast.make_uniform_scale(best_uniform_scale)
     translation_world, rotation_world = fast.camera_pose_to_world_pose(
@@ -742,6 +757,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "enabled": bool(args.partial_visibility_enabled),
         "is_truncated": bool(truncation_info.get("is_truncated")),
         "truncation_sides": truncation_info.get("truncation_sides", []),
+        "truncation_severity": truncation_info.get("truncation_severity", "none"),
+        "low_observability": bool(truncation_info.get("low_observability", False)),
+        "truncation_observability_score": truncation_info.get("truncation_observability_score"),
+        "truncation_observability_reasons": truncation_info.get("truncation_observability_reasons", []),
         "border_touch": truncation_info.get("border_touch", {}),
         "bbox_touch": truncation_info.get("bbox_touch", {}),
         "mask_area_px": truncation_info.get("mask_area_px"),
@@ -754,6 +773,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "partial_score_boost_cap": args.partial_score_boost_cap,
         "visible_mask_iou": best_result.get("visible_mask_iou"),
         "visible_soft_mask_iou": best_result.get("visible_soft_mask_iou"),
+        "visible_target_fraction": best_result.get("visible_target_fraction"),
+        "visible_target_area_px": best_result.get("visible_target_area_px"),
         "visible_bbox_iou": best_result.get("visible_bbox_iou"),
         "visible_bbox_center_error_px": best_result.get("visible_bbox_center_error_px"),
         "visible_contour_score": best_result.get("visible_contour_score"),
@@ -767,15 +788,22 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "truncated_visual_quality_reason": best_result.get("truncated_visual_quality_reason"),
         "truncated_visual_bbox_factor": best_result.get("truncated_visual_bbox_factor"),
         "truncated_visual_center_factor": best_result.get("truncated_visual_center_factor"),
+        "truncated_visual_mask_factor": best_result.get("truncated_visual_mask_factor"),
+        "truncated_visual_contour_factor": best_result.get("truncated_visual_contour_factor"),
+        "truncated_visual_profile_factor": best_result.get("truncated_visual_profile_factor"),
         "truncated_visual_overflow_factor": best_result.get("truncated_visual_overflow_factor"),
         "truncated_visual_overflow_loss": best_result.get("truncated_visual_overflow_loss"),
         "truncated_visual_quality_penalty": best_result.get("truncated_visual_quality_penalty"),
+        "severe_truncation_gate_passed": best_result.get("severe_truncation_gate_passed"),
+        "severe_truncation_gate_reasons": best_result.get("severe_truncation_gate_reasons"),
         "visible_projected_bbox": best_result.get("visible_projected_bbox"),
         "visible_target_bbox": best_result.get("visible_target_bbox"),
+        "visible_bbox_source": best_result.get("visible_bbox_source"),
         "truncated_bbox_score": best_result.get("truncated_bbox_score"),
         "truncated_bbox_loss": best_result.get("truncated_bbox_loss"),
         "truncated_bbox_penalty": best_result.get("truncated_bbox_penalty"),
         "truncated_bbox_components": best_result.get("truncated_bbox_components"),
+        "truncated_bbox_source": best_result.get("truncated_bbox_source"),
     }
     edge_report = {
         "enabled": bool(args.edge_score_enabled),
@@ -928,6 +956,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "visible_mask_bonus_weight": best_result.get("visible_mask_bonus_weight"),
             "visible_mask_iou": best_result.get("visible_mask_iou"),
             "visible_soft_mask_iou": best_result.get("visible_soft_mask_iou"),
+            "visible_target_fraction": best_result.get("visible_target_fraction"),
+            "visible_target_area_px": best_result.get("visible_target_area_px"),
             "visible_bbox_iou": best_result.get("visible_bbox_iou"),
             "visible_bbox_center_error_px": best_result.get("visible_bbox_center_error_px"),
             "visible_contour_score": best_result.get("visible_contour_score"),
@@ -936,13 +966,26 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "visible_contour_mean_distance_px": best_result.get("visible_contour_mean_distance_px"),
             "visible_profile_mean_distance_px": best_result.get("visible_profile_mean_distance_px"),
             "effective_visible_contour_weight": best_result.get("effective_visible_contour_weight"),
+            "truncation_severity": best_result.get("truncation_severity", truncation_info.get("truncation_severity")),
+            "low_observability": best_result.get("low_observability", truncation_info.get("low_observability")),
+            "truncation_observability_score": best_result.get("truncation_observability_score", truncation_info.get("truncation_observability_score")),
+            "truncation_observability_reasons": best_result.get("truncation_observability_reasons", truncation_info.get("truncation_observability_reasons")),
             "truncated_visual_quality_gate": best_result.get("truncated_visual_quality_gate"),
             "truncated_visual_quality_reason": best_result.get("truncated_visual_quality_reason"),
             "truncated_visual_bbox_factor": best_result.get("truncated_visual_bbox_factor"),
             "truncated_visual_center_factor": best_result.get("truncated_visual_center_factor"),
+            "truncated_visual_mask_factor": best_result.get("truncated_visual_mask_factor"),
+            "truncated_visual_contour_factor": best_result.get("truncated_visual_contour_factor"),
+            "truncated_visual_profile_factor": best_result.get("truncated_visual_profile_factor"),
             "truncated_visual_overflow_factor": best_result.get("truncated_visual_overflow_factor"),
             "truncated_visual_overflow_loss": best_result.get("truncated_visual_overflow_loss"),
             "truncated_visual_quality_penalty": best_result.get("truncated_visual_quality_penalty"),
+            "severe_truncation_gate_passed": best_result.get("severe_truncation_gate_passed"),
+            "severe_truncation_gate_reasons": best_result.get("severe_truncation_gate_reasons"),
+            "visible_projected_bbox": best_result.get("visible_projected_bbox"),
+            "visible_target_bbox": best_result.get("visible_target_bbox"),
+            "visible_bbox_source": best_result.get("visible_bbox_source"),
+            "truncated_bbox_source": best_result.get("truncated_bbox_source"),
             "final_ground_constrained_selected": best_result.get("final_ground_constrained_selected"),
             "final_ground_constrained_rank_score": best_result.get("final_ground_constrained_rank_score"),
             "final_selection_mode": best_result.get("final_selection_mode"),

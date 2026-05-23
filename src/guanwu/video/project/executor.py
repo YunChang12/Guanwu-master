@@ -96,6 +96,20 @@ _EDGE_POSE_HEADING_METRIC_KEYS = (
     "effective_heading_prior_weight",
     "effective_front_sign_penalty_weight",
 )
+_EDGE_POSE_TRUNCATION_METRIC_KEYS = (
+    "truncation_severity",
+    "low_observability",
+    "truncation_observability_score",
+    "truncation_observability_reasons",
+    "visible_target_fraction",
+    "visible_target_area_px",
+    "visible_contour_mean_distance_px",
+    "visible_profile_mean_distance_px",
+    "truncated_visual_quality_gate",
+    "truncated_visual_quality_reason",
+    "severe_truncation_gate_passed",
+    "severe_truncation_gate_reasons",
+)
 
 
 class ProjectExecutor:
@@ -2041,7 +2055,8 @@ class ProjectExecutor:
 
                 if decision.get("accepted"):
                     if all_frames_mode:
-                        previous_candidate_prior = pose_record
+                        if self._pose_record_updates_temporal_anchor(pose_record):
+                            previous_candidate_prior = pose_record
                         all_frame_prior_records.append(pose_record)
                         updated_scale_prior = self._pose_track_scale_prior(
                             all_frame_prior_records,
@@ -4022,6 +4037,7 @@ class ProjectExecutor:
             "projected_bbox": metrics.get("projected_bbox"),
         }
         record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
+        record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_TRUNCATION_METRIC_KEYS if key in metrics})
         return {
             "object_id": obj_id,
             "frame_id": int(frame_id),
@@ -4095,6 +4111,7 @@ class ProjectExecutor:
                 "final_selection_mode": metrics.get("final_selection_mode"),
             }
             record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
+            record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_TRUNCATION_METRIC_KEYS if key in metrics})
             record = {
                 "object_id": obj_id,
                 "frame_id": int(frame_id),
@@ -4215,6 +4232,21 @@ class ProjectExecutor:
         return ProjectExecutor._edge_pose_temporal_prior_payload(previous)
 
     @staticmethod
+    def _pose_record_updates_temporal_anchor(record: dict) -> bool:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        severity = str(metrics.get("truncation_severity") or "")
+        if bool(metrics.get("low_observability")) and severity == "severe":
+            return False
+        contour_mean = metrics.get("visible_contour_mean_distance_px")
+        if severity == "severe" and contour_mean is not None:
+            try:
+                if float(contour_mean) > 7.0:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
     def _pose_local_seed_frame_ids(
         *,
         frame_ids: list[int],
@@ -4304,6 +4336,15 @@ class ProjectExecutor:
             center_error = float(metrics.get("bbox_center_error_px") or 1e9)
         except Exception:
             return False
+        if bool(metrics.get("low_observability")) and str(metrics.get("truncation_severity") or "") == "severe":
+            return False
+        contour_mean = metrics.get("visible_contour_mean_distance_px")
+        if str(metrics.get("truncation_severity") or "") == "severe" and contour_mean is not None:
+            try:
+                if float(contour_mean) > 7.0:
+                    return False
+            except Exception:
+                return False
         return mask_iou >= 0.55 and bbox_iou >= 0.55 and center_error <= 80.0
 
     @staticmethod
@@ -4366,17 +4407,68 @@ class ProjectExecutor:
         if not frames:
             return [], {"enabled": True, "applied": False, "reason": "no_candidates"}
 
+        def has_strong_truncated_visual_evidence(candidate: dict) -> bool:
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+            severity = str(metrics.get("truncation_severity") or "")
+            if severity not in {"light", "moderate", "severe"} and not bool(metrics.get("low_observability")):
+                return False
+            try:
+                mask = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
+                contour = float(metrics.get("visible_contour_score") or 0.0)
+                contour_mean = float(metrics.get("visible_contour_mean_distance_px"))
+                profile_mean = float(metrics.get("visible_profile_mean_distance_px"))
+            except Exception:
+                return False
+            return mask >= 0.90 and contour >= 0.60 and contour_mean <= 2.5 and profile_mean <= 4.0
+
         def unary_cost(candidate: dict) -> float:
             metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
             score = float(metrics.get("score") or 0.0)
             mask = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
             bbox = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            severity = str(metrics.get("truncation_severity") or "")
+            severe = severity == "severe" or bool(metrics.get("low_observability"))
+            truncated = severe or severity in {"light", "moderate"}
+            contour = float(metrics.get("visible_contour_score") or 0.0)
+            contour_mean = metrics.get("visible_contour_mean_distance_px")
+            profile_mean = metrics.get("visible_profile_mean_distance_px")
             center = float(metrics.get("bbox_center_error_px") or 120.0)
             ground = metrics.get("ground_contact_max_abs_m")
             ground_penalty = 0.0
             if ground is not None:
                 ground_penalty = min(2.0, max(0.0, float(ground) - 0.12) * 2.0)
             heading_penalty = ProjectExecutor._edge_pose_heading_cost(metrics)
+            contour_penalty = 0.0
+            if severe:
+                if contour_mean is not None:
+                    contour_penalty += min(4.0, max(0.0, float(contour_mean) - 5.0) * 0.45)
+                if profile_mean is not None:
+                    contour_penalty += min(3.0, max(0.0, float(profile_mean) - 8.0) * 0.30)
+                return (
+                    -0.20 * score
+                    -0.95 * mask
+                    -0.50 * contour
+                    -0.03 * bbox
+                    + 0.004 * min(center, 200.0)
+                    + ground_penalty
+                    + heading_penalty
+                    + contour_penalty
+                )
+            if truncated:
+                if contour_mean is not None:
+                    contour_penalty += min(2.5, max(0.0, float(contour_mean) - 3.5) * 0.25)
+                if profile_mean is not None:
+                    contour_penalty += min(2.0, max(0.0, float(profile_mean) - 6.0) * 0.10)
+                return (
+                    -0.18 * score
+                    -1.05 * mask
+                    -0.75 * contour
+                    -0.10 * bbox
+                    + 0.002 * min(center, 200.0)
+                    + ground_penalty
+                    + heading_penalty
+                    + contour_penalty
+                )
             return -score - 0.7 * mask - 0.35 * bbox + 0.004 * min(center, 200.0) + ground_penalty + heading_penalty
 
         def transition_cost(prev: dict, cur: dict) -> float:
@@ -4384,24 +4476,31 @@ class ProjectExecutor:
             cur_pose = cur.get("pose") if isinstance(cur.get("pose"), dict) else {}
             cost = 0.0
             dt = max(1, abs(int(cur.get("frame_id") or 0) - int(prev.get("frame_id") or 0)))
+            strong_truncated_visual = (
+                has_strong_truncated_visual_evidence(cur)
+                or has_strong_truncated_visual_evidence(prev)
+            )
             if ProjectExecutor._valid_vec3_like(prev_pose.get("translation_world")) and ProjectExecutor._valid_vec3_like(cur_pose.get("translation_world")):
                 prev_t = np.asarray(prev_pose["translation_world"], dtype=np.float64)
                 cur_t = np.asarray(cur_pose["translation_world"], dtype=np.float64)
                 jump = float(np.linalg.norm(cur_t - prev_t)) / float(dt)
-                cost += min(12.0, (jump / 0.8) ** 2)
+                translation_sigma_m = 1.2 if strong_truncated_visual else 0.8
+                cost += min(12.0, (jump / translation_sigma_m) ** 2)
             prev_r = prev_pose.get("rotation_matrix")
             cur_r = cur_pose.get("rotation_matrix")
             if isinstance(prev_r, list) and isinstance(cur_r, list):
                 jump_deg = ProjectExecutor._rotation_geodesic_deg(cur_r, prev_r)
                 if math.isfinite(jump_deg):
-                    cost += min(16.0, (jump_deg / 25.0) ** 2)
+                    rotation_sigma_deg = 45.0 if strong_truncated_visual else 25.0
+                    cost += min(16.0, (jump_deg / rotation_sigma_deg) ** 2)
                     if jump_deg > 90.0:
                         cost += 6.0
             if ProjectExecutor._valid_vec3_like(prev_pose.get("scale")) and ProjectExecutor._valid_vec3_like(cur_pose.get("scale")):
                 prev_s = float(np.median(np.asarray(prev_pose["scale"], dtype=np.float64)))
                 cur_s = float(np.median(np.asarray(cur_pose["scale"], dtype=np.float64)))
                 ratio = max(prev_s, cur_s) / max(1e-8, min(prev_s, cur_s))
-                cost += min(9.0, (math.log(max(ratio, 1e-8)) / 0.14) ** 2)
+                scale_sigma_log = 0.24 if strong_truncated_visual else 0.14
+                cost += min(9.0, (math.log(max(ratio, 1e-8)) / scale_sigma_log) ** 2)
             return cost
 
         dp: list[list[float]] = []

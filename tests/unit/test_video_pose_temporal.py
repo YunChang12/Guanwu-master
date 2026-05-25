@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import guanwu.video.project.executor as project_executor
 from guanwu.video.project.executor import ProjectExecutor
@@ -132,6 +133,158 @@ def test_pose_temporal_anchor_excludes_low_observability_severe_truncation() -> 
 
     assert ProjectExecutor._pose_record_updates_temporal_anchor(severe) is False
     assert ProjectExecutor._pose_record_updates_temporal_anchor(light) is True
+
+
+def test_truncated_fail_fast_triggers_for_low_observability_failure() -> None:
+    record = {
+        "status": "failed",
+        "reason": "optimizer_failed",
+        "metrics": {
+            "low_observability": True,
+            "truncation_severity": "severe",
+        },
+    }
+
+    decision = ProjectExecutor._pose_truncated_object_fail_fast_decision(
+        record,
+        inst={"bbox_xyxy": [100.0, 240.0, 220.0, 360.0], "image_width": 640, "image_height": 360},
+        frame_id=9,
+    )
+
+    assert decision["skip_object"] is True
+    assert decision["frame_id"] == 9
+    assert decision["reason"] == "optimizer_failed"
+    assert decision["truncation_severity"] == "severe"
+
+
+def test_truncated_fail_fast_ignores_non_truncated_failure() -> None:
+    record = {
+        "status": "failed",
+        "reason": "optimizer_failed",
+        "metrics": {
+            "low_observability": False,
+            "truncation_severity": "normal",
+        },
+    }
+
+    decision = ProjectExecutor._pose_truncated_object_fail_fast_decision(
+        record,
+        inst={"bbox_xyxy": [100.0, 80.0, 220.0, 180.0], "image_width": 640, "image_height": 360},
+        frame_id=3,
+    )
+
+    assert decision["skip_object"] is False
+
+
+def test_truncated_fail_fast_keeps_object_when_prior_frames_were_accepted() -> None:
+    fail_fast = {
+        "skip_object": True,
+        "reason": "optimizer_failed",
+        "frame_id": 10,
+        "truncation_severity": "severe",
+        "low_observability": True,
+    }
+    accepted_records = [_pose_record(frame_id=1), _pose_record(frame_id=2)]
+    frame_ids = [1, 2, 10, 11, 12]
+    frame_records = {
+        "frame_000001": accepted_records[0],
+        "frame_000002": accepted_records[1],
+        "frame_000010": {"status": "failed", "reason": "optimizer_failed"},
+    }
+
+    summary = ProjectExecutor._apply_truncated_object_fail_fast(
+        fail_fast,
+        frame_ids=frame_ids,
+        frame_records=frame_records,
+        accepted_records=accepted_records,
+    )
+
+    assert summary["skip_entire_object"] is False
+    assert summary["remaining_frame_count"] == 2
+    assert summary["accepted_frame_count_before_failure"] == 2
+    assert frame_records["frame_000011"]["status"] == "skipped"
+    assert frame_records["frame_000012"]["failed_frame_id"] == 10
+
+
+def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records() -> None:
+    fail_fast = {
+        "skip_object": True,
+        "reason": "optimizer_failed",
+        "frame_id": 10,
+        "truncation_severity": "severe",
+        "low_observability": True,
+    }
+    frame_records = {
+        "frame_000001": {"status": "accepted", "reason": "accepted"},
+        "frame_000002": {"status": "accepted", "reason": "accepted"},
+        "frame_000010": {"status": "failed", "reason": "optimizer_failed"},
+    }
+
+    summary = ProjectExecutor._apply_truncated_object_fail_fast(
+        fail_fast,
+        frame_ids=[1, 2, 10, 11],
+        frame_records=frame_records,
+        accepted_records=[],
+    )
+
+    assert summary["skip_entire_object"] is False
+    assert summary["accepted_frame_count_before_failure"] == 2
+
+
+def test_usd_visibility_segments_split_contiguous_trajectory_frames() -> None:
+    assert ProjectExecutor._trajectory_visibility_segments([6, 7, 8, 10, 11, 15]) == [
+        (6, 8),
+        (10, 11),
+        (15, 15),
+    ]
+
+
+def test_apply_usd_visibility_samples_shows_track_from_first_frame() -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD visibility checks")
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = UsdGeom.Xform.Define(stage, "/World/Objects/obj_000001").GetPrim()
+
+    ProjectExecutor._apply_trajectory_visibility_samples(
+        UsdGeom.Imageable(prim),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        stage_start_frame=1,
+        stage_end_frame=12,
+    )
+
+    imageable = UsdGeom.Imageable(prim)
+    attr = imageable.GetVisibilityAttr()
+    assert attr.GetTimeSamples() == [1.0, 10.0]
+    assert imageable.ComputeVisibility(Usd.TimeCode(1.0)) == UsdGeom.Tokens.inherited
+    assert imageable.ComputeVisibility(Usd.TimeCode(9.0)) == UsdGeom.Tokens.inherited
+    assert imageable.ComputeVisibility(Usd.TimeCode(10.0)) == UsdGeom.Tokens.invisible
+
+
+def test_apply_usd_visibility_samples_hides_before_between_and_after_segments() -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD visibility checks")
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = UsdGeom.Xform.Define(stage, "/World/Objects/obj_000009").GetPrim()
+
+    ProjectExecutor._apply_trajectory_visibility_samples(
+        UsdGeom.Imageable(prim),
+        [6, 7, 8, 61, 62, 63],
+        stage_start_frame=1,
+        stage_end_frame=79,
+    )
+
+    imageable = UsdGeom.Imageable(prim)
+    attr = imageable.GetVisibilityAttr()
+    assert attr.GetTimeSamples() == [1.0, 6.0, 9.0, 61.0, 64.0]
+    assert imageable.ComputeVisibility(Usd.TimeCode(1.0)) == UsdGeom.Tokens.invisible
+    assert imageable.ComputeVisibility(Usd.TimeCode(6.0)) == UsdGeom.Tokens.inherited
+    assert imageable.ComputeVisibility(Usd.TimeCode(8.0)) == UsdGeom.Tokens.inherited
+    assert imageable.ComputeVisibility(Usd.TimeCode(9.0)) == UsdGeom.Tokens.invisible
+    assert imageable.ComputeVisibility(Usd.TimeCode(60.0)) == UsdGeom.Tokens.invisible
+    assert imageable.ComputeVisibility(Usd.TimeCode(61.0)) == UsdGeom.Tokens.inherited
+    assert imageable.ComputeVisibility(Usd.TimeCode(64.0)) == UsdGeom.Tokens.invisible
 
 
 def test_temporal_candidate_trajectory_prefers_smooth_pose_over_visual_outlier() -> None:

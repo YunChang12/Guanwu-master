@@ -1856,6 +1856,7 @@ class ProjectExecutor:
             object_attempted = 0
             object_rejected = 0
             object_failed = 0
+            object_fail_fast: dict | None = None
             previous_accepted: dict | None = None
             previous_candidate_prior: dict | None = None
             all_frame_prior_records: list[dict] = []
@@ -1993,11 +1994,19 @@ class ProjectExecutor:
                 if run_info.get("returncode") != 0 or not report_path.exists():
                     failed_frames += 1
                     object_failed += 1
-                    frame_records[f"frame_{int(frame_id):06d}"] = {
+                    failed_record = {
                         "status": "failed",
                         "reason": "optimizer_failed" if run_info.get("returncode") != 0 else "missing_optimization_report",
                         **record_base,
                     }
+                    frame_records[f"frame_{int(frame_id):06d}"] = failed_record
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        failed_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
+                    )
+                    if object_fail_fast.get("skip_object"):
+                        break
                     continue
 
                 try:
@@ -2007,12 +2016,20 @@ class ProjectExecutor:
                 except Exception as exc:
                     failed_frames += 1
                     object_failed += 1
-                    frame_records[f"frame_{int(frame_id):06d}"] = {
+                    failed_record = {
                         "status": "failed",
                         "reason": "invalid_optimization_report",
                         "error": str(exc),
                         **record_base,
                     }
+                    frame_records[f"frame_{int(frame_id):06d}"] = failed_record
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        failed_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
+                    )
+                    if object_fail_fast.get("skip_object"):
+                        break
                     continue
 
                 decision = self._pose_optimizer_acceptance(report)
@@ -2083,6 +2100,37 @@ class ProjectExecutor:
                     rejected_frames += 1
                     object_rejected += 1
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        pose_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
+                    )
+                    if object_fail_fast.get("skip_object"):
+                        break
+
+            if object_fail_fast and object_fail_fast.get("skip_object"):
+                fail_fast_summary = self._apply_truncated_object_fail_fast(
+                    object_fail_fast,
+                    frame_ids=frame_ids,
+                    frame_records=frame_records,
+                    accepted_records=accepted_records,
+                )
+                if fail_fast_summary.get("skip_entire_object"):
+                    manifest["objects"][obj_id] = {
+                        "status": "skipped_after_truncated_failure",
+                        "reason": object_fail_fast.get("reason"),
+                        "failed_frame_id": object_fail_fast.get("frame_id"),
+                        "truncation_severity": object_fail_fast.get("truncation_severity"),
+                        "low_observability": object_fail_fast.get("low_observability"),
+                        "attempted_frame_count": object_attempted,
+                        "accepted_frame_count": len(accepted_records),
+                        "rejected_frame_count": object_rejected,
+                        "failed_frame_count": object_failed,
+                        "remaining_frame_count": fail_fast_summary.get("remaining_frame_count", 0),
+                        "frames": frame_records,
+                    }
+                    skipped_objects += 1
+                    continue
 
             if candidate_records_by_frame:
                 old_accepted_count = len(accepted_records)
@@ -4245,6 +4293,110 @@ class ProjectExecutor:
             except Exception:
                 return False
         return True
+
+    @staticmethod
+    def _pose_truncated_object_fail_fast_decision(record: dict, *, inst: dict | None, frame_id: int) -> dict:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        status = str(record.get("status") or "").lower()
+        reason = str(record.get("reason") or "")
+        failure_status = status in {"failed", "rejected"}
+        if not failure_status:
+            return {"skip_object": False, "reason": "not_failed_or_rejected"}
+
+        severity = str(metrics.get("truncation_severity") or "").lower()
+        low_observability = bool(metrics.get("low_observability"))
+        truncated = low_observability or severity in {"severe", "critical"}
+        inst = inst if isinstance(inst, dict) else {}
+        truncation_info = inst.get("truncation_info")
+        if isinstance(truncation_info, dict):
+            info_severity = str(truncation_info.get("truncation_severity") or truncation_info.get("severity") or "").lower()
+            low_observability = low_observability or bool(truncation_info.get("low_observability"))
+            truncated = truncated or bool(
+                truncation_info.get("is_truncated")
+                or truncation_info.get("touches_image_border")
+                or info_severity in {"severe", "critical"}
+            )
+            if not severity and info_severity:
+                severity = info_severity
+        truncated = truncated or bool(inst.get("is_truncated") or inst.get("truncated"))
+
+        bbox = inst.get("bbox_xyxy") or inst.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+                width = inst.get("image_width") or inst.get("width")
+                height = inst.get("image_height") or inst.get("height")
+                if (width is None or height is None) and inst.get("mask_rle"):
+                    try:
+                        rle = json.loads(inst["mask_rle"]) if isinstance(inst["mask_rle"], str) else inst["mask_rle"]
+                        size = rle.get("size") if isinstance(rle, dict) else None
+                        if isinstance(size, (list, tuple)) and len(size) >= 2:
+                            height, width = int(size[0]), int(size[1])
+                    except Exception:
+                        pass
+                if width is not None and height is not None:
+                    w = float(width)
+                    h = float(height)
+                    touches_bottom = y2 >= h - 1.0
+                    touches_side = x1 <= 1.0 or x2 >= w - 1.0
+                    if touches_bottom and touches_side:
+                        severity = severity or "severe"
+                        truncated = True
+                    elif touches_bottom and status == "failed":
+                        severity = severity or "severe"
+                        truncated = True
+            except Exception:
+                pass
+
+        if not truncated:
+            return {"skip_object": False, "reason": "not_truncated"}
+        if severity not in {"severe", "critical"} and not low_observability and status != "failed":
+            return {"skip_object": False, "reason": "truncation_not_severe"}
+        return {
+            "skip_object": True,
+            "reason": reason or status,
+            "frame_id": int(frame_id),
+            "status": status,
+            "truncation_severity": severity or ("severe" if low_observability else "unknown"),
+            "low_observability": bool(low_observability),
+        }
+
+    @staticmethod
+    def _apply_truncated_object_fail_fast(
+        fail_fast: dict,
+        *,
+        frame_ids: list[int],
+        frame_records: dict[str, dict],
+        accepted_records: list[dict],
+    ) -> dict:
+        failed_frame_id = int(fail_fast.get("frame_id") or 0)
+        remaining_count = 0
+        for remaining_frame_id in frame_ids:
+            remaining_frame_id = int(remaining_frame_id)
+            if failed_frame_id and remaining_frame_id <= failed_frame_id:
+                continue
+            remaining_count += 1
+            frame_key = f"frame_{remaining_frame_id:06d}"
+            if frame_key in frame_records:
+                continue
+            frame_records[frame_key] = {
+                "status": "skipped",
+                "reason": "skipped_after_truncated_object_failure",
+                "failed_frame_id": failed_frame_id,
+            }
+        accepted_count = len([record for record in accepted_records if isinstance(record, dict)])
+        if accepted_count <= 0:
+            accepted_count = sum(
+                1
+                for record in frame_records.values()
+                if isinstance(record, dict) and str(record.get("status") or "").lower() == "accepted"
+            )
+        return {
+            "skip_entire_object": accepted_count <= 0,
+            "failed_frame_id": failed_frame_id,
+            "remaining_frame_count": remaining_count,
+            "accepted_frame_count_before_failure": accepted_count,
+        }
 
     @staticmethod
     def _pose_local_seed_frame_ids(
@@ -6981,6 +7133,51 @@ class ProjectExecutor:
         out /= max(float(np.linalg.norm(out)), 1e-8)
         return out.tolist()
 
+    @staticmethod
+    def _trajectory_visibility_segments(frame_ids: list[int]) -> list[tuple[int, int]]:
+        frames = sorted({int(frame_id) for frame_id in frame_ids if int(frame_id) > 0})
+        if not frames:
+            return []
+
+        segments: list[tuple[int, int]] = []
+        start = frames[0]
+        prev = frames[0]
+        for frame_id in frames[1:]:
+            if frame_id == prev + 1:
+                prev = frame_id
+                continue
+            segments.append((start, prev))
+            start = frame_id
+            prev = frame_id
+        segments.append((start, prev))
+        return segments
+
+    @staticmethod
+    def _apply_trajectory_visibility_samples(
+        imageable,
+        frame_ids: list[int],
+        *,
+        stage_start_frame: int,
+        stage_end_frame: int,
+    ) -> list[tuple[int, int]]:
+        from pxr import Usd, UsdGeom
+
+        segments = ProjectExecutor._trajectory_visibility_segments(frame_ids)
+        vis_attr = imageable.GetVisibilityAttr()
+        vis_attr.Set(UsdGeom.Tokens.inherited)
+        if not segments:
+            vis_attr.Set(UsdGeom.Tokens.invisible, Usd.TimeCode(float(stage_start_frame)))
+            return []
+
+        if segments[0][0] > int(stage_start_frame):
+            vis_attr.Set(UsdGeom.Tokens.invisible, Usd.TimeCode(float(stage_start_frame)))
+
+        for start, end in segments:
+            vis_attr.Set(UsdGeom.Tokens.inherited, Usd.TimeCode(float(start)))
+            if end < int(stage_end_frame):
+                vis_attr.Set(UsdGeom.Tokens.invisible, Usd.TimeCode(float(end + 1)))
+        return segments
+
     def _export_usdc(
         self,
         usdc_path,
@@ -7250,11 +7447,12 @@ class ProjectExecutor:
             vis_xf = UsdGeom.Xformable(visual.GetPrim())
             vis_orient = vis_xf.AddOrientOp()
             vis_scale = vis_xf.AddScaleOp()
-            first_frame = int(min(float(rec.get("frame_id", 0)) for rec in frames))
-            last_frame = int(max(float(rec.get("frame_id", 0)) for rec in frames))
-            if first_frame > 1:
-                imageable.MakeInvisible(1.0)
-            imageable.MakeVisible(float(first_frame))
+            self._apply_trajectory_visibility_samples(
+                imageable,
+                [int(float(rec.get("frame_id", 0))) for rec in frames],
+                stage_start_frame=1,
+                stage_end_frame=int(max_frame),
+            )
             for rec in frames:
                 frame_num = float(rec.get("frame_id", 0))
                 cx, cy, cz = rec["centroid_world"]
@@ -7273,8 +7471,6 @@ class ProjectExecutor:
                     frame_num,
                 )
                 _set_quat(vis_orient, rot_usd, frame_num)
-            if last_frame < int(max_frame):
-                imageable.MakeInvisible(float(last_frame + 1))
 
             mesh_path = f"{obj_path}/Visual/Mesh"
             usd_mesh = UsdGeom.Mesh.Define(stage, mesh_path)

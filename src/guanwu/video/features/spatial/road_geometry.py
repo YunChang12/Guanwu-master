@@ -146,15 +146,31 @@ def estimate_road_geometry(
         "source": "wildgs_depth_maps",
         "depth_maps_dir": str(depth_dir),
         "world_up_axis": world_up_axis,
+        "default_plane_policy": "global_for_fixed_camera",
         "keyframe_planes": keyframes,
         "planes": keyframes,
         "global_plane": global_plane,
     }
 
 
-def select_road_plane_for_frame(road_geometry: dict[str, Any] | None, frame_id: int) -> dict[str, Any] | None:
+def select_road_plane_for_frame(
+    road_geometry: dict[str, Any] | None,
+    frame_id: int,
+    *,
+    policy: str | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(road_geometry, dict) or not road_geometry.get("available"):
         return None
+    requested_policy = str(policy or road_geometry.get("default_plane_policy") or "nearest_keyframe").strip().lower()
+    global_plane = road_geometry.get("global_plane")
+    if requested_policy in {"global", "global_for_fixed_camera"} and isinstance(global_plane, dict):
+        plane = dict(global_plane)
+        plane["selection"] = {
+            "mode": "global",
+            "policy": requested_policy,
+            "target_frame_id": int(frame_id),
+        }
+        return plane
     keyframes = road_geometry.get("keyframe_planes") or []
     if keyframes:
         target_frame_id = int(frame_id)
@@ -168,10 +184,13 @@ def select_road_plane_for_frame(road_geometry: dict[str, Any] | None, frame_id: 
             "frame_distance": _road_plane_frame_distance(best, target_frame_id),
         }
         return plane
-    global_plane = road_geometry.get("global_plane")
     if isinstance(global_plane, dict):
         plane = dict(global_plane)
-        plane["selection"] = {"mode": "global", "target_frame_id": int(frame_id)}
+        plane["selection"] = {
+            "mode": "global",
+            "policy": requested_policy,
+            "target_frame_id": int(frame_id),
+        }
         return plane
     return None
 
@@ -433,29 +452,64 @@ def _camera_plane_to_world(normal_cam: Any, offset_cam: float, t_world_from_cam:
 def _merge_world_planes(keyframes: list[dict[str, Any]]) -> dict[str, Any]:
     import numpy as np
 
-    normals = []
-    offsets = []
-    weights = []
+    candidates = []
     for item in keyframes:
-        normal = np.asarray(item["normal_world"], dtype=np.float64)
-        offset = float(item["offset"])
         quality = item.get("quality", {})
-        weight = max(1e-3, float(quality.get("inlier_ratio", 0.0)))
-        normals.append(normal * weight)
-        offsets.append(offset)
-        weights.append(weight)
-    total = max(1e-6, float(sum(weights)))
+        inlier_ratio = float(quality.get("inlier_ratio", 0.0))
+        rmse_m = float(quality.get("rmse_m", 1.0))
+        if inlier_ratio < 0.20 or rmse_m > 0.25:
+            continue
+        normal = np.asarray(item["normal_world"], dtype=np.float64)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm < 1e-8:
+            continue
+        candidates.append((normal / normal_norm, float(item["offset"]), max(1e-3, inlier_ratio / max(rmse_m, 1e-3)), item))
+    if not candidates:
+        for item in keyframes:
+            normal = np.asarray(item["normal_world"], dtype=np.float64)
+            normal_norm = float(np.linalg.norm(normal))
+            if normal_norm < 1e-8:
+                continue
+            quality = item.get("quality", {})
+            candidates.append((normal / normal_norm, float(item["offset"]), max(1e-3, float(quality.get("inlier_ratio", 0.0))), item))
+    normals = [normal * weight for normal, _offset, weight, _item in candidates]
+    offsets = np.asarray([offset for _normal, offset, _weight, _item in candidates], dtype=np.float64)
+    weights = np.asarray([weight for _normal, _offset, weight, _item in candidates], dtype=np.float64)
+    total = max(1e-6, float(np.sum(weights)))
     normal = np.sum(np.stack(normals, axis=0), axis=0) / total
     norm = max(1e-12, float(np.linalg.norm(normal)))
     normal = normal / norm
-    offset = float(np.average(np.asarray(offsets, dtype=np.float64), weights=np.asarray(weights, dtype=np.float64)))
+    offset = _weighted_quantile(offsets, weights, 0.5)
     return {
-        "source": "weighted_keyframe_mean",
+        "source": "weighted_keyframe_robust_global",
         "normal_world": [float(v) for v in normal],
         "offset": offset,
         "quality": {
             "keyframe_count": len(keyframes),
+            "support_frame_count": len(candidates),
             "mean_inlier_ratio": float(np.mean([item.get("quality", {}).get("inlier_ratio", 0.0) for item in keyframes])),
             "mean_rmse_m": float(np.mean([item.get("quality", {}).get("rmse_m", 0.0) for item in keyframes])),
+            "offset_p05": float(np.percentile(offsets, 5)),
+            "offset_p50": float(np.percentile(offsets, 50)),
+            "offset_p95": float(np.percentile(offsets, 95)),
         },
     }
+
+
+def _weighted_quantile(values: Any, weights: Any, quantile: float) -> float:
+    import numpy as np
+
+    values_arr = np.asarray(values, dtype=np.float64)
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    if len(values_arr) == 0:
+        return 0.0
+    order = np.argsort(values_arr)
+    sorted_values = values_arr[order]
+    sorted_weights = np.maximum(weights_arr[order], 0.0)
+    total = float(np.sum(sorted_weights))
+    if total <= 1e-12:
+        return float(np.median(sorted_values))
+    cdf = np.cumsum(sorted_weights) / total
+    idx = int(np.searchsorted(cdf, float(quantile), side="left"))
+    idx = max(0, min(idx, len(sorted_values) - 1))
+    return float(sorted_values[idx])

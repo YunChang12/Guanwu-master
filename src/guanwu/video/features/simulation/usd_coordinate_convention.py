@@ -235,7 +235,12 @@ def build_coordinate_report(
     forward_usd = convention.R_usd_from_world @ convention.scene_forward_world
     proper_rotation = bool(np.allclose(convention.R_usd_from_world.T @ convention.R_usd_from_world, np.eye(3), atol=1e-6))
     proper_rotation = proper_rotation and bool(abs(float(np.linalg.det(convention.R_usd_from_world)) - 1.0) < 1e-6)
-    up_axis_aligned = bool(np.allclose(up_usd, np.array([0.0, 0.0, 1.0], dtype=np.float64), atol=1e-5))
+    expected_up_usd = (
+        np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        if str(convention.stage_up_axis).upper() == "Y"
+        else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    )
+    up_axis_aligned = bool(np.allclose(up_usd, expected_up_usd, atol=1e-5))
     camera_height_stats = _stats(camera_heights)
     camera_forward_stats = _stats(camera_forward_ground_dots)
     return {

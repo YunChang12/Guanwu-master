@@ -1951,6 +1951,83 @@ def test_vehicle_pose_context_heading_uses_long_track_window_despite_dynamic_rad
     assert prior["displacement_px"] > 35.0
 
 
+def test_pose_road_geometry_falls_back_to_background_manifest_global_plane(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "target_frame_id": 1,
+                "road_plane": {
+                    "source": "weighted_keyframe_mean+semantic_bg_depth_tar",
+                    "normal_world": [0.0, -0.94, -0.34],
+                    "offset": 2.8,
+                    "quality": {"mean_rmse_m": 0.05},
+                    "selection": {"policy": "global_for_fixed_camera"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+    failed = {"available": False, "reason": "plane_fit_failed", "keyframe_planes": [], "global_plane": None}
+
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback(failed, geometry)
+    plane = project_executor.select_road_plane_for_frame(road_geometry, 7)
+
+    assert road_geometry["available"] is True
+    assert road_geometry["source"] == "background_assets_manifest"
+    assert road_geometry["fallback_from"]["reason"] == "plane_fit_failed"
+    assert plane is not None
+    assert plane["normal_world"] == [0.0, -0.94, -0.34]
+    assert plane["selection"]["policy"] == "global_for_fixed_camera"
+
+
+def test_vehicle_pose_context_uses_background_manifest_fallback_road_plane(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "road_plane": {
+                    "normal_world": [0.0, 0.0, 1.0],
+                    "offset": -10.0,
+                    "selection": {"policy": "global_for_fixed_camera"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback({"available": False}, geometry)
+
+    class DummyExecutor:
+        _vehicle_pose_context_for_task = ProjectExecutor._vehicle_pose_context_for_task
+        _motion_heading_prior_for_track = ProjectExecutor._motion_heading_prior_for_track
+
+        def _get_instance_for_frame(self, obj_id, frame_id, detection_frames):
+            return None
+
+    context = DummyExecutor()._vehicle_pose_context_for_task(
+        obj_id="obj_000001",
+        frame_id=3,
+        bbox_xyxy=[10.0, 20.0, 30.0, 40.0],
+        camera={
+            "fx": 10.0,
+            "fy": 10.0,
+            "cx": 20.0,
+            "cy": 20.0,
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, 0.0],
+        },
+        detection_frames=[],
+        road_geometry=road_geometry,
+        target_window_radius=0,
+    )
+
+    assert context["road_plane"]["offset"] == -10.0
+    assert context["bbox_bottom_ground"]["point_world"] == [0.0, 20.0, 10.0]
+
+
 def test_refine_candidate_selection_always_keeps_task_json_corrected_pose() -> None:
     args = type("Args", (), {"pareto_refine_selection_enabled": True})()
     candidates = [

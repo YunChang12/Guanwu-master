@@ -1859,6 +1859,8 @@ class ProjectExecutor:
             object_fail_fast: dict | None = None
             previous_accepted: dict | None = None
             previous_candidate_prior: dict | None = None
+            previous_anchor: dict | None = None
+            stable_temporal_streak = 0
             all_frame_prior_records: list[dict] = []
             frame_records: dict[str, dict] = {}
             candidate_records_by_frame: dict[int, list[dict]] = {}
@@ -1954,6 +1956,13 @@ class ProjectExecutor:
                 }
                 if track_scale_prior:
                     vehicle_pose_context["track_scale_prior"] = track_scale_prior
+                trusted_anchor_prior = self._edge_pose_candidate_temporal_prior_payload(
+                    previous_anchor,
+                    all_frames_mode=all_frames_mode,
+                )
+                if trusted_anchor_prior:
+                    trusted_anchor_prior["source"] = "trusted_temporal_anchor_pose"
+                    vehicle_pose_context["trusted_temporal_anchor_pose"] = trusted_anchor_prior
                 task_path = self._write_pose_optimizer_sample(
                     task_dir=task_dir,
                     obj_id=obj_id,
@@ -2071,9 +2080,48 @@ class ProjectExecutor:
                 pose_record["reason"] = decision.get("reason", "")
 
                 if decision.get("accepted"):
+                    anchor_decision = self._pose_anchor_temporal_gate(pose_record, previous_anchor)
+                    pose_record["anchor_temporal_gate"] = anchor_decision
+                    if not anchor_decision.get("accepted"):
+                        decision = anchor_decision
+                        pose_record["status"] = "rejected"
+                        pose_record["reason"] = str(anchor_decision.get("reason") or "anchor_temporal_gate_rejected")
+                    else:
+                        pose_record["metrics"].update(
+                            {
+                                key: anchor_decision.get(key)
+                                for key in (
+                                    "anchor_frame_id",
+                                    "yaw_jump_deg",
+                                    "rotation_jump_deg",
+                                    "scale_ratio",
+                                    "mask_drop",
+                                    "bbox_drop",
+                                )
+                                if anchor_decision.get(key) is not None
+                            }
+                        )
+                if decision.get("accepted"):
+                    anchor_kind = self._pose_temporal_anchor_kind(pose_record)
+                    if anchor_kind:
+                        pose_record["temporal_anchor_kind"] = anchor_kind
                     if all_frames_mode:
                         if self._pose_record_updates_temporal_anchor(pose_record):
                             previous_candidate_prior = pose_record
+                            stable_temporal_streak = 0
+                        elif anchor_kind == "stable":
+                            stable_temporal_streak += 1
+                            if self._pose_record_promotes_temporal_candidate(
+                                pose_record,
+                                stable_streak_count=stable_temporal_streak,
+                            ):
+                                previous_candidate_prior = pose_record
+                        else:
+                            stable_temporal_streak = 0
+                        if anchor_kind:
+                            previous_anchor = pose_record
+                        else:
+                            stable_temporal_streak = 0
                         all_frame_prior_records.append(pose_record)
                         updated_scale_prior = self._pose_track_scale_prior(
                             all_frame_prior_records,
@@ -2143,6 +2191,13 @@ class ProjectExecutor:
                     int(rec.get("frame_id") or 0) == int(target_frame_id) for rec in selected_records
                 )
                 if selected_records and has_required_target:
+                    selected_records, anchor_gate_summary = self._apply_anchor_temporal_gate_to_selected_records(
+                        selected_records,
+                        frame_ids=frame_ids,
+                        frame_records=frame_records,
+                    )
+                    if anchor_gate_summary.get("applied"):
+                        trajectory_selection_summary["anchor_temporal_gate"] = anchor_gate_summary
                     accepted_records = selected_records
                     for selected in accepted_records:
                         frame_key = f"frame_{int(selected.get('frame_id') or 0):06d}"
@@ -4254,11 +4309,20 @@ class ProjectExecutor:
         rotation = pose.get("rotation_matrix")
         if not isinstance(rotation, list):
             return None
+        metrics = previous.get("metrics") if isinstance(previous.get("metrics"), dict) else {}
+        quality = {
+            "mask_iou": metrics.get("visible_mask_iou", metrics.get("mask_iou")),
+            "bbox_iou": metrics.get("visible_bbox_iou", metrics.get("bbox_iou")),
+            "bbox_center_error_px": metrics.get("bbox_center_error_px"),
+            "truncation_severity": metrics.get("truncation_severity"),
+            "low_observability": metrics.get("low_observability"),
+        }
         return {
             "source": "previous_accepted_pose_in_memory",
             "frame_id": int(previous.get("frame_id") or 0),
             "output_dir": previous.get("output_dir"),
             "path": previous.get("report"),
+            "quality": quality,
             "pose": {
                 "translation_world": pose.get("translation_world"),
                 "rotation_matrix": rotation,
@@ -4281,18 +4345,337 @@ class ProjectExecutor:
 
     @staticmethod
     def _pose_record_updates_temporal_anchor(record: dict) -> bool:
-        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
-        severity = str(metrics.get("truncation_severity") or "")
-        if bool(metrics.get("low_observability")) and severity == "severe":
+        return ProjectExecutor._pose_record_is_high_quality_anchor(record)
+
+    @staticmethod
+    def _pose_record_promotes_temporal_candidate(record: dict, *, stable_streak_count: int = 0) -> bool:
+        if ProjectExecutor._pose_record_is_high_quality_anchor(record):
+            return True
+        return (
+            stable_streak_count >= 2
+            and ProjectExecutor._pose_record_is_stable_temporal_anchor(record)
+        )
+
+    @staticmethod
+    def _pose_record_is_stable_temporal_anchor(record: dict) -> bool:
+        if not isinstance(record, dict):
             return False
-        contour_mean = metrics.get("visible_contour_mean_distance_px")
-        if severity == "severe" and contour_mean is not None:
+        if str(record.get("status") or "accepted") != "accepted":
+            return False
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        severity = str(metrics.get("truncation_severity") or "").lower()
+        if severity in {"moderate", "severe", "critical"}:
+            return False
+        if bool(metrics.get("low_observability")) and severity in {"severe", "critical"}:
+            return False
+        anchor_gate = record.get("anchor_temporal_gate") if isinstance(record.get("anchor_temporal_gate"), dict) else {}
+        if anchor_gate and not bool(anchor_gate.get("accepted", False)):
+            return False
+        try:
+            mask_iou = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
+            bbox_iou = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            ground = float(metrics.get("ground_contact_max_abs_m") or 0.0)
+            heading_err = float(metrics.get("heading_prior_angle_error_deg") or 0.0)
+            contour_mean = metrics.get("visible_contour_mean_distance_px")
+        except Exception:
+            return False
+        if not math.isfinite(mask_iou) or not math.isfinite(bbox_iou):
+            return False
+        if mask_iou < 0.80 or bbox_iou < 0.75:
+            return False
+        if math.isfinite(ground) and ground > 0.20:
+            return False
+        if math.isfinite(heading_err) and heading_err > 60.0:
+            return False
+        if contour_mean is not None:
             try:
-                if float(contour_mean) > 7.0:
+                if float(contour_mean) > 6.5:
                     return False
             except Exception:
                 return False
+        if anchor_gate:
+            try:
+                yaw_jump = float(anchor_gate.get("yaw_jump_deg") or 0.0)
+            except Exception:
+                yaw_jump = 0.0
+            try:
+                scale_ratio = float(anchor_gate.get("scale_ratio") or 1.0)
+            except Exception:
+                scale_ratio = 1.0
+            try:
+                mask_drop = float(anchor_gate.get("mask_drop") or 0.0)
+            except Exception:
+                mask_drop = 0.0
+            try:
+                bbox_drop = float(anchor_gate.get("bbox_drop") or 0.0)
+            except Exception:
+                bbox_drop = 0.0
+            combined_drop = max(0.0, mask_drop) + max(0.0, bbox_drop)
+            source_anchor_kind = str(anchor_gate.get("anchor_kind") or "").lower()
+            normal_observation = severity in {"", "none", "normal"}
+            if math.isfinite(yaw_jump) and yaw_jump > 18.0:
+                return False
+            if math.isfinite(scale_ratio) and scale_ratio > 1.10:
+                return False
+            if (
+                normal_observation
+                and source_anchor_kind == "high_quality"
+                and combined_drop > 0.20
+                and (mask_drop > 0.08 or bbox_drop > 0.10)
+                and (mask_iou < 0.86 or bbox_iou < 0.82)
+            ):
+                return False
+            if (
+                math.isfinite(yaw_jump)
+                and yaw_jump > 6.0
+                and combined_drop > 0.18
+                and (mask_drop > 0.08 or bbox_drop > 0.10)
+                and (bbox_iou < 0.82 or mask_iou < 0.84)
+            ):
+                return False
+            if mask_drop > 0.12 or bbox_drop > 0.15:
+                return False
         return True
+
+    @staticmethod
+    def _pose_temporal_anchor_kind(record: dict) -> str | None:
+        if ProjectExecutor._pose_record_is_high_quality_anchor(record):
+            return "high_quality"
+        if ProjectExecutor._pose_record_is_stable_temporal_anchor(record):
+            return "stable"
+        return None
+
+    @staticmethod
+    def _pose_visual_iou(metrics: dict, *, kind: str) -> float:
+        if kind == "mask":
+            keys = ("visible_mask_iou", "mask_iou")
+        else:
+            keys = ("visible_bbox_iou", "bbox_iou")
+        for key in keys:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            try:
+                score = float(value)
+            except Exception:
+                continue
+            if math.isfinite(score) and score > 0.0:
+                return max(0.0, min(1.0, score))
+        return 0.0
+
+    @staticmethod
+    def _pose_record_is_high_quality_anchor(record: dict) -> bool:
+        if not isinstance(record, dict):
+            return False
+        if str(record.get("status") or "accepted") != "accepted":
+            return False
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        severity = str(metrics.get("truncation_severity") or "").lower()
+        if bool(metrics.get("low_observability")) or severity in {"moderate", "severe", "critical"}:
+            return False
+        mask_iou = ProjectExecutor._pose_visual_iou(metrics, kind="mask")
+        bbox_iou = ProjectExecutor._pose_visual_iou(metrics, kind="bbox")
+        if mask_iou < 0.88 or bbox_iou < 0.85:
+            return False
+        try:
+            ground = float(metrics.get("ground_contact_max_abs_m") or 0.0)
+        except Exception:
+            ground = 0.0
+        if math.isfinite(ground) and ground > 0.18:
+            return False
+        pose = record.get("pose") if isinstance(record.get("pose"), dict) else {}
+        return (
+            ProjectExecutor._valid_vec3_like(pose.get("translation_world"))
+            and ProjectExecutor._valid_vec3_like(pose.get("scale"))
+            and isinstance(pose.get("rotation_matrix"), list)
+        )
+
+    @staticmethod
+    def _pose_scale_ratio(record: dict, anchor: dict) -> float | None:
+        import numpy as np
+
+        pose = record.get("pose") if isinstance(record.get("pose"), dict) else {}
+        anchor_pose = anchor.get("pose") if isinstance(anchor.get("pose"), dict) else {}
+        if not ProjectExecutor._valid_vec3_like(pose.get("scale")):
+            return None
+        if not ProjectExecutor._valid_vec3_like(anchor_pose.get("scale")):
+            return None
+        cur = float(np.median(np.asarray(pose["scale"], dtype=np.float64).reshape(3)))
+        ref = float(np.median(np.asarray(anchor_pose["scale"], dtype=np.float64).reshape(3)))
+        if not math.isfinite(cur) or not math.isfinite(ref) or cur <= 1e-8 or ref <= 1e-8:
+            return None
+        return max(cur, ref) / max(1e-8, min(cur, ref))
+
+    @staticmethod
+    def _pose_anchor_temporal_gate(record: dict, anchor: dict | None) -> dict:
+        if not isinstance(anchor, dict):
+            return {"accepted": True, "reason": "accepted"}
+        pose = record.get("pose") if isinstance(record.get("pose"), dict) else {}
+        anchor_pose = anchor.get("pose") if isinstance(anchor.get("pose"), dict) else {}
+        rotation = pose.get("rotation_matrix")
+        anchor_rotation = anchor_pose.get("rotation_matrix")
+        if not isinstance(rotation, list) or not isinstance(anchor_rotation, list):
+            return {"accepted": True, "reason": "accepted"}
+
+        rotation_jump = ProjectExecutor._rotation_geodesic_deg(rotation, anchor_rotation)
+        yaw_jump = rotation_jump
+        scale_ratio = ProjectExecutor._pose_scale_ratio(record, anchor)
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        anchor_metrics = anchor.get("metrics") if isinstance(anchor.get("metrics"), dict) else {}
+        mask_iou = ProjectExecutor._pose_visual_iou(metrics, kind="mask")
+        bbox_iou = ProjectExecutor._pose_visual_iou(metrics, kind="bbox")
+        anchor_mask = ProjectExecutor._pose_visual_iou(anchor_metrics, kind="mask")
+        anchor_bbox = ProjectExecutor._pose_visual_iou(anchor_metrics, kind="bbox")
+        mask_drop = max(0.0, anchor_mask - mask_iou)
+        bbox_drop = max(0.0, anchor_bbox - bbox_iou)
+        combined_visual_drop = mask_drop + bbox_drop
+        severity = str(metrics.get("truncation_severity") or "").lower()
+        low_observability = bool(metrics.get("low_observability"))
+        visible_fraction = None
+        try:
+            if metrics.get("visible_target_fraction") is not None:
+                visible_fraction = float(metrics.get("visible_target_fraction"))
+        except Exception:
+            visible_fraction = None
+        try:
+            heading_err = float(metrics.get("heading_prior_angle_error_deg"))
+        except Exception:
+            heading_err = 0.0
+        if not math.isfinite(heading_err):
+            heading_err = 0.0
+        anchor_kind = str(anchor.get("temporal_anchor_kind") or "").lower()
+        if not anchor_kind:
+            anchor_kind = ProjectExecutor._pose_temporal_anchor_kind(anchor) or ""
+        stable_anchor = anchor_kind == "stable"
+
+        decision_base = {
+            "anchor_frame_id": int(anchor.get("frame_id") or 0),
+            "anchor_kind": anchor_kind or None,
+            "yaw_jump_deg": float(yaw_jump) if math.isfinite(yaw_jump) else None,
+            "rotation_jump_deg": float(rotation_jump) if math.isfinite(rotation_jump) else None,
+            "scale_ratio": scale_ratio,
+            "mask_drop": float(mask_drop),
+            "bbox_drop": float(bbox_drop),
+            "combined_visual_drop": float(combined_visual_drop),
+            "mask_iou": float(mask_iou),
+            "bbox_iou": float(bbox_iou),
+            "anchor_mask_iou": float(anchor_mask),
+            "anchor_bbox_iou": float(anchor_bbox),
+            "heading_prior_angle_error_deg": heading_err,
+            "truncation_severity": severity or None,
+            "low_observability": bool(low_observability),
+            "visible_target_fraction": visible_fraction,
+        }
+
+        severe_observation_loss = low_observability or severity in {"severe", "critical"} or (
+            visible_fraction is not None and visible_fraction < 0.40
+        )
+        moderate_observation_loss = severity == "moderate" or (
+            visible_fraction is not None and visible_fraction < 0.72
+        )
+        if severe_observation_loss:
+            yaw_limit = 22.0 if stable_anchor else 30.0
+            scale_limit = 1.18 if stable_anchor else 1.12
+            heading_limit = 70.0 if stable_anchor else 60.0
+            if math.isfinite(yaw_jump) and yaw_jump > yaw_limit:
+                return {"accepted": False, "reason": f"anchor_low_observability_yaw_jump:{yaw_jump:.1f}deg", **decision_base}
+            if scale_ratio is not None and scale_ratio > scale_limit:
+                return {"accepted": False, "reason": f"anchor_low_observability_scale_jump:{scale_ratio:.3f}x", **decision_base}
+            if heading_err > heading_limit:
+                return {"accepted": False, "reason": f"anchor_low_observability_heading_error:{heading_err:.1f}deg", **decision_base}
+
+        if moderate_observation_loss:
+            yaw_limit = 36.0 if stable_anchor else 45.0
+            scale_limit = 1.30 if stable_anchor else 1.25
+            heading_limit = 80.0 if stable_anchor else 75.0
+            if math.isfinite(yaw_jump) and yaw_jump > yaw_limit:
+                return {"accepted": False, "reason": f"anchor_truncated_yaw_jump:{yaw_jump:.1f}deg", **decision_base}
+            if scale_ratio is not None and scale_ratio > scale_limit:
+                return {"accepted": False, "reason": f"anchor_truncated_scale_jump:{scale_ratio:.3f}x", **decision_base}
+            if heading_err > heading_limit:
+                return {"accepted": False, "reason": f"anchor_truncated_heading_error:{heading_err:.1f}deg", **decision_base}
+
+        visual_mask_drop_limit = 0.14 if stable_anchor else 0.10
+        visual_bbox_drop_limit = 0.16 if stable_anchor else 0.12
+        visual_degraded = mask_drop > visual_mask_drop_limit or bbox_drop > visual_bbox_drop_limit
+        high_quality_anchor = anchor_kind == "high_quality" or (anchor_mask >= 0.88 and anchor_bbox >= 0.85)
+        coupled_visual_degraded = (
+            combined_visual_drop > (0.22 if stable_anchor else 0.18)
+            and (mask_drop > 0.08 or bbox_drop > 0.10)
+            and (mask_iou < 0.86 or bbox_iou < 0.82)
+        )
+        if (
+            high_quality_anchor
+            and severity in {"", "none", "normal"}
+            and coupled_visual_degraded
+            and math.isfinite(yaw_jump)
+            and yaw_jump > (10.0 if stable_anchor else 6.0)
+        ):
+            return {"accepted": False, "reason": f"anchor_visual_degradation_yaw_jump_from_high_quality:{yaw_jump:.1f}deg", **decision_base}
+        if coupled_visual_degraded and math.isfinite(yaw_jump):
+            yaw_limit = 8.0 if stable_anchor else 6.0
+            if yaw_jump > yaw_limit:
+                return {"accepted": False, "reason": f"anchor_visual_degradation_yaw_jump_coupled:{yaw_jump:.1f}deg", **decision_base}
+        if visual_degraded:
+            yaw_limit = 12.0 if stable_anchor else 8.0
+            low_mask = 0.84 if stable_anchor else 0.86
+            low_bbox = 0.82 if stable_anchor else 0.84
+            if math.isfinite(yaw_jump) and yaw_jump > yaw_limit and (mask_iou < low_mask or bbox_iou < low_bbox):
+                return {"accepted": False, "reason": f"anchor_visual_degradation_yaw_jump:{yaw_jump:.1f}deg", **decision_base}
+            rotation_limit = 24.0 if stable_anchor else 18.0
+            if math.isfinite(yaw_jump) and yaw_jump > rotation_limit:
+                return {"accepted": False, "reason": f"anchor_visual_degradation_rotation_jump:{yaw_jump:.1f}deg", **decision_base}
+            scale_limit = 1.20 if stable_anchor else 1.15
+            if scale_ratio is not None and scale_ratio > scale_limit:
+                return {"accepted": False, "reason": f"anchor_visual_degradation_scale_jump:{scale_ratio:.3f}x", **decision_base}
+
+        return {"accepted": True, "reason": "accepted", **decision_base}
+
+    @staticmethod
+    def _apply_anchor_temporal_gate_to_selected_records(
+        selected_records: list[dict],
+        *,
+        frame_ids: list[int],
+        frame_records: dict[str, dict],
+    ) -> tuple[list[dict], dict]:
+        kept: list[dict] = []
+        anchor: dict | None = None
+        sorted_records = sorted(
+            [record for record in selected_records if isinstance(record, dict)],
+            key=lambda record: int(record.get("frame_id") or 0),
+        )
+        for record in sorted_records:
+            decision = ProjectExecutor._pose_anchor_temporal_gate(record, anchor)
+            record["anchor_temporal_gate"] = decision
+            if not decision.get("accepted"):
+                failed_frame_id = int(record.get("frame_id") or 0)
+                record["status"] = "rejected"
+                record["reason"] = str(decision.get("reason") or "anchor_temporal_gate_rejected")
+                frame_records[f"frame_{failed_frame_id:06d}"] = record
+                remaining_count = 0
+                for remaining_frame_id in sorted({int(fid) for fid in frame_ids if int(fid) > failed_frame_id}):
+                    remaining_count += 1
+                    frame_records[f"frame_{remaining_frame_id:06d}"] = {
+                        "status": "skipped",
+                        "reason": "skipped_after_anchor_temporal_gate_failure",
+                        "failed_frame_id": failed_frame_id,
+                    }
+                return kept, {
+                    "applied": True,
+                    "reason": record["reason"],
+                    "failed_frame_id": failed_frame_id,
+                    "remaining_frame_count": remaining_count,
+                    "accepted_frame_count_before_failure": len(kept),
+                    "gate": decision,
+                }
+            record["status"] = "accepted"
+            kept.append(record)
+            anchor_kind = ProjectExecutor._pose_temporal_anchor_kind(record)
+            if anchor_kind:
+                record["temporal_anchor_kind"] = anchor_kind
+            if anchor_kind:
+                anchor = record
+        return kept, {"applied": False, "reason": "all_selected_records_passed"}
 
     @staticmethod
     def _pose_truncated_object_fail_fast_decision(record: dict, *, inst: dict | None, frame_id: int) -> dict:
@@ -4542,9 +4925,16 @@ class ProjectExecutor:
             return 0.0
         if bool(metrics.get("heading_front_sign_hard_rejected")):
             return 10.0
+        try:
+            candidate_sign = float(metrics.get("heading_candidate_forward_sign"))
+            semantic_sign = float(metrics.get("heading_semantic_front_sign"))
+        except Exception:
+            candidate_sign = 0.0
+            semantic_sign = 0.0
+        sign_flip_penalty = 1.0 if candidate_sign * semantic_sign < 0.0 else 0.0
         wrong_sign_penalty = max(0.0, angle - 90.0) / 90.0
         soft_angle_penalty = min(angle, 90.0) / 180.0
-        return confidence * (4.0 * wrong_sign_penalty + 0.3 * soft_angle_penalty)
+        return confidence * (sign_flip_penalty + 4.0 * wrong_sign_penalty + 0.3 * soft_angle_penalty)
 
     @staticmethod
     def _select_edge_pose_candidate_trajectory(

@@ -1445,6 +1445,8 @@ def build_vehicle_pose_context(
         context["disable_disk_temporal_prior"] = bool(raw_context.get("disable_disk_temporal_prior"))
     if isinstance(raw_context.get("track_scale_prior"), dict):
         context["track_scale_prior"] = dict(raw_context["track_scale_prior"])
+    if isinstance(raw_context.get("trusted_temporal_anchor_pose"), dict):
+        context["trusted_temporal_anchor_pose"] = dict(raw_context["trusted_temporal_anchor_pose"])
 
     area_trend = compute_bbox_area_trend_from_geometry_lift(
         sample_dir=sample_dir,

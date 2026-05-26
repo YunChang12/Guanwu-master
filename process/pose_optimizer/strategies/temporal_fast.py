@@ -94,6 +94,25 @@ TEMPORAL_EXTRA_HISTORY_KEYS = [
     "effective_bbox_bottom_weight",
     "effective_upright_weight",
     "effective_heading_prior_weight",
+    "temporal_anchor_visual_gate_passed",
+    "temporal_anchor_visual_gate_reason",
+    "temporal_anchor_visual_mask_drop",
+    "temporal_anchor_visual_bbox_drop",
+    "temporal_anchor_visual_yaw_jump_deg",
+    "temporal_anchor_visual_prior_mask_iou",
+    "temporal_anchor_visual_prior_bbox_iou",
+    "temporal_anchor_visual_penalty",
+    "trusted_anchor_gate_passed",
+    "trusted_anchor_gate_reason",
+    "trusted_anchor_mask_drop",
+    "trusted_anchor_bbox_drop",
+    "trusted_anchor_yaw_jump_deg",
+    "trusted_anchor_scale_ratio",
+    "trusted_anchor_penalty",
+    "truncated_anchor_gate_passed",
+    "truncated_anchor_gate_reasons",
+    "scale_ratio_from_anchor",
+    "yaw_jump_from_anchor_deg",
     "final_score",
     "is_truncated",
     "prior_frame_id",
@@ -133,14 +152,24 @@ def load_prior_pose(
     data = fast.read_json(pose_path)
     pose_source = pose_path.name
     prior_mask_area_px: int | None = None
+    prior_quality: dict[str, Any] = {}
 
     report_path = pose_path.parent / "optimization_report.json"
     if report_path.exists():
         try:
             report = fast.read_json(report_path)
             prior_mask_area_px = int(report.get("mask_observations", {}).get("area_px", 0)) or None
+            metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
+            prior_quality = {
+                "mask_iou": metrics.get("visible_mask_iou", metrics.get("mask_iou")),
+                "bbox_iou": metrics.get("visible_bbox_iou", metrics.get("bbox_iou")),
+                "bbox_center_error_px": metrics.get("bbox_center_error_px"),
+                "truncation_severity": metrics.get("truncation_severity"),
+                "low_observability": metrics.get("low_observability"),
+            }
         except Exception:
             prior_mask_area_px = None
+            prior_quality = {}
 
     if pose_path.name == "task_with_optimized_corrected_pose.json":
         pose = data.get("corrected_pose", {})
@@ -164,6 +193,7 @@ def load_prior_pose(
             "rotation_cam": rotation_cam,
             "scale": scale,
             "prior_mask_area_px": prior_mask_area_px,
+            "quality": prior_quality,
         }
 
     world_pose = data.get("optimized_corrected_pose_world")
@@ -186,6 +216,7 @@ def load_prior_pose(
             "rotation_cam": rotation_cam,
             "scale": scale,
             "prior_mask_area_px": prior_mask_area_px,
+            "quality": prior_quality,
         }
 
     camera_pose = data.get("optimized_camera_pose")
@@ -200,6 +231,7 @@ def load_prior_pose(
                 fast.scale_to_uniform_scalar(np.asarray(camera_pose.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64))
             ),
             "prior_mask_area_px": prior_mask_area_px,
+            "quality": prior_quality,
         }
 
     return None
@@ -237,6 +269,7 @@ def load_prior_pose_payload(
         "rotation_cam": rotation_cam,
         "scale": scale,
         "prior_mask_area_px": payload.get("prior_mask_area_px"),
+        "quality": payload.get("quality") if isinstance(payload.get("quality"), dict) else {},
         "frame_idx": int(payload.get("frame_id") or payload.get("frame_idx") or 0),
         "output_dir": payload.get("output_dir"),
         "path": payload.get("path"),
@@ -382,6 +415,8 @@ def compute_temporal_score(
         "delta_yaw_deg": delta_yaw_deg,
         "delta_roll_deg": delta_roll_deg,
         "delta_scale_log": delta_scale_log,
+        "scale_ratio_from_anchor": float(scale_ratio),
+        "yaw_jump_from_anchor_deg": float(delta_rotation_deg),
         "temporal_loss": float(loss),
         "temporal_score": temporal_score,
     }
@@ -855,6 +890,204 @@ def compute_visual_gate_for_pose_priors(
         "visual_gate_mask_iou_min": mask_min,
         "visual_gate_bbox_iou_min": bbox_min,
         "visual_gate_center_error_px_max": center_max,
+    }
+
+
+def _prior_quality_score(prior: dict[str, Any] | None, key: str) -> float | None:
+    if not isinstance(prior, dict):
+        return None
+    quality = prior.get("quality") if isinstance(prior.get("quality"), dict) else {}
+    candidates: list[Any] = []
+    if key == "mask_iou":
+        candidates.extend([quality.get("visible_mask_iou"), quality.get("mask_iou")])
+    elif key == "bbox_iou":
+        candidates.extend([quality.get("visible_bbox_iou"), quality.get("bbox_iou")])
+    candidates.extend([prior.get(key)])
+    for value in candidates:
+        parsed = _finite_float(value)
+        if parsed is None:
+            continue
+        return float(np.clip(parsed, 0.0, 1.0))
+    return None
+
+
+def _result_quality_score(result: dict[str, Any], keys: tuple[str, ...]) -> float:
+    for key in keys:
+        parsed = _finite_float(result.get(key))
+        if parsed is None:
+            continue
+        return float(np.clip(parsed, 0.0, 1.0))
+    return 0.0
+
+
+def compute_temporal_anchor_visual_gate(
+    *,
+    result: dict[str, Any],
+    temporal_prior: dict[str, Any] | None,
+    truncation_info: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Reject temporal-seed drift that trades visual fit for weak pose priors."""
+
+    defaults = {
+        "temporal_anchor_visual_gate_passed": True,
+        "temporal_anchor_visual_gate_reason": "not_applicable",
+        "temporal_anchor_visual_mask_drop": None,
+        "temporal_anchor_visual_bbox_drop": None,
+        "temporal_anchor_visual_yaw_jump_deg": None,
+        "temporal_anchor_visual_prior_mask_iou": None,
+        "temporal_anchor_visual_prior_bbox_iou": None,
+        "temporal_anchor_visual_penalty": 0.0,
+    }
+    if not bool(getattr(args, "temporal_anchor_visual_gate_enabled", True)):
+        defaults["temporal_anchor_visual_gate_reason"] = "disabled"
+        return defaults
+    if temporal_prior is None:
+        return defaults
+    if bool(truncation_info.get("is_truncated")):
+        defaults["temporal_anchor_visual_gate_reason"] = "truncated_uses_low_observability_gate"
+        return defaults
+
+    prior_mask = _prior_quality_score(temporal_prior, "mask_iou")
+    prior_bbox = _prior_quality_score(temporal_prior, "bbox_iou")
+    if prior_mask is None or prior_bbox is None:
+        defaults["temporal_anchor_visual_gate_reason"] = "missing_prior_quality"
+        return defaults
+
+    prior_mask_min = float(getattr(args, "temporal_anchor_visual_gate_prior_mask_iou_min", 0.88))
+    prior_bbox_min = float(getattr(args, "temporal_anchor_visual_gate_prior_bbox_iou_min", 0.85))
+    if prior_mask < prior_mask_min or prior_bbox < prior_bbox_min:
+        defaults.update(
+            {
+                "temporal_anchor_visual_gate_reason": "prior_not_high_quality",
+                "temporal_anchor_visual_prior_mask_iou": prior_mask,
+                "temporal_anchor_visual_prior_bbox_iou": prior_bbox,
+            }
+        )
+        return defaults
+
+    mask_iou = _result_quality_score(result, ("visible_mask_iou", "mask_iou"))
+    bbox_iou = _result_quality_score(result, ("visible_bbox_iou", "bbox_iou"))
+    mask_drop = max(0.0, prior_mask - mask_iou)
+    bbox_drop = max(0.0, prior_bbox - bbox_iou)
+    yaw_jump = _finite_float(result.get("delta_yaw_deg"))
+    if yaw_jump is None:
+        yaw_jump = _finite_float(result.get("delta_rotation_deg"))
+    temporal_loss = _finite_float(result.get("temporal_loss"))
+
+    mask_drop_max = float(getattr(args, "temporal_anchor_visual_gate_mask_drop_max", 0.08))
+    bbox_drop_max = float(getattr(args, "temporal_anchor_visual_gate_bbox_drop_max", 0.10))
+    yaw_limit = float(getattr(args, "temporal_anchor_visual_gate_yaw_jump_deg", 8.0))
+    min_mask = float(getattr(args, "temporal_anchor_visual_gate_min_mask_iou", 0.86))
+    min_bbox = float(getattr(args, "temporal_anchor_visual_gate_min_bbox_iou", 0.84))
+    loss_limit = float(getattr(args, "temporal_anchor_visual_gate_temporal_loss_max", 0.50))
+    penalty = float(getattr(args, "temporal_anchor_visual_gate_penalty", 1_000_000.0))
+
+    visual_degraded = mask_drop > mask_drop_max or bbox_drop > bbox_drop_max
+    yaw_drift = yaw_jump is not None and yaw_jump > yaw_limit
+    low_current_visual = mask_iou < min_mask or bbox_iou < min_bbox
+    temporal_drift = temporal_loss is not None and temporal_loss > loss_limit
+    failed = visual_degraded and (yaw_drift or temporal_drift) and low_current_visual
+
+    reason = "passed"
+    if failed:
+        parts = ["visual_degradation"]
+        if yaw_drift:
+            parts.append("yaw_jump")
+        if temporal_drift:
+            parts.append("temporal_loss")
+        reason = "_".join(parts)
+
+    return {
+        "temporal_anchor_visual_gate_passed": not failed,
+        "temporal_anchor_visual_gate_reason": reason,
+        "temporal_anchor_visual_mask_drop": float(mask_drop),
+        "temporal_anchor_visual_bbox_drop": float(bbox_drop),
+        "temporal_anchor_visual_yaw_jump_deg": float(yaw_jump) if yaw_jump is not None else None,
+        "temporal_anchor_visual_prior_mask_iou": float(prior_mask),
+        "temporal_anchor_visual_prior_bbox_iou": float(prior_bbox),
+        "temporal_anchor_visual_penalty": float(penalty if failed else 0.0),
+    }
+
+
+def compute_trusted_anchor_gate(
+    *,
+    result: dict[str, Any],
+    trusted_anchor: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    defaults = {
+        "trusted_anchor_gate_passed": True,
+        "trusted_anchor_gate_reason": "not_applicable",
+        "trusted_anchor_mask_drop": None,
+        "trusted_anchor_bbox_drop": None,
+        "trusted_anchor_yaw_jump_deg": None,
+        "trusted_anchor_scale_ratio": None,
+        "trusted_anchor_penalty": 0.0,
+    }
+    if not bool(getattr(args, "trusted_anchor_gate_enabled", True)):
+        defaults["trusted_anchor_gate_reason"] = "disabled"
+        return defaults
+    if trusted_anchor is None:
+        return defaults
+
+    prior_mask = _prior_quality_score(trusted_anchor, "mask_iou")
+    prior_bbox = _prior_quality_score(trusted_anchor, "bbox_iou")
+    if prior_mask is None or prior_bbox is None:
+        defaults["trusted_anchor_gate_reason"] = "missing_prior_quality"
+        return defaults
+    if (
+        prior_mask < float(getattr(args, "trusted_anchor_prior_mask_iou_min", 0.88))
+        or prior_bbox < float(getattr(args, "trusted_anchor_prior_bbox_iou_min", 0.85))
+    ):
+        defaults["trusted_anchor_gate_reason"] = "prior_not_high_quality"
+        return defaults
+
+    mask_iou = _result_quality_score(result, ("visible_mask_iou", "mask_iou"))
+    bbox_iou = _result_quality_score(result, ("visible_bbox_iou", "bbox_iou"))
+    mask_drop = max(0.0, prior_mask - mask_iou)
+    bbox_drop = max(0.0, prior_bbox - bbox_iou)
+    combined_drop = mask_drop + bbox_drop
+    yaw_jump = _finite_float(result.get("yaw_jump_from_trusted_anchor_deg"))
+    if yaw_jump is None:
+        yaw_jump = _finite_float(result.get("delta_rotation_from_trusted_anchor_deg"))
+    scale_ratio = _finite_float(result.get("scale_ratio_from_trusted_anchor"))
+
+    visual_drop_max = float(getattr(args, "trusted_anchor_visual_drop_max", 0.18))
+    mask_drop_max = float(getattr(args, "trusted_anchor_mask_drop_max", 0.08))
+    bbox_drop_max = float(getattr(args, "trusted_anchor_bbox_drop_max", 0.10))
+    yaw_limit = float(getattr(args, "trusted_anchor_yaw_jump_deg", 6.0))
+    scale_limit = float(getattr(args, "trusted_anchor_scale_ratio", 1.04))
+    min_mask = float(getattr(args, "trusted_anchor_min_mask_iou", 0.86))
+    min_bbox = float(getattr(args, "trusted_anchor_min_bbox_iou", 0.82))
+    penalty = float(getattr(args, "trusted_anchor_penalty", 18.0))
+
+    visual_degraded = (
+        combined_drop > visual_drop_max
+        and (mask_drop > mask_drop_max or bbox_drop > bbox_drop_max)
+        and (mask_iou < min_mask or bbox_iou < min_bbox)
+    )
+    yaw_drift = yaw_jump is not None and yaw_jump > yaw_limit
+    scale_drift = scale_ratio is not None and scale_ratio > scale_limit
+    failed = visual_degraded and (yaw_drift or scale_drift)
+
+    reason = "passed"
+    if failed:
+        parts = ["visual_degradation"]
+        if yaw_drift:
+            parts.append("yaw_jump")
+        if scale_drift:
+            parts.append("scale_jump")
+        reason = "_".join(parts)
+
+    return {
+        "trusted_anchor_gate_passed": not failed,
+        "trusted_anchor_gate_reason": reason,
+        "trusted_anchor_mask_drop": float(mask_drop),
+        "trusted_anchor_bbox_drop": float(bbox_drop),
+        "trusted_anchor_yaw_jump_deg": float(yaw_jump) if yaw_jump is not None else None,
+        "trusted_anchor_scale_ratio": float(scale_ratio) if scale_ratio is not None else None,
+        "trusted_anchor_penalty": float(penalty if failed else 0.0),
     }
 
 
@@ -1907,6 +2140,21 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
         result["visual_gate_mask_iou_min"] = None
         result["visual_gate_bbox_iou_min"] = None
         result["visual_gate_center_error_px_max"] = None
+        result["temporal_anchor_visual_gate_passed"] = True
+        result["temporal_anchor_visual_gate_reason"] = "not_evaluated"
+        result["temporal_anchor_visual_mask_drop"] = None
+        result["temporal_anchor_visual_bbox_drop"] = None
+        result["temporal_anchor_visual_yaw_jump_deg"] = None
+        result["temporal_anchor_visual_prior_mask_iou"] = None
+        result["temporal_anchor_visual_prior_bbox_iou"] = None
+        result["temporal_anchor_visual_penalty"] = 0.0
+        result["trusted_anchor_gate_passed"] = True
+        result["trusted_anchor_gate_reason"] = "not_evaluated"
+        result["trusted_anchor_mask_drop"] = None
+        result["trusted_anchor_bbox_drop"] = None
+        result["trusted_anchor_yaw_jump_deg"] = None
+        result["trusted_anchor_scale_ratio"] = None
+        result["trusted_anchor_penalty"] = 0.0
         result["visible_mask_bonus"] = 0.0
         result["visible_mask_bonus_weight"] = 0.0
         result["effective_temporal_weight"] = float(self.temporal_args.temporal_weight)
@@ -2034,6 +2282,43 @@ class TemporalPoseEvaluator(fast.CameraPoseEvaluator):
                 temporal_weight = float(self.temporal_args.truncated_temporal_weight)
             result["effective_temporal_weight"] = temporal_weight
             final_score += temporal_weight * float(temporal["temporal_score"])
+            anchor_visual_gate = compute_temporal_anchor_visual_gate(
+                result=result,
+                temporal_prior=self.temporal_prior,
+                truncation_info=self.truncation_info,
+                args=self.temporal_args,
+            )
+            result.update(anchor_visual_gate)
+            if not bool(anchor_visual_gate.get("temporal_anchor_visual_gate_passed", True)):
+                final_score -= float(anchor_visual_gate.get("temporal_anchor_visual_penalty") or 0.0)
+
+        trusted_anchor = self.vehicle_pose_context.get("trusted_temporal_anchor_pose")
+        if isinstance(trusted_anchor, dict):
+            trusted_temporal = compute_temporal_score(
+                translation_cam=np.asarray(result["translation_cam"], dtype=np.float64),
+                rotation_cam=np.asarray(result["rotation_cam"], dtype=np.float64),
+                scale=np.asarray(result["scale"], dtype=np.float64),
+                prior=trusted_anchor,
+                args=self.temporal_args,
+            )
+            result.update(
+                {
+                    "delta_rotation_from_trusted_anchor_deg": trusted_temporal.get("delta_rotation_deg"),
+                    "delta_yaw_from_trusted_anchor_deg": trusted_temporal.get("delta_yaw_deg"),
+                    "scale_ratio_from_trusted_anchor": trusted_temporal.get("scale_ratio_from_anchor"),
+                    "yaw_jump_from_trusted_anchor_deg": trusted_temporal.get("yaw_jump_from_anchor_deg"),
+                    "temporal_loss_from_trusted_anchor": trusted_temporal.get("temporal_loss"),
+                    "temporal_score_from_trusted_anchor": trusted_temporal.get("temporal_score"),
+                }
+            )
+            trusted_gate = compute_trusted_anchor_gate(
+                result=result,
+                trusted_anchor=trusted_anchor,
+                args=self.temporal_args,
+            )
+            result.update(trusted_gate)
+            if not bool(trusted_gate.get("trusted_anchor_gate_passed", True)):
+                final_score -= float(trusted_gate.get("trusted_anchor_penalty") or 0.0)
 
         track_scale_prior = self.vehicle_pose_context.get("track_scale_prior")
         track_scale = compute_track_scale_prior_score(
@@ -2391,12 +2676,16 @@ def road_snap_candidate(
     candidate: dict[str, Any],
     evaluator: TemporalPoseEvaluator,
     args: argparse.Namespace,
+    *,
+    allow_non_truncated: bool = False,
+    source_suffix: str = "_road_snap",
+    max_distance_m: float | None = None,
 ) -> dict[str, Any] | None:
     """Project a candidate onto the road plane by moving it along road normal."""
 
     if not bool(getattr(args, "road_snap_candidate_enabled", True)):
         return None
-    if not bool(evaluator.truncation_info.get("is_truncated")):
+    if not allow_non_truncated and not bool(evaluator.truncation_info.get("is_truncated")):
         return None
     if evaluator.t_world_from_cam is None or not evaluator.mesh_meta or not evaluator.vehicle_pose_context:
         return None
@@ -2436,7 +2725,11 @@ def road_snap_candidate(
         # Align the average bottom contact point to the plane.  A capped snap
         # avoids turning bad faraway hypotheses into plausible-looking ones.
         snap_distance = float(np.mean(signed))
-        max_snap = float(getattr(args, "road_snap_candidate_max_distance_m", 0.30))
+        max_snap = (
+            float(max_distance_m)
+            if max_distance_m is not None
+            else float(getattr(args, "road_snap_candidate_max_distance_m", 0.30))
+        )
         if abs(snap_distance) <= 1e-6 or abs(snap_distance) > max_snap:
             return None
         snapped_world = translation_world - snap_distance * normal_world
@@ -2444,7 +2737,7 @@ def road_snap_candidate(
         if not np.all(np.isfinite(snapped_cam)) or float(snapped_cam[2]) <= 0.05:
             return None
         meta = dict(candidate.get("initializer_metadata") or {})
-        meta["source"] = str(meta.get("source", "candidate")) + "_road_snap"
+        meta["source"] = str(meta.get("source", "candidate")) + source_suffix
         meta["road_snap_from_score"] = float(candidate.get("score", 0.0))
         meta["road_snap_distance_m"] = snap_distance
         result = evaluator.evaluate_absolute(snapped_cam, rotation_cam, scale)
@@ -2478,6 +2771,423 @@ def augment_with_road_snap_candidates(
         seen.add(signature)
         augmented.append(snapped)
     return sorted(augmented, key=lambda item: float(item.get("score", -1e9)), reverse=True)
+
+
+def _pose_visual_metric(result: dict[str, Any], key: str, default: float) -> float:
+    value = _finite_float(result.get(key))
+    if value is None:
+        return default
+    return value
+
+
+def _pose_visual_drop_from_prior(result: dict[str, Any], temporal_prior: dict[str, Any] | None) -> float:
+    prior_mask = _prior_quality_score(temporal_prior, "mask_iou")
+    if prior_mask is None:
+        return 0.0
+    mask_iou = _result_quality_score(result, ("visible_mask_iou", "mask_iou"))
+    return max(0.0, float(prior_mask) - mask_iou)
+
+
+def _has_pose_scale_prior(
+    temporal_prior: dict[str, Any] | None,
+    vehicle_pose_context: dict[str, Any] | None,
+) -> bool:
+    if isinstance(temporal_prior, dict) and temporal_prior.get("scale") is not None:
+        return True
+    if not isinstance(vehicle_pose_context, dict):
+        return False
+    track_prior = vehicle_pose_context.get("track_scale_prior")
+    return isinstance(track_prior, dict) and track_prior.get("scale") is not None
+
+
+def should_run_non_truncated_visual_ground_rescue(
+    selected_result: dict[str, Any] | None,
+    args: argparse.Namespace,
+    truncation_info: dict[str, Any],
+    *,
+    temporal_prior: dict[str, Any] | None,
+    vehicle_pose_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return whether the non-truncated visual/ground rescue should run."""
+
+    if not bool(getattr(args, "non_truncated_visual_ground_rescue_enabled", True)):
+        return {"run": False, "reason": "disabled", "reasons": [], "trigger_count": 0}
+    if selected_result is None:
+        return {"run": False, "reason": "missing_selected_result", "reasons": [], "trigger_count": 0}
+    if bool(truncation_info.get("is_truncated")):
+        return {"run": False, "reason": "truncated_uses_existing_path", "reasons": [], "trigger_count": 0}
+    if not isinstance(vehicle_pose_context, dict):
+        return {"run": False, "reason": "missing_vehicle_pose_context", "reasons": [], "trigger_count": 0}
+    road = vehicle_pose_context.get("road_constraint")
+    if not isinstance(road, dict) or not bool(road.get("available")):
+        return {"run": False, "reason": "missing_road_constraint", "reasons": [], "trigger_count": 0}
+    if not _has_pose_scale_prior(temporal_prior, vehicle_pose_context):
+        return {"run": False, "reason": "missing_scale_prior", "reasons": [], "trigger_count": 0}
+
+    reasons: list[str] = []
+    ground_mean = _finite_float(selected_result.get("ground_contact_mean_abs_m"))
+    ground_max = _finite_float(selected_result.get("ground_contact_max_abs_m"))
+    if ground_mean is not None and ground_mean > float(getattr(args, "rescue_ground_mean_trigger_m", 0.20)):
+        reasons.append("ground_mean")
+    if ground_max is not None and ground_max > float(getattr(args, "rescue_ground_max_trigger_m", 0.30)):
+        reasons.append("ground_max")
+
+    visual_gate = _finite_float(selected_result.get("visual_gate_factor"))
+    if visual_gate is not None and visual_gate <= 0.0:
+        reasons.append("visual_gate_failed")
+    if _pose_visual_metric(selected_result, "bbox_iou", 1.0) < float(getattr(args, "rescue_bbox_iou_trigger", 0.82)):
+        reasons.append("bbox_iou")
+    if _pose_visual_metric(selected_result, "bbox_center_error_px", 0.0) > float(
+        getattr(args, "rescue_center_error_trigger_px", 8.0)
+    ):
+        reasons.append("center_error")
+    if _pose_visual_metric(selected_result, "mask_iou", 1.0) < float(getattr(args, "rescue_mask_iou_trigger", 0.72)):
+        reasons.append("mask_iou")
+    if _pose_visual_drop_from_prior(selected_result, temporal_prior) > float(getattr(args, "rescue_mask_drop_trigger", 0.05)):
+        reasons.append("mask_drop")
+
+    trigger_count = len(set(reasons))
+    required = max(1, int(getattr(args, "rescue_min_trigger_count", 2)))
+    return {
+        "run": trigger_count >= required,
+        "reason": "triggered" if trigger_count >= required else "insufficient_triggers",
+        "reasons": sorted(set(reasons)),
+        "trigger_count": trigger_count,
+    }
+
+
+def _target_rescue_scale(
+    temporal_prior: dict[str, Any] | None,
+    vehicle_pose_context: dict[str, Any] | None,
+) -> float | None:
+    if isinstance(vehicle_pose_context, dict):
+        track_prior = vehicle_pose_context.get("track_scale_prior")
+        if isinstance(track_prior, dict):
+            try:
+                value = fast.scale_to_uniform_scalar(np.asarray(track_prior.get("scale"), dtype=np.float64))
+                if math.isfinite(value) and value > 1e-8:
+                    return float(value)
+            except Exception:
+                pass
+    if isinstance(temporal_prior, dict) and temporal_prior.get("scale") is not None:
+        try:
+            value = fast.scale_to_uniform_scalar(np.asarray(temporal_prior.get("scale"), dtype=np.float64))
+            if math.isfinite(value) and value > 1e-8:
+                return float(value)
+        except Exception:
+            return None
+    return None
+
+
+def _visual_seed_rank_score(result: dict[str, Any]) -> float:
+    mask_iou = _pose_visual_metric(result, "visible_mask_iou", _pose_visual_metric(result, "mask_iou", 0.0))
+    bbox_iou = _pose_visual_metric(result, "visible_bbox_iou", _pose_visual_metric(result, "bbox_iou", 0.0))
+    center = _pose_visual_metric(result, "visible_bbox_center_error_px", _pose_visual_metric(result, "bbox_center_error_px", 1e3))
+    return 1.3 * mask_iou + 0.8 * bbox_iou - 0.015 * center
+
+
+def select_visual_ground_rescue_seeds(
+    *,
+    selected_result: dict[str, Any],
+    initial_candidates: list[dict[str, Any]],
+    refined_results: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    source_top_k = max(1, int(getattr(args, "rescue_source_top_k", 8)))
+    max_candidates = max(1, int(getattr(args, "rescue_max_candidates", 4)))
+    current_mask = _pose_visual_metric(selected_result, "mask_iou", 0.0)
+    current_bbox = _pose_visual_metric(selected_result, "bbox_iou", 0.0)
+    current_center = _pose_visual_metric(selected_result, "bbox_center_error_px", 1e3)
+
+    combined = [*refined_results, *initial_candidates[:source_top_k]]
+    ranked = sorted(combined, key=_visual_seed_rank_score, reverse=True)
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for item in ranked:
+        if len(selected) >= max_candidates:
+            break
+        if item is selected_result:
+            continue
+        mask_iou = _pose_visual_metric(item, "mask_iou", 0.0)
+        bbox_iou = _pose_visual_metric(item, "bbox_iou", 0.0)
+        center = _pose_visual_metric(item, "bbox_center_error_px", 1e3)
+        if not (
+            mask_iou >= current_mask + 0.02
+            or bbox_iou >= current_bbox + 0.03
+            or center <= current_center - 2.0
+        ):
+            continue
+        try:
+            signature = fast.pose_signature(item)
+        except Exception:
+            signature = tuple(float(v) for v in np.asarray(item.get("translation_cam", [len(selected), 0, 0]), dtype=np.float64).reshape(-1)[:3])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        selected.append(item)
+    return selected
+
+
+def build_scale_depth_lifted_candidate(
+    seed: dict[str, Any],
+    *,
+    target_scale: float,
+    source: str,
+) -> dict[str, Any] | None:
+    try:
+        seed_scale = fast.scale_to_uniform_scalar(np.asarray(seed["scale"], dtype=np.float64))
+        translation = np.asarray(seed["translation_cam"], dtype=np.float64)
+        rotation = np.asarray(seed["rotation_cam"], dtype=np.float64)
+    except Exception:
+        return None
+    if seed_scale <= 1e-8 or target_scale <= 1e-8 or not np.all(np.isfinite(translation)):
+        return None
+    ratio = float(target_scale / seed_scale)
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        return None
+    lifted_translation = translation * ratio
+    if float(lifted_translation[2]) <= 0.05:
+        return None
+    metadata = dict(seed.get("initializer_metadata") or {})
+    metadata["source"] = source
+    metadata["rescue_seed_source"] = seed.get("initializer_metadata", {}).get("source", "candidate")
+    metadata["rescue_seed_score"] = float(seed.get("score", 0.0) or 0.0)
+    metadata["rescue_seed_scale"] = float(seed_scale)
+    metadata["rescue_target_scale"] = float(target_scale)
+    metadata["rescue_scale_depth_ratio"] = ratio
+    return {
+        "translation_cam": lifted_translation,
+        "rotation_cam": rotation,
+        "scale": fast.make_uniform_scale(target_scale),
+        "initializer_metadata": metadata,
+    }
+
+
+def _evaluate_rescue_spec(
+    candidate_spec: dict[str, Any],
+    evaluator: TemporalPoseEvaluator,
+) -> dict[str, Any] | None:
+    metadata = candidate_spec.get("initializer_metadata", {})
+    evaluator.set_initializer_metadata(metadata)
+    result = evaluator.evaluate_absolute(
+        candidate_spec["translation_cam"],
+        candidate_spec["rotation_cam"],
+        candidate_spec["scale"],
+    )
+    if result.get("projected_bbox") is None:
+        return None
+    result["initializer_metadata"] = metadata
+    return result
+
+
+def _rescue_refine_args(args: argparse.Namespace) -> argparse.Namespace:
+    try:
+        values = vars(args).copy()
+    except TypeError:
+        values = {}
+    rescue_args = argparse.Namespace(**values)
+    scale_delta = max(1e-6, float(getattr(args, "rescue_scale_delta_log_max", 0.08)))
+    rescue_args.scale_min_factor = float(math.exp(-scale_delta))
+    rescue_args.scale_max_factor = float(math.exp(scale_delta))
+    rescue_args.max_translation_delta = min(
+        float(getattr(args, "max_translation_delta", 0.8)),
+        float(getattr(args, "rescue_max_translation_delta", 0.45)),
+    )
+    rescue_args.max_rotation_delta_deg = min(
+        float(getattr(args, "max_rotation_delta_deg", 45.0)),
+        float(getattr(args, "rescue_max_rotation_delta_deg", 18.0)),
+    )
+    return rescue_args
+
+
+def passes_non_truncated_visual_ground_rescue_replacement_gate(
+    rescue_result: dict[str, Any],
+    current_result: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if bool(rescue_result.get("ground_gate_rejected")):
+        reasons.append("ground_gate")
+    if bool(rescue_result.get("upright_gate_rejected")):
+        reasons.append("upright_gate")
+    if bool(rescue_result.get("heading_front_sign_hard_rejected")):
+        reasons.append("front_sign")
+
+    scale_ratio = _finite_float(rescue_result.get("scale_ratio_from_anchor"))
+    if scale_ratio is not None and scale_ratio > float(getattr(args, "rescue_scale_ratio_from_anchor_max", 1.10)):
+        reasons.append("scale_ratio")
+    delta_log = _finite_float(rescue_result.get("track_scale_prior_delta_log"))
+    if delta_log is not None and abs(delta_log) > float(getattr(args, "rescue_scale_delta_log_max", 0.08)):
+        reasons.append("scale_delta")
+
+    ground_mean = _finite_float(rescue_result.get("ground_contact_mean_abs_m"))
+    ground_max = _finite_float(rescue_result.get("ground_contact_max_abs_m"))
+    if ground_mean is None or ground_mean > float(getattr(args, "rescue_replace_ground_mean_max_m", 0.30)):
+        reasons.append("ground_mean")
+    current_ground_max = _finite_float(current_result.get("ground_contact_max_abs_m"))
+    hard_ground_max = float(getattr(args, "rescue_replace_ground_max_max_m", 0.50))
+    if current_ground_max is not None:
+        hard_ground_max = min(hard_ground_max, current_ground_max + 0.10)
+    if ground_max is None or ground_max > hard_ground_max:
+        reasons.append("ground_max")
+
+    temporal_loss = _finite_float(rescue_result.get("temporal_loss"))
+    current_temporal_loss = _finite_float(current_result.get("temporal_loss"))
+    yaw_jump = _finite_float(rescue_result.get("yaw_jump_from_anchor_deg"))
+    if yaw_jump is not None and yaw_jump > float(getattr(args, "rescue_replace_yaw_jump_max_deg", 15.0)):
+        reasons.append("yaw_jump")
+
+    mask_gain = _pose_visual_metric(rescue_result, "mask_iou", 0.0) - _pose_visual_metric(current_result, "mask_iou", 0.0)
+    bbox_gain = _pose_visual_metric(rescue_result, "bbox_iou", 0.0) - _pose_visual_metric(current_result, "bbox_iou", 0.0)
+    center_gain = _pose_visual_metric(current_result, "bbox_center_error_px", 1e3) - _pose_visual_metric(
+        rescue_result,
+        "bbox_center_error_px",
+        1e3,
+    )
+    visual_gain = (
+        mask_gain >= float(getattr(args, "rescue_replace_mask_gain_min", 0.04))
+        or bbox_gain >= float(getattr(args, "rescue_replace_bbox_gain_min", 0.06))
+        or center_gain >= float(getattr(args, "rescue_replace_center_gain_min_px", 3.0))
+    )
+    strong_visual_gain = (
+        mask_gain >= float(getattr(args, "rescue_replace_strong_visual_mask_gain", 0.08))
+        and bbox_gain >= float(getattr(args, "rescue_replace_strong_visual_bbox_gain", 0.08))
+        and center_gain >= float(getattr(args, "rescue_replace_strong_visual_center_gain_px", 6.0))
+    )
+    if temporal_loss is not None and current_temporal_loss is not None:
+        temporal_margin = float(getattr(args, "rescue_replace_temporal_loss_margin", 0.25))
+        temporal_hard_max = float(getattr(args, "rescue_replace_temporal_loss_hard_max", 80.0))
+        if temporal_loss > current_temporal_loss + temporal_margin:
+            if not (strong_visual_gain and temporal_loss <= temporal_hard_max):
+                reasons.append("temporal_loss")
+    if not visual_gain:
+        reasons.append("visual_gain")
+    if mask_gain < -float(getattr(args, "rescue_replace_mask_drop_max", 0.01)):
+        reasons.append("mask_drop")
+    if bbox_gain < -float(getattr(args, "rescue_replace_bbox_drop_max", 0.02)):
+        reasons.append("bbox_drop")
+
+    return {
+        "accepted": not reasons,
+        "reasons": sorted(set(reasons)),
+        "visual_gain": visual_gain,
+        "strong_visual_gain": strong_visual_gain,
+        "mask_gain": float(mask_gain),
+        "bbox_gain": float(bbox_gain),
+        "center_gain_px": float(center_gain),
+        "ground_max_limit_m": float(hard_ground_max),
+    }
+
+
+def try_non_truncated_visual_ground_rescue(
+    *,
+    selected_result: dict[str, Any] | None,
+    initial_candidates: list[dict[str, Any]],
+    refined_results: list[dict[str, Any]],
+    proxy_evaluator: TemporalPoseEvaluator,
+    full_evaluator: TemporalPoseEvaluator,
+    args: argparse.Namespace,
+    truncation_info: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any]]:
+    """Try a narrow rescue for non-truncated frames with weak visual/ground fit."""
+
+    decision = should_run_non_truncated_visual_ground_rescue(
+        selected_result,
+        args,
+        truncation_info,
+        temporal_prior=full_evaluator.temporal_prior,
+        vehicle_pose_context=full_evaluator.vehicle_pose_context,
+    )
+    if not decision.get("run"):
+        return None, [], decision
+    assert selected_result is not None
+
+    target_scale = _target_rescue_scale(full_evaluator.temporal_prior, full_evaluator.vehicle_pose_context)
+    if target_scale is None:
+        decision.update({"run": False, "reason": "missing_target_scale"})
+        return None, [], decision
+
+    seeds = select_visual_ground_rescue_seeds(
+        selected_result=selected_result,
+        initial_candidates=initial_candidates,
+        refined_results=refined_results,
+        args=args,
+    )
+    if not seeds:
+        decision.update({"run": False, "reason": "no_visual_seed"})
+        return None, [], decision
+
+    best_result: dict[str, Any] | None = None
+    best_history: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
+    max_snap = float(getattr(args, "rescue_road_snap_max_distance_m", 2.5))
+    rescue_args = _rescue_refine_args(args)
+
+    for index, seed in enumerate(seeds, start=1):
+        lifted = build_scale_depth_lifted_candidate(
+            seed,
+            target_scale=target_scale,
+            source=f"non_truncated_visual_ground_rescue_seed_{index}",
+        )
+        if lifted is None:
+            attempts.append({"seed_index": index, "status": "invalid_lift"})
+            continue
+        lifted_result = _evaluate_rescue_spec(lifted, proxy_evaluator)
+        if lifted_result is None:
+            attempts.append({"seed_index": index, "status": "lift_not_projected"})
+            continue
+        snapped = road_snap_candidate(
+            lifted_result,
+            proxy_evaluator,
+            args,
+            allow_non_truncated=True,
+            source_suffix="_non_truncated_rescue_road_snap",
+            max_distance_m=max_snap,
+        )
+        coarse = snapped if snapped is not None else lifted_result
+        refined, history = refine_candidate_stages(coarse, proxy_evaluator, full_evaluator, rescue_args)
+        meta = dict(coarse.get("initializer_metadata") or lifted.get("initializer_metadata") or {})
+        meta["source"] = "non_truncated_visual_ground_rescue"
+        meta["rescue_seed_index"] = index
+        refined["initializer_metadata"] = meta
+        gate = passes_non_truncated_visual_ground_rescue_replacement_gate(refined, selected_result, args)
+        refined["non_truncated_visual_ground_rescue_gate"] = gate
+        attempts.append(
+            {
+                "seed_index": index,
+                "status": "accepted" if gate["accepted"] else "rejected",
+                "gate": gate,
+                "mask_iou": refined.get("mask_iou"),
+                "bbox_iou": refined.get("bbox_iou"),
+                "bbox_center_error_px": refined.get("bbox_center_error_px"),
+                "ground_contact_mean_abs_m": refined.get("ground_contact_mean_abs_m"),
+                "ground_contact_max_abs_m": refined.get("ground_contact_max_abs_m"),
+                "score": refined.get("score"),
+            }
+        )
+        if not gate["accepted"]:
+            continue
+        if best_result is None:
+            best_result = refined
+            best_history = history
+            continue
+        best_gate = best_result.get("non_truncated_visual_ground_rescue_gate", {})
+        if (
+            float(gate.get("mask_gain", 0.0)) + float(gate.get("bbox_gain", 0.0)) + 0.01 * float(gate.get("center_gain_px", 0.0))
+            > float(best_gate.get("mask_gain", 0.0)) + float(best_gate.get("bbox_gain", 0.0)) + 0.01 * float(best_gate.get("center_gain_px", 0.0))
+        ):
+            best_result = refined
+            best_history = history
+
+    decision["attempts"] = attempts
+    decision["seed_count"] = len(seeds)
+    if best_result is None:
+        decision["reason"] = "no_replacement_passed_gate"
+        return None, [], decision
+
+    best_result["final_selection_mode"] = "non_truncated_visual_ground_rescue"
+    best_result["non_truncated_visual_ground_rescue"] = decision
+    return best_result, best_history, decision
 
 
 def candidate_forward_sign(result: dict[str, Any], default_sign: float) -> float:
@@ -2640,7 +3350,38 @@ def candidate_satisfies_ground_constraint(result: dict[str, Any], args: argparse
         return False
     mean_limit = float(getattr(args, "final_ground_select_mean_max_m", 0.055))
     max_limit = float(getattr(args, "final_ground_select_max_max_m", 0.12))
-    return float(mean_raw) <= mean_limit and float(max_raw) <= max_limit
+    mean_value = float(mean_raw)
+    max_value = float(max_raw)
+    if mean_value <= mean_limit and max_value <= max_limit:
+        result["final_ground_relaxed_selected"] = False
+        return True
+
+    relaxed_mean_limit = float(getattr(args, "final_ground_select_relaxed_mean_max_m", 0.075))
+    relaxed_max_limit = float(getattr(args, "final_ground_select_relaxed_max_max_m", 0.16))
+    if mean_value > relaxed_mean_limit or max_value > relaxed_max_limit:
+        return False
+
+    temporal_score = _finite_float(result.get("temporal_score"))
+    visible_mask = _finite_float(result.get("visible_mask_iou"))
+    if visible_mask is None:
+        visible_mask = _finite_float(result.get("mask_iou"))
+    contour_mean = _finite_float(result.get("visible_contour_mean_distance_px"))
+    metadata = result.get("initializer_metadata") if isinstance(result.get("initializer_metadata"), dict) else {}
+    temporal_seed = str(metadata.get("source") or "") == "temporal_prior"
+    if (
+        temporal_seed
+        and temporal_score is not None
+        and temporal_score >= float(getattr(args, "final_ground_relaxed_temporal_score_min", 0.70))
+        and visible_mask is not None
+        and visible_mask >= float(getattr(args, "final_ground_relaxed_visible_mask_iou_min", 0.92))
+        and (
+            contour_mean is None
+            or contour_mean <= float(getattr(args, "final_ground_relaxed_visible_contour_mean_px_max", 2.5))
+        )
+    ):
+        result["final_ground_relaxed_selected"] = True
+        return True
+    return False
 
 
 def candidate_satisfies_severe_truncation_gate(result: dict[str, Any], args: argparse.Namespace) -> bool:
@@ -2741,6 +3482,53 @@ def candidate_satisfies_severe_truncation_fallback(result: dict[str, Any], args:
     return True
 
 
+def candidate_satisfies_truncated_anchor_gate(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    low_observability: bool,
+) -> bool:
+    reasons: list[str] = []
+    if not bool(getattr(args, "truncated_anchor_gate_enabled", True)):
+        result["truncated_anchor_gate_passed"] = True
+        result["truncated_anchor_gate_reasons"] = []
+        return True
+
+    yaw_jump = _finite_float(result.get("yaw_jump_from_anchor_deg"))
+    if yaw_jump is None:
+        yaw_jump = _finite_float(result.get("delta_rotation_deg"))
+    scale_ratio = _finite_float(result.get("scale_ratio_from_anchor"))
+    temporal_loss = _finite_float(result.get("temporal_loss"))
+
+    yaw_limit = float(getattr(args, "truncated_anchor_gate_yaw_jump_deg", 12.0))
+    scale_limit = float(getattr(args, "truncated_anchor_gate_scale_ratio", 1.08))
+    loss_limit = float(getattr(args, "truncated_anchor_gate_temporal_loss_max", 2.0))
+    if low_observability:
+        yaw_limit = float(getattr(args, "low_observability_anchor_gate_yaw_jump_deg", 8.0))
+        scale_limit = float(getattr(args, "low_observability_anchor_gate_scale_ratio", 1.04))
+        loss_limit = float(getattr(args, "low_observability_anchor_gate_temporal_loss_max", 1.0))
+
+    source = ""
+    metadata = result.get("initializer_metadata")
+    if isinstance(metadata, dict):
+        source = str(metadata.get("source") or "")
+    is_temporal_seed = source == "temporal_prior"
+    if yaw_jump is not None and yaw_jump > yaw_limit:
+        reasons.append("yaw_jump")
+    if scale_ratio is not None and scale_ratio > scale_limit:
+        reasons.append("scale_jump")
+    if temporal_loss is not None and temporal_loss > loss_limit and not is_temporal_seed:
+        reasons.append("temporal_loss")
+
+    passed = not reasons
+    result["truncated_anchor_gate_passed"] = passed
+    result["truncated_anchor_gate_reasons"] = reasons
+    result["truncated_anchor_gate_yaw_limit_deg"] = yaw_limit
+    result["truncated_anchor_gate_scale_ratio_limit"] = scale_limit
+    result["truncated_anchor_gate_temporal_loss_limit"] = loss_limit
+    return passed
+
+
 def front_sign_selection_penalty(result: dict[str, Any]) -> float:
     if not bool(result.get("heading_front_sign_enabled")):
         return 0.0
@@ -2759,9 +3547,12 @@ def front_sign_selection_penalty(result: dict[str, Any]) -> float:
         return 0.0
     if bool(result.get("heading_front_sign_hard_rejected")):
         return 10.0
+    candidate_sign = _finite_float(result.get("heading_candidate_forward_sign"))
+    semantic_sign = _finite_float(result.get("heading_semantic_front_sign"))
+    sign_flip_penalty = 1.0 if candidate_sign is not None and semantic_sign is not None and candidate_sign * semantic_sign < 0.0 else 0.0
     wrong_sign = max(0.0, angle - 90.0) / 90.0
     soft_angle = min(angle, 90.0) / 180.0
-    return confidence * (0.5 * wrong_sign + 0.05 * soft_angle)
+    return confidence * (sign_flip_penalty + 0.5 * wrong_sign + 0.05 * soft_angle)
 
 
 def front_sign_rank_score(result: dict[str, Any]) -> float:
@@ -2805,12 +3596,23 @@ def choose_best_refined_result(
             ]
             if not fallback_pool:
                 return None
+            anchor_pool = [
+                item
+                for item in fallback_pool
+                if candidate_satisfies_truncated_anchor_gate(item, args, low_observability=severe)
+            ]
+            if anchor_pool:
+                fallback_pool = anchor_pool
+            else:
+                return None
             fallback = max(
                 fallback_pool,
                 key=lambda item: (
                     float(item.get("visible_mask_iou", item.get("mask_iou", 0.0)) or 0.0),
                     -float(item.get("visible_contour_mean_distance_px", 1e9) or 1e9),
                     float(item.get("visible_contour_score", 0.0) or 0.0),
+                    float(item.get("temporal_score", 0.0) or 0.0),
+                    -float(item.get("temporal_loss", 0.0) or 0.0),
                     -float(item.get("yaw_jump_from_anchor_deg", 180.0) or 180.0),
                 ),
             )
@@ -2818,6 +3620,19 @@ def choose_best_refined_result(
             fallback["final_ground_constrained_selected"] = True
             fallback["low_confidence"] = True
             return fallback
+
+    low_observability = bool(truncation_info.get("low_observability")) or str(
+        truncation_info.get("truncation_severity", "")
+    ) in {"severe", "critical"}
+    anchor_gated = [
+        item
+        for item in feasible
+        if candidate_satisfies_truncated_anchor_gate(item, args, low_observability=low_observability)
+    ]
+    if anchor_gated:
+        feasible = anchor_gated
+    elif low_observability:
+        return None
 
     if not bool(getattr(args, "truncated_final_visual_selection_enabled", True)):
         selected = max(feasible, key=lambda item: float(item.get("score", -1e9)))
@@ -2845,6 +3660,13 @@ def choose_best_refined_result(
     ground_mean_weight = float(getattr(args, "truncated_final_visual_ground_mean_weight", 0.25))
     ground_max_weight = float(getattr(args, "truncated_final_visual_ground_max_weight", 0.10))
     score_weight = float(getattr(args, "truncated_final_visual_score_weight", 0.03))
+    temporal_weight = float(getattr(args, "truncated_final_visual_temporal_weight", 0.18))
+    temporal_loss_weight = float(getattr(args, "truncated_final_visual_temporal_loss_weight", 0.02))
+    heading_weight = float(getattr(args, "truncated_final_visual_heading_weight", 0.02))
+    temporal_seed_bonus = float(getattr(args, "truncated_final_visual_prefer_temporal_seed_bonus", 0.04))
+    scale_jump_weight = float(getattr(args, "truncated_final_visual_scale_jump_weight", 0.20))
+    anchor_yaw_weight = float(getattr(args, "truncated_final_visual_anchor_yaw_weight", 0.01))
+    front_flip_penalty = float(getattr(args, "truncated_final_visual_front_flip_penalty", 0.80))
 
     for item in feasible:
         visible_mask = float(item.get("visible_mask_iou", item.get("mask_iou", 0.0)) or 0.0)
@@ -2854,15 +3676,35 @@ def choose_best_refined_result(
         ground_mean = float(item.get("ground_contact_mean_abs_m", 1.0) or 1.0)
         ground_max = float(item.get("ground_contact_max_abs_m", 1.0) or 1.0)
         score = float(item.get("score", 0.0) or 0.0)
+        temporal_score = float(item.get("temporal_score", 0.0) or 0.0)
+        temporal_loss = min(60.0, float(item.get("temporal_loss", 0.0) or 0.0))
+        heading_error = min(180.0, float(item.get("heading_prior_angle_error_deg", 0.0) or 0.0))
+        scale_ratio = float(item.get("scale_ratio_from_anchor", 1.0) or 1.0)
+        scale_excess = max(0.0, scale_ratio - 1.0)
+        yaw_jump = float(item.get("yaw_jump_from_anchor_deg", item.get("delta_rotation_deg", 0.0)) or 0.0)
+        candidate_sign = _finite_float(item.get("heading_candidate_forward_sign"))
+        semantic_sign = _finite_float(item.get("heading_semantic_front_sign"))
+        front_flip = bool(candidate_sign is not None and semantic_sign is not None and candidate_sign * semantic_sign < 0.0)
+        metadata = item.get("initializer_metadata") if isinstance(item.get("initializer_metadata"), dict) else {}
+        source = str(metadata.get("source") or "")
+        source_bonus = temporal_seed_bonus if source == "temporal_prior" else 0.0
         item["final_ground_constrained_selected"] = True
+        item["final_front_sign_flip_penalty"] = front_flip_penalty if front_flip else 0.0
         item["final_ground_constrained_rank_score"] = (
             mask_weight * visible_mask
             + contour_weight * contour
             + bbox_weight * bbox
             + quality_weight * quality_gate
             + score_weight * score
+            + temporal_weight * temporal_score
+            + source_bonus
             - ground_mean_weight * ground_mean
             - ground_max_weight * ground_max
+            - temporal_loss_weight * temporal_loss
+            - heading_weight * (heading_error / 180.0)
+            - scale_jump_weight * scale_excess
+            - anchor_yaw_weight * (yaw_jump / 10.0)
+            - (front_flip_penalty if front_flip else 0.0)
         )
         item["final_selection_mode"] = "ground_feasible_visual_rank"
         item["final_visual_selection_weights"] = {
@@ -2873,6 +3715,13 @@ def choose_best_refined_result(
             "ground_mean": ground_mean_weight,
             "ground_max": ground_max_weight,
             "score": score_weight,
+            "temporal": temporal_weight,
+            "temporal_loss": temporal_loss_weight,
+            "heading": heading_weight,
+            "temporal_seed_bonus": temporal_seed_bonus,
+            "scale_jump": scale_jump_weight,
+            "anchor_yaw": anchor_yaw_weight,
+            "front_flip": front_flip_penalty,
             "min_bbox_iou": min_bbox,
             "min_quality_gate": min_quality_gate,
         }
@@ -2963,6 +3812,25 @@ def refined_pose_candidate_summary(
         "heading_front_sign_hard_rejected",
         "heading_front_sign_penalty",
         "heading_front_angle_penalty",
+        "temporal_anchor_visual_gate_passed",
+        "temporal_anchor_visual_gate_reason",
+        "temporal_anchor_visual_mask_drop",
+        "temporal_anchor_visual_bbox_drop",
+        "temporal_anchor_visual_yaw_jump_deg",
+        "temporal_anchor_visual_prior_mask_iou",
+        "temporal_anchor_visual_prior_bbox_iou",
+        "temporal_anchor_visual_penalty",
+        "trusted_anchor_gate_passed",
+        "trusted_anchor_gate_reason",
+        "trusted_anchor_mask_drop",
+        "trusted_anchor_bbox_drop",
+        "trusted_anchor_yaw_jump_deg",
+        "trusted_anchor_scale_ratio",
+        "trusted_anchor_penalty",
+        "truncated_anchor_gate_passed",
+        "truncated_anchor_gate_reasons",
+        "scale_ratio_from_anchor",
+        "yaw_jump_from_anchor_deg",
         "final_selection_mode",
         "final_ground_constrained_selected",
         "final_ground_constrained_rank_score",
@@ -3101,6 +3969,12 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         t_world_from_cam=t_world_from_cam,
         args=args,
     )
+    trusted_anchor_payload = vehicle_pose_context.get("trusted_temporal_anchor_pose")
+    trusted_anchor_pose = load_prior_pose_payload(trusted_anchor_payload, t_world_from_cam)
+    if trusted_anchor_pose is not None:
+        vehicle_pose_context["trusted_temporal_anchor_pose"] = trusted_anchor_pose
+    else:
+        vehicle_pose_context.pop("trusted_temporal_anchor_pose", None)
     vehicle_pose_context["mesh_tail_light_prior"] = mesh_tail_light_prior
     mesh_meta = fast.apply_mesh_axis_prior(mesh_meta, vehicle_pose_context.get("mesh_axis_prior"))
     mesh_meta["tail_light_prior"] = mesh_tail_light_prior
@@ -3469,6 +4343,22 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "used_temporal_seed": temporal_seed is not None,
         "best_started_from_temporal_seed": best_result.get("initializer_metadata", {}).get("source") == "temporal_prior",
     }
+    trusted_anchor = vehicle_pose_context.get("trusted_temporal_anchor_pose")
+    if isinstance(trusted_anchor, dict):
+        temporal_report["trusted_anchor"] = {
+            "available": True,
+            "frame_id": trusted_anchor.get("frame_idx") or trusted_anchor.get("frame_id"),
+            "source": trusted_anchor.get("pose_source") or trusted_anchor.get("source"),
+            "gate_passed": best_result.get("trusted_anchor_gate_passed"),
+            "gate_reason": best_result.get("trusted_anchor_gate_reason"),
+            "mask_drop": best_result.get("trusted_anchor_mask_drop"),
+            "bbox_drop": best_result.get("trusted_anchor_bbox_drop"),
+            "yaw_jump_deg": best_result.get("trusted_anchor_yaw_jump_deg"),
+            "scale_ratio": best_result.get("trusted_anchor_scale_ratio"),
+            "penalty": best_result.get("trusted_anchor_penalty"),
+        }
+    else:
+        temporal_report["trusted_anchor"] = {"available": False}
     partial_report = {
         "enabled": bool(args.partial_visibility_enabled),
         "is_truncated": bool(truncation_info.get("is_truncated")),
@@ -3645,6 +4535,20 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "truncated_visual_quality_penalty": best_result.get("truncated_visual_quality_penalty"),
             "severe_truncation_gate_passed": best_result.get("severe_truncation_gate_passed"),
             "severe_truncation_gate_reasons": best_result.get("severe_truncation_gate_reasons"),
+            "trusted_anchor_gate_passed": best_result.get("trusted_anchor_gate_passed"),
+            "trusted_anchor_gate_reason": best_result.get("trusted_anchor_gate_reason"),
+            "trusted_anchor_mask_drop": best_result.get("trusted_anchor_mask_drop"),
+            "trusted_anchor_bbox_drop": best_result.get("trusted_anchor_bbox_drop"),
+            "trusted_anchor_yaw_jump_deg": best_result.get("trusted_anchor_yaw_jump_deg"),
+            "trusted_anchor_scale_ratio": best_result.get("trusted_anchor_scale_ratio"),
+            "trusted_anchor_penalty": best_result.get("trusted_anchor_penalty"),
+            "truncated_anchor_gate_passed": best_result.get("truncated_anchor_gate_passed"),
+            "truncated_anchor_gate_reasons": best_result.get("truncated_anchor_gate_reasons"),
+            "truncated_anchor_gate_yaw_limit_deg": best_result.get("truncated_anchor_gate_yaw_limit_deg"),
+            "truncated_anchor_gate_scale_ratio_limit": best_result.get("truncated_anchor_gate_scale_ratio_limit"),
+            "truncated_anchor_gate_temporal_loss_limit": best_result.get("truncated_anchor_gate_temporal_loss_limit"),
+            "scale_ratio_from_anchor": best_result.get("scale_ratio_from_anchor"),
+            "yaw_jump_from_anchor_deg": best_result.get("yaw_jump_from_anchor_deg"),
             "visible_projected_bbox": best_result.get("visible_projected_bbox"),
             "visible_target_bbox": best_result.get("visible_target_bbox"),
             "visible_bbox_source": best_result.get("visible_bbox_source"),
@@ -3748,6 +4652,27 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--temporal_max_allowed_jump_deg", type=float, default=60.0)
     parser.add_argument("--temporal_max_allowed_scale_ratio", type=float, default=1.6)
     parser.add_argument("--temporal_search_output_suffixes", default="_temporal_fast_quick,_fast_quick,_fast,_baseline")
+    parser.add_argument("--temporal_anchor_visual_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--temporal_anchor_visual_gate_prior_mask_iou_min", type=float, default=0.88)
+    parser.add_argument("--temporal_anchor_visual_gate_prior_bbox_iou_min", type=float, default=0.85)
+    parser.add_argument("--temporal_anchor_visual_gate_mask_drop_max", type=float, default=0.08)
+    parser.add_argument("--temporal_anchor_visual_gate_bbox_drop_max", type=float, default=0.10)
+    parser.add_argument("--temporal_anchor_visual_gate_yaw_jump_deg", type=float, default=8.0)
+    parser.add_argument("--temporal_anchor_visual_gate_min_mask_iou", type=float, default=0.86)
+    parser.add_argument("--temporal_anchor_visual_gate_min_bbox_iou", type=float, default=0.84)
+    parser.add_argument("--temporal_anchor_visual_gate_temporal_loss_max", type=float, default=0.50)
+    parser.add_argument("--temporal_anchor_visual_gate_penalty", type=float, default=1_000_000.0)
+    parser.add_argument("--trusted_anchor_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trusted_anchor_prior_mask_iou_min", type=float, default=0.88)
+    parser.add_argument("--trusted_anchor_prior_bbox_iou_min", type=float, default=0.85)
+    parser.add_argument("--trusted_anchor_visual_drop_max", type=float, default=0.18)
+    parser.add_argument("--trusted_anchor_mask_drop_max", type=float, default=0.08)
+    parser.add_argument("--trusted_anchor_bbox_drop_max", type=float, default=0.10)
+    parser.add_argument("--trusted_anchor_yaw_jump_deg", type=float, default=6.0)
+    parser.add_argument("--trusted_anchor_scale_ratio", type=float, default=1.04)
+    parser.add_argument("--trusted_anchor_min_mask_iou", type=float, default=0.86)
+    parser.add_argument("--trusted_anchor_min_bbox_iou", type=float, default=0.82)
+    parser.add_argument("--trusted_anchor_penalty", type=float, default=18.0)
     parser.add_argument("--track_scale_prior_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track_scale_prior_weight", type=float, default=0.18)
     parser.add_argument("--track_scale_prior_sigma", type=float, default=0.10)
@@ -3823,6 +4748,34 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--road_snap_candidate_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--road_snap_candidate_source_top_k", type=int, default=16)
     parser.add_argument("--road_snap_candidate_max_distance_m", type=float, default=0.30)
+    parser.add_argument("--non_truncated_visual_ground_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rescue_min_trigger_count", type=int, default=2)
+    parser.add_argument("--rescue_ground_mean_trigger_m", type=float, default=0.20)
+    parser.add_argument("--rescue_ground_max_trigger_m", type=float, default=0.30)
+    parser.add_argument("--rescue_bbox_iou_trigger", type=float, default=0.82)
+    parser.add_argument("--rescue_center_error_trigger_px", type=float, default=8.0)
+    parser.add_argument("--rescue_mask_iou_trigger", type=float, default=0.72)
+    parser.add_argument("--rescue_mask_drop_trigger", type=float, default=0.05)
+    parser.add_argument("--rescue_source_top_k", type=int, default=8)
+    parser.add_argument("--rescue_max_candidates", type=int, default=4)
+    parser.add_argument("--rescue_road_snap_max_distance_m", type=float, default=2.5)
+    parser.add_argument("--rescue_scale_delta_log_max", type=float, default=0.08)
+    parser.add_argument("--rescue_scale_ratio_from_anchor_max", type=float, default=1.10)
+    parser.add_argument("--rescue_max_translation_delta", type=float, default=0.45)
+    parser.add_argument("--rescue_max_rotation_delta_deg", type=float, default=18.0)
+    parser.add_argument("--rescue_replace_mask_gain_min", type=float, default=0.04)
+    parser.add_argument("--rescue_replace_bbox_gain_min", type=float, default=0.06)
+    parser.add_argument("--rescue_replace_center_gain_min_px", type=float, default=3.0)
+    parser.add_argument("--rescue_replace_temporal_loss_margin", type=float, default=0.25)
+    parser.add_argument("--rescue_replace_temporal_loss_hard_max", type=float, default=80.0)
+    parser.add_argument("--rescue_replace_strong_visual_mask_gain", type=float, default=0.08)
+    parser.add_argument("--rescue_replace_strong_visual_bbox_gain", type=float, default=0.08)
+    parser.add_argument("--rescue_replace_strong_visual_center_gain_px", type=float, default=6.0)
+    parser.add_argument("--rescue_replace_ground_mean_max_m", type=float, default=0.30)
+    parser.add_argument("--rescue_replace_ground_max_max_m", type=float, default=0.50)
+    parser.add_argument("--rescue_replace_mask_drop_max", type=float, default=0.01)
+    parser.add_argument("--rescue_replace_bbox_drop_max", type=float, default=0.02)
+    parser.add_argument("--rescue_replace_yaw_jump_max_deg", type=float, default=15.0)
     parser.add_argument("--pareto_refine_selection_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pareto_refine_branch_quota", type=int, default=2)
     parser.add_argument("--truncated_candidate_ground_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -3843,6 +4796,19 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--truncated_final_visual_ground_mean_weight", type=float, default=0.25)
     parser.add_argument("--truncated_final_visual_ground_max_weight", type=float, default=0.10)
     parser.add_argument("--truncated_final_visual_score_weight", type=float, default=0.03)
+    parser.add_argument("--truncated_final_visual_temporal_weight", type=float, default=0.18)
+    parser.add_argument("--truncated_final_visual_temporal_loss_weight", type=float, default=0.02)
+    parser.add_argument("--truncated_final_visual_heading_weight", type=float, default=0.02)
+    parser.add_argument("--truncated_final_visual_prefer_temporal_seed_bonus", type=float, default=0.04)
+    parser.add_argument("--truncated_final_visual_scale_jump_weight", type=float, default=0.20)
+    parser.add_argument("--truncated_final_visual_anchor_yaw_weight", type=float, default=0.01)
+    parser.add_argument("--truncated_anchor_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--truncated_anchor_gate_yaw_jump_deg", type=float, default=12.0)
+    parser.add_argument("--truncated_anchor_gate_scale_ratio", type=float, default=1.08)
+    parser.add_argument("--truncated_anchor_gate_temporal_loss_max", type=float, default=2.0)
+    parser.add_argument("--low_observability_anchor_gate_yaw_jump_deg", type=float, default=8.0)
+    parser.add_argument("--low_observability_anchor_gate_scale_ratio", type=float, default=1.04)
+    parser.add_argument("--low_observability_anchor_gate_temporal_loss_max", type=float, default=1.0)
     parser.add_argument("--visual_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--visual_gate_mask_iou_min", type=float, default=0.65)
     parser.add_argument("--visual_gate_bbox_iou_min", type=float, default=0.75)

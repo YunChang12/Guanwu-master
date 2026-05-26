@@ -14,10 +14,15 @@ from process.pose_optimizer.strategies.temporal_fast import (
     compute_visible_bbox_score,
     compute_truncated_visual_quality_gate,
     compute_road_and_heading_score,
+    compute_temporal_anchor_visual_gate,
+    compute_trusted_anchor_gate,
     choose_best_refined_result,
     detect_truncation,
+    load_prior_pose_payload,
+    passes_non_truncated_visual_ground_rescue_replacement_gate,
     should_skip_disk_temporal_prior,
     select_pareto_refine_candidates,
+    should_run_non_truncated_visual_ground_rescue,
 )
 from process.pose_optimizer.strategies.fast import build_vehicle_pose_context
 from process.pose_optimizer.strategies.fast import find_depth_map_for_task
@@ -120,19 +125,306 @@ def test_pose_temporal_anchor_excludes_low_observability_severe_truncation() -> 
             "visible_contour_mean_distance_px": 8.5,
         }
     )
-    light = _pose_record(frame_id=4, scale=1.05, mask_iou=0.86, bbox_iou=0.86)
+    light = _pose_record(frame_id=4, scale=1.05, mask_iou=0.90, bbox_iou=0.89)
     light["metrics"].update(
         {
             "truncation_severity": "light",
             "low_observability": False,
-            "visible_mask_iou": 0.84,
-            "visible_bbox_iou": 0.88,
+            "visible_mask_iou": 0.90,
+            "visible_bbox_iou": 0.89,
             "visible_contour_mean_distance_px": 4.0,
         }
     )
 
     assert ProjectExecutor._pose_record_updates_temporal_anchor(severe) is False
     assert ProjectExecutor._pose_record_updates_temporal_anchor(light) is True
+
+
+def test_anchor_temporal_gate_rejects_visual_degradation_yaw_jump() -> None:
+    anchor = _pose_record(frame_id=10, yaw_deg=-2.4, mask_iou=0.926, bbox_iou=0.923)
+    degraded = _pose_record(frame_id=11, yaw_deg=8.4, mask_iou=0.809, bbox_iou=0.776)
+    degraded["metrics"].update(
+        {
+            "heading_prior_angle_error_deg": 13.8,
+            "heading_front_sign_enabled": True,
+            "heading_front_sign_confidence": 1.0,
+        }
+    )
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(degraded, anchor)
+
+    assert decision["accepted"] is False
+    assert decision["reason"].startswith("anchor_visual_degradation_yaw_jump")
+    assert decision["yaw_jump_deg"] > 10.0
+    assert decision["mask_drop"] > 0.10
+    assert decision["bbox_drop"] > 0.14
+
+
+def test_anchor_temporal_gate_rejects_low_observability_heading_and_scale_jump() -> None:
+    anchor = _pose_record(frame_id=15, yaw_deg=4.0, scale=1.0, mask_iou=0.90, bbox_iou=0.88)
+    bad = _pose_record(frame_id=16, yaw_deg=88.0, scale=1.2, mask_iou=0.84, bbox_iou=0.95)
+    bad["metrics"].update(
+        {
+            "truncation_severity": "moderate",
+            "low_observability": True,
+            "visible_target_fraction": 0.22,
+            "visible_mask_iou": 0.82,
+            "visible_bbox_iou": 0.88,
+            "heading_prior_angle_error_deg": 108.0,
+        }
+    )
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(bad, anchor)
+
+    assert decision["accepted"] is False
+    assert decision["reason"].startswith("anchor_low_observability")
+
+
+def test_anchor_temporal_gate_accepts_stable_visual_pose() -> None:
+    anchor = _pose_record(frame_id=10, yaw_deg=-2.4, scale=1.0, mask_iou=0.926, bbox_iou=0.923)
+    stable = _pose_record(frame_id=11, yaw_deg=-1.0, scale=1.01, mask_iou=0.90, bbox_iou=0.90)
+    stable["metrics"].update({"heading_prior_angle_error_deg": 28.0})
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(stable, anchor)
+
+    assert decision["accepted"] is True
+    assert decision["reason"] == "accepted"
+
+
+def test_anchor_temporal_gate_filter_keeps_prior_track_and_skips_remaining_frames() -> None:
+    frame_records: dict[str, dict] = {}
+    selected = [
+        _pose_record(frame_id=10, yaw_deg=-2.4, mask_iou=0.926, bbox_iou=0.923),
+        _pose_record(frame_id=11, yaw_deg=8.4, mask_iou=0.809, bbox_iou=0.776),
+        _pose_record(frame_id=12, yaw_deg=-3.3, mask_iou=0.906, bbox_iou=0.916),
+    ]
+
+    kept, summary = ProjectExecutor._apply_anchor_temporal_gate_to_selected_records(
+        selected,
+        frame_ids=[10, 11, 12],
+        frame_records=frame_records,
+    )
+
+    assert [record["frame_id"] for record in kept] == [10]
+    assert summary["failed_frame_id"] == 11
+    assert summary["accepted_frame_count_before_failure"] == 1
+    assert frame_records["frame_000011"]["status"] == "rejected"
+    assert frame_records["frame_000011"]["reason"].startswith("anchor_visual_degradation_yaw_jump")
+    assert frame_records["frame_000012"]["status"] == "skipped"
+    assert frame_records["frame_000012"]["reason"] == "skipped_after_anchor_temporal_gate_failure"
+
+
+def test_stable_temporal_anchor_allows_consecutive_handoffs() -> None:
+    first_anchor = _pose_record(frame_id=12, yaw_deg=-177.0, scale=2.67, mask_iou=0.923, bbox_iou=0.911)
+    first_anchor["metrics"].update({"ground_contact_max_abs_m": 0.11})
+
+    stable_followup = _pose_record(frame_id=13, yaw_deg=-173.8, scale=2.69, mask_iou=0.832, bbox_iou=0.792)
+    stable_followup["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.832,
+            "visible_bbox_iou": 0.792,
+            "visible_contour_mean_distance_px": 5.2,
+            "visible_profile_mean_distance_px": 6.1,
+            "ground_contact_max_abs_m": 0.17,
+            "heading_prior_angle_error_deg": 16.0,
+        }
+    )
+
+    next_followup = _pose_record(frame_id=14, yaw_deg=-171.9, scale=2.70, mask_iou=0.803, bbox_iou=0.751)
+    next_followup["metrics"].update(
+        {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_mask_iou": 0.803,
+            "visible_bbox_iou": 0.751,
+            "visible_contour_mean_distance_px": 5.7,
+            "visible_profile_mean_distance_px": 6.6,
+            "ground_contact_max_abs_m": 0.18,
+            "heading_prior_angle_error_deg": 11.0,
+        }
+    )
+
+    handoff_13 = ProjectExecutor._pose_anchor_temporal_gate(stable_followup, first_anchor)
+    stable_followup["anchor_temporal_gate"] = handoff_13
+    assert handoff_13["accepted"] is True
+    assert ProjectExecutor._pose_record_is_stable_temporal_anchor(stable_followup) is True
+    assert ProjectExecutor._pose_record_updates_temporal_anchor(stable_followup) is False
+    assert ProjectExecutor._pose_record_promotes_temporal_candidate(
+        stable_followup,
+        stable_streak_count=1,
+    ) is False
+
+    stable_followup["temporal_anchor_kind"] = ProjectExecutor._pose_temporal_anchor_kind(stable_followup)
+    handoff_14 = ProjectExecutor._pose_anchor_temporal_gate(next_followup, stable_followup)
+
+    assert handoff_14["accepted"] is True
+    assert handoff_14["anchor_kind"] == "stable"
+    assert handoff_14["yaw_jump_deg"] < 6.0
+    assert handoff_14["scale_ratio"] < 1.02
+    next_followup["anchor_temporal_gate"] = handoff_14
+    assert ProjectExecutor._pose_record_promotes_temporal_candidate(
+        next_followup,
+        stable_streak_count=2,
+    ) is True
+
+
+def test_anchor_temporal_gate_rejects_obj18_frame14_quality_drift() -> None:
+    anchor = _pose_record(frame_id=13, yaw_deg=-1.29, scale=2.63, mask_iou=0.916, bbox_iou=0.878)
+    drifted = _pose_record(frame_id=14, yaw_deg=6.52, scale=2.61, mask_iou=0.821, bbox_iou=0.773)
+    drifted["metrics"].update(
+        {
+            "heading_front_sign_enabled": True,
+            "heading_front_sign_confidence": 1.0,
+            "heading_prior_angle_error_deg": 15.7,
+            "ground_contact_max_abs_m": 0.085,
+        }
+    )
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(drifted, anchor)
+
+    assert decision["accepted"] is False
+    assert decision["reason"].startswith("anchor_visual_degradation")
+    assert decision["mask_drop"] > 0.09
+    assert decision["bbox_drop"] > 0.10
+
+
+def test_pose_record_does_not_promote_obj18_frame14_as_stable_anchor() -> None:
+    drifted = _pose_record(frame_id=14, yaw_deg=6.52, scale=2.61, mask_iou=0.821, bbox_iou=0.773)
+    drifted["metrics"].update(
+        {
+            "heading_front_sign_enabled": True,
+            "heading_front_sign_confidence": 1.0,
+            "heading_prior_angle_error_deg": 15.7,
+            "ground_contact_max_abs_m": 0.085,
+            "mask_drop": 0.095,
+            "bbox_drop": 0.105,
+        }
+    )
+    drifted["anchor_temporal_gate"] = {
+        "accepted": True,
+        "yaw_jump_deg": 7.8,
+        "scale_ratio": 1.006,
+        "mask_drop": 0.095,
+        "bbox_drop": 0.105,
+    }
+
+    assert ProjectExecutor._pose_record_is_stable_temporal_anchor(drifted) is False
+
+
+def test_pose_record_does_not_make_obj18_frame12_quality_drop_stable_anchor() -> None:
+    degraded = _pose_record(frame_id=12, yaw_deg=4.58, scale=2.63, mask_iou=0.8498, bbox_iou=0.8085)
+    degraded["metrics"].update(
+        {
+            "heading_front_sign_enabled": True,
+            "heading_front_sign_confidence": 1.0,
+            "heading_prior_angle_error_deg": 21.4,
+            "ground_contact_max_abs_m": 0.080,
+        }
+    )
+    degraded["anchor_temporal_gate"] = {
+        "accepted": True,
+        "yaw_jump_deg": 7.79,
+        "scale_ratio": 1.010,
+        "mask_drop": 0.0917,
+        "bbox_drop": 0.1228,
+        "combined_visual_drop": 0.2145,
+        "anchor_kind": "high_quality",
+        "anchor_frame_id": 11,
+        "anchor_mask_iou": 0.9416,
+        "anchor_bbox_iou": 0.9313,
+    }
+
+    assert ProjectExecutor._pose_record_is_stable_temporal_anchor(degraded) is False
+    assert ProjectExecutor._pose_record_promotes_temporal_candidate(
+        degraded,
+        stable_streak_count=2,
+    ) is False
+
+
+def test_anchor_temporal_gate_rejects_obj18_frame12_quality_drift() -> None:
+    anchor = _pose_record(frame_id=11, yaw_deg=-3.17, scale=2.6566, mask_iou=0.9416, bbox_iou=0.9313)
+    drifted = _pose_record(frame_id=12, yaw_deg=4.58, scale=2.6302, mask_iou=0.8498, bbox_iou=0.8085)
+    drifted["metrics"].update(
+        {
+            "heading_front_sign_enabled": True,
+            "heading_front_sign_confidence": 1.0,
+            "heading_prior_angle_error_deg": 21.39,
+            "ground_contact_max_abs_m": 0.0802,
+        }
+    )
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(drifted, anchor)
+
+    assert decision["accepted"] is False
+    assert decision["reason"].startswith("anchor_visual_degradation")
+    assert decision["mask_drop"] > 0.08
+    assert decision["bbox_drop"] > 0.12
+
+
+def test_trusted_anchor_gate_rejects_obj18_frame12_quality_drift() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "trusted_anchor_gate_enabled": True,
+            "trusted_anchor_prior_mask_iou_min": 0.88,
+            "trusted_anchor_prior_bbox_iou_min": 0.85,
+            "trusted_anchor_visual_drop_max": 0.18,
+            "trusted_anchor_mask_drop_max": 0.08,
+            "trusted_anchor_bbox_drop_max": 0.10,
+            "trusted_anchor_yaw_jump_deg": 6.0,
+            "trusted_anchor_scale_ratio": 1.04,
+            "trusted_anchor_min_mask_iou": 0.86,
+            "trusted_anchor_min_bbox_iou": 0.82,
+            "trusted_anchor_penalty": 1_000_000.0,
+        },
+    )()
+
+    gate = compute_trusted_anchor_gate(
+        result={
+            "mask_iou": 0.8498,
+            "bbox_iou": 0.8085,
+            "yaw_jump_from_trusted_anchor_deg": 7.79,
+            "scale_ratio_from_trusted_anchor": 1.01,
+        },
+        trusted_anchor={
+            "quality": {
+                "mask_iou": 0.9416,
+                "bbox_iou": 0.9313,
+            }
+        },
+        args=args,
+    )
+
+    assert gate["trusted_anchor_gate_passed"] is False
+    assert gate["trusted_anchor_gate_reason"].startswith("visual_degradation")
+    assert gate["trusted_anchor_mask_drop"] > 0.08
+    assert gate["trusted_anchor_bbox_drop"] > 0.12
+
+
+def test_trusted_anchor_payload_converts_world_pose_to_camera_prior() -> None:
+    prior = load_prior_pose_payload(
+        {
+            "source": "trusted_temporal_anchor_pose",
+            "frame_id": 11,
+            "pose": {
+                "translation_world": [1.0, 2.0, 3.0],
+                "rotation_matrix": np.eye(3).tolist(),
+                "scale": [2.0, 2.0, 2.0],
+            },
+            "quality": {"mask_iou": 0.94, "bbox_iou": 0.93},
+        },
+        np.eye(4),
+    )
+
+    assert prior is not None
+    assert prior["pose_source"] == "trusted_temporal_anchor_pose"
+    assert prior["frame_idx"] == 11
+    assert np.allclose(prior["translation_cam"], [1.0, 2.0, 3.0])
+    assert np.allclose(prior["scale"], [2.0, 2.0, 2.0])
+    assert prior["quality"]["mask_iou"] == 0.94
 
 
 def test_truncated_fail_fast_triggers_for_low_observability_failure() -> None:
@@ -561,6 +853,496 @@ def test_optimizer_final_selection_prefers_front_sign_consistent_candidate() -> 
     assert selected is not None
     assert selected["heading_prior_angle_error_deg"] == 6.0
     assert selected["final_selection_mode"] == "front_sign_consistent_rank"
+
+
+def test_non_truncated_visual_ground_rescue_uses_wide_trigger() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "non_truncated_visual_ground_rescue_enabled": True,
+            "rescue_ground_mean_trigger_m": 0.20,
+            "rescue_ground_max_trigger_m": 0.30,
+            "rescue_bbox_iou_trigger": 0.82,
+            "rescue_center_error_trigger_px": 8.0,
+            "rescue_mask_iou_trigger": 0.72,
+            "rescue_mask_drop_trigger": 0.05,
+            "visual_gate_enabled": True,
+        },
+    )()
+    selected = {
+        "mask_iou": 0.704,
+        "bbox_iou": 0.708,
+        "bbox_center_error_px": 13.24,
+        "ground_contact_mean_abs_m": 0.297,
+        "ground_contact_max_abs_m": 0.385,
+        "visual_gate_factor": 0.0,
+    }
+    temporal_prior = {
+        "quality": {
+            "mask_iou": 0.892,
+            "bbox_iou": 0.938,
+        }
+    }
+    vehicle_pose_context = {
+        "road_constraint": {"available": True},
+        "track_scale_prior": {"available": True, "scale": [2.63, 2.63, 2.63]},
+    }
+
+    decision = should_run_non_truncated_visual_ground_rescue(
+        selected,
+        args,
+        {"is_truncated": False},
+        temporal_prior=temporal_prior,
+        vehicle_pose_context=vehicle_pose_context,
+    )
+
+    assert decision["run"] is True
+    assert decision["trigger_count"] >= 2
+    assert "visual_gate_failed" in decision["reasons"]
+    assert "ground_max" in decision["reasons"]
+
+
+def test_non_truncated_visual_ground_rescue_requires_strict_replacement_gain() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "rescue_scale_delta_log_max": 0.08,
+            "rescue_scale_ratio_from_anchor_max": 1.10,
+            "rescue_replace_mask_gain_min": 0.04,
+            "rescue_replace_bbox_gain_min": 0.06,
+            "rescue_replace_center_gain_min_px": 3.0,
+            "rescue_replace_temporal_loss_margin": 0.25,
+            "rescue_replace_temporal_loss_hard_max": 80.0,
+            "rescue_replace_strong_visual_mask_gain": 0.08,
+            "rescue_replace_strong_visual_bbox_gain": 0.08,
+            "rescue_replace_strong_visual_center_gain_px": 6.0,
+            "rescue_replace_ground_mean_max_m": 0.30,
+            "rescue_replace_ground_max_max_m": 0.50,
+            "rescue_replace_mask_drop_max": 0.01,
+            "rescue_replace_bbox_drop_max": 0.02,
+            "rescue_replace_yaw_jump_max_deg": 15.0,
+        },
+    )()
+    current = {
+        "mask_iou": 0.704,
+        "bbox_iou": 0.708,
+        "bbox_center_error_px": 13.2,
+        "ground_contact_mean_abs_m": 0.297,
+        "ground_contact_max_abs_m": 0.385,
+        "temporal_loss": 0.30,
+    }
+    rescued = {
+        "mask_iou": 0.884,
+        "bbox_iou": 0.856,
+        "bbox_center_error_px": 1.3,
+        "ground_gate_rejected": False,
+        "upright_gate_rejected": False,
+        "heading_front_sign_hard_rejected": False,
+        "ground_contact_mean_abs_m": 0.19,
+        "ground_contact_max_abs_m": 0.42,
+        "scale_ratio_from_anchor": 1.04,
+        "track_scale_prior_delta_log": 0.02,
+        "temporal_loss": 46.0,
+        "yaw_jump_from_anchor_deg": 5.0,
+    }
+    bad_scale = dict(rescued, scale_ratio_from_anchor=1.22)
+
+    accepted = passes_non_truncated_visual_ground_rescue_replacement_gate(rescued, current, args)
+    rejected = passes_non_truncated_visual_ground_rescue_replacement_gate(bad_scale, current, args)
+
+    assert accepted["accepted"] is True
+    assert accepted["visual_gain"] is True
+    assert rejected["accepted"] is False
+    assert "scale_ratio" in rejected["reasons"]
+
+
+def test_optimizer_temporal_anchor_visual_gate_rejects_obj18_frame11_regression() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "temporal_anchor_visual_gate_enabled": True,
+            "temporal_anchor_visual_gate_prior_mask_iou_min": 0.88,
+            "temporal_anchor_visual_gate_prior_bbox_iou_min": 0.85,
+            "temporal_anchor_visual_gate_mask_drop_max": 0.08,
+            "temporal_anchor_visual_gate_bbox_drop_max": 0.10,
+            "temporal_anchor_visual_gate_yaw_jump_deg": 8.0,
+            "temporal_anchor_visual_gate_min_mask_iou": 0.86,
+            "temporal_anchor_visual_gate_min_bbox_iou": 0.84,
+            "temporal_anchor_visual_gate_temporal_loss_max": 0.50,
+            "temporal_anchor_visual_gate_penalty": 1_000_000.0,
+        },
+    )()
+
+    gate = compute_temporal_anchor_visual_gate(
+        result={
+            "mask_iou": 0.8090440755580997,
+            "bbox_iou": 0.7761221199906715,
+            "delta_yaw_deg": 9.999997913562225,
+            "temporal_loss": 0.7659476237599382,
+            "heading_prior_angle_error_deg": 13.778497797813854,
+            "heading_prior_confidence": 0.35,
+        },
+        temporal_prior={
+            "quality": {
+                "mask_iou": 0.9260330578512397,
+                "bbox_iou": 0.9234311966194116,
+            }
+        },
+        truncation_info={"is_truncated": False},
+        args=args,
+    )
+
+    assert gate["temporal_anchor_visual_gate_passed"] is False
+    assert gate["temporal_anchor_visual_gate_reason"].startswith("visual_degradation_yaw_jump")
+    assert gate["temporal_anchor_visual_mask_drop"] > 0.11
+    assert gate["temporal_anchor_visual_bbox_drop"] > 0.14
+
+
+def test_optimizer_temporal_anchor_visual_gate_accepts_stable_visual_followup() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "temporal_anchor_visual_gate_enabled": True,
+            "temporal_anchor_visual_gate_prior_mask_iou_min": 0.88,
+            "temporal_anchor_visual_gate_prior_bbox_iou_min": 0.85,
+            "temporal_anchor_visual_gate_mask_drop_max": 0.08,
+            "temporal_anchor_visual_gate_bbox_drop_max": 0.10,
+            "temporal_anchor_visual_gate_yaw_jump_deg": 8.0,
+            "temporal_anchor_visual_gate_min_mask_iou": 0.86,
+            "temporal_anchor_visual_gate_min_bbox_iou": 0.84,
+            "temporal_anchor_visual_gate_temporal_loss_max": 0.50,
+            "temporal_anchor_visual_gate_penalty": 1_000_000.0,
+        },
+    )()
+
+    gate = compute_temporal_anchor_visual_gate(
+        result={
+            "mask_iou": 0.906,
+            "bbox_iou": 0.916,
+            "delta_yaw_deg": 2.0,
+            "temporal_loss": 0.08,
+        },
+        temporal_prior={
+            "quality": {
+                "mask_iou": 0.926,
+                "bbox_iou": 0.923,
+            }
+        },
+        truncation_info={"is_truncated": False},
+        args=args,
+    )
+
+    assert gate["temporal_anchor_visual_gate_passed"] is True
+    assert gate["temporal_anchor_visual_gate_reason"] == "passed"
+
+
+def test_optimizer_temporal_anchor_visual_gate_falls_back_when_visible_iou_is_none() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "temporal_anchor_visual_gate_enabled": True,
+            "temporal_anchor_visual_gate_prior_mask_iou_min": 0.88,
+            "temporal_anchor_visual_gate_prior_bbox_iou_min": 0.85,
+            "temporal_anchor_visual_gate_mask_drop_max": 0.08,
+            "temporal_anchor_visual_gate_bbox_drop_max": 0.10,
+            "temporal_anchor_visual_gate_yaw_jump_deg": 8.0,
+            "temporal_anchor_visual_gate_min_mask_iou": 0.86,
+            "temporal_anchor_visual_gate_min_bbox_iou": 0.84,
+            "temporal_anchor_visual_gate_temporal_loss_max": 0.50,
+            "temporal_anchor_visual_gate_penalty": 1_000_000.0,
+        },
+    )()
+
+    gate = compute_temporal_anchor_visual_gate(
+        result={
+            "visible_mask_iou": None,
+            "visible_bbox_iou": None,
+            "mask_iou": 0.90,
+            "bbox_iou": 0.89,
+            "delta_yaw_deg": 2.0,
+            "temporal_loss": 0.08,
+        },
+        temporal_prior={
+            "quality": {
+                "mask_iou": 0.926,
+                "bbox_iou": 0.923,
+            }
+        },
+        truncation_info={"is_truncated": False},
+        args=args,
+    )
+
+    assert gate["temporal_anchor_visual_gate_passed"] is True
+    assert gate["temporal_anchor_visual_mask_drop"] == pytest.approx(0.026)
+    assert gate["temporal_anchor_visual_bbox_drop"] == pytest.approx(0.033)
+
+
+def test_pose_record_rejects_temporal_prior_after_anchor_visual_degradation() -> None:
+    anchor = _pose_record(frame_id=11, yaw_deg=-177.0, scale=2.67, mask_iou=0.923, bbox_iou=0.911)
+    degraded = _pose_record(frame_id=12, yaw_deg=173.9, scale=2.65, mask_iou=0.839, bbox_iou=0.801)
+
+    decision = ProjectExecutor._pose_anchor_temporal_gate(degraded, anchor)
+    degraded["anchor_temporal_gate"] = decision
+
+    assert decision["accepted"] is False
+    assert decision["reason"].startswith("anchor_visual_degradation")
+    assert decision["mask_drop"] > 0.08
+    assert decision["bbox_drop"] > 0.10
+    assert ProjectExecutor._pose_record_updates_temporal_anchor(degraded) is False
+    assert ProjectExecutor._pose_record_is_high_quality_anchor(degraded) is False
+
+
+def test_truncated_final_selection_prefers_anchor_consistent_temporal_candidate() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.09,
+            "final_ground_select_max_max_m": 0.16,
+            "truncated_final_visual_selection_enabled": True,
+            "truncated_final_visual_min_bbox_iou": 0.88,
+            "truncated_final_visual_min_quality_gate": 0.80,
+            "truncated_final_visual_mask_weight": 1.2,
+            "truncated_final_visual_contour_weight": 0.5,
+            "truncated_final_visual_bbox_weight": 0.04,
+            "severe_truncated_final_visual_bbox_weight": 0.02,
+            "truncated_final_visual_quality_weight": 0.05,
+            "truncated_final_visual_ground_mean_weight": 0.18,
+            "truncated_final_visual_ground_max_weight": 0.08,
+            "truncated_final_visual_score_weight": 0.01,
+            "truncated_final_visual_temporal_weight": 0.35,
+            "truncated_final_visual_temporal_loss_weight": 0.04,
+            "truncated_final_visual_heading_weight": 0.04,
+            "truncated_final_visual_prefer_temporal_seed_bonus": 0.08,
+            "truncated_final_visual_scale_jump_weight": 0.35,
+            "truncated_final_visual_anchor_yaw_weight": 0.02,
+            "truncated_anchor_gate_enabled": True,
+            "truncated_anchor_gate_yaw_jump_deg": 12.0,
+            "truncated_anchor_gate_scale_ratio": 1.08,
+            "truncated_anchor_gate_temporal_loss_max": 2.0,
+            "low_observability_anchor_gate_yaw_jump_deg": 8.0,
+            "low_observability_anchor_gate_scale_ratio": 1.04,
+            "low_observability_anchor_gate_temporal_loss_max": 1.0,
+        },
+    )()
+    temporal_prior = {
+        "score": 2.09,
+        "visible_mask_iou": 0.9625,
+        "visible_bbox_iou": 0.9761,
+        "visible_contour_score": 0.755,
+        "visible_contour_mean_distance_px": 0.79,
+        "visible_profile_score": 0.674,
+        "truncated_visual_quality_gate": 0.92,
+        "ground_contact_mean_abs_m": 0.074,
+        "ground_contact_max_abs_m": 0.149,
+        "upright_angle_error_deg": 1.0,
+        "temporal_score": 0.961,
+        "temporal_loss": 0.04,
+        "heading_prior_angle_error_deg": 45.8,
+        "scale_ratio_from_anchor": 1.006,
+        "yaw_jump_from_anchor_deg": 0.8,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+    flipped_coarse = {
+        "score": 1.84,
+        "visible_mask_iou": 0.9070,
+        "visible_bbox_iou": 0.9618,
+        "visible_contour_score": 0.474,
+        "visible_contour_mean_distance_px": 2.48,
+        "visible_profile_score": 0.397,
+        "truncated_visual_quality_gate": 0.896,
+        "ground_contact_mean_abs_m": 0.021,
+        "ground_contact_max_abs_m": 0.036,
+        "upright_angle_error_deg": 0.6,
+        "temporal_score": 0.0,
+        "temporal_loss": 114.3,
+        "heading_prior_angle_error_deg": 37.3,
+        "scale_ratio_from_anchor": 1.01,
+        "yaw_jump_from_anchor_deg": 178.0,
+        "initializer_metadata": {"source": "coarse_search"},
+    }
+
+    selected = choose_best_refined_result(
+        [temporal_prior, flipped_coarse],
+        args,
+        {"is_truncated": True, "truncation_sides": ["right"], "truncation_severity": "light"},
+    )
+
+    assert selected is temporal_prior
+    assert flipped_coarse["truncated_anchor_gate_passed"] is False
+    assert "yaw_jump" in flipped_coarse["truncated_anchor_gate_reasons"]
+
+
+def test_truncated_final_selection_does_not_discard_strong_temporal_for_slight_ground_excess() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.055,
+            "final_ground_select_max_max_m": 0.12,
+            "final_ground_select_relaxed_mean_max_m": 0.075,
+            "final_ground_select_relaxed_max_max_m": 0.16,
+            "final_ground_relaxed_temporal_score_min": 0.70,
+            "final_ground_relaxed_visible_mask_iou_min": 0.92,
+            "final_ground_relaxed_visible_contour_mean_px_max": 2.5,
+            "truncated_final_visual_selection_enabled": True,
+            "truncated_final_visual_min_bbox_iou": 0.88,
+            "truncated_final_visual_min_quality_gate": 0.80,
+            "truncated_final_visual_mask_weight": 1.0,
+            "truncated_final_visual_contour_weight": 0.35,
+            "truncated_final_visual_bbox_weight": 0.08,
+            "severe_truncated_final_visual_bbox_weight": 0.02,
+            "truncated_final_visual_quality_weight": 0.05,
+            "truncated_final_visual_ground_mean_weight": 0.25,
+            "truncated_final_visual_ground_max_weight": 0.10,
+            "truncated_final_visual_score_weight": 0.03,
+            "truncated_final_visual_temporal_weight": 0.18,
+            "truncated_final_visual_temporal_loss_weight": 0.02,
+            "truncated_final_visual_heading_weight": 0.02,
+            "truncated_final_visual_prefer_temporal_seed_bonus": 0.04,
+            "truncated_final_visual_scale_jump_weight": 0.20,
+            "truncated_final_visual_anchor_yaw_weight": 0.01,
+            "truncated_final_visual_front_flip_penalty": 1.0,
+            "truncated_anchor_gate_enabled": True,
+            "truncated_anchor_gate_yaw_jump_deg": 12.0,
+            "truncated_anchor_gate_scale_ratio": 1.08,
+            "truncated_anchor_gate_temporal_loss_max": 2.0,
+            "low_observability_anchor_gate_yaw_jump_deg": 8.0,
+            "low_observability_anchor_gate_scale_ratio": 1.04,
+            "low_observability_anchor_gate_temporal_loss_max": 1.0,
+        },
+    )()
+    temporal_prior = {
+        "score": 2.13,
+        "visible_mask_iou": 0.959,
+        "visible_bbox_iou": 0.984,
+        "visible_contour_score": 0.753,
+        "visible_contour_mean_distance_px": 0.80,
+        "visible_profile_mean_distance_px": 1.99,
+        "truncated_visual_quality_gate": 1.0,
+        "ground_contact_mean_abs_m": 0.062,
+        "ground_contact_max_abs_m": 0.115,
+        "temporal_score": 0.883,
+        "temporal_loss": 0.125,
+        "heading_prior_angle_error_deg": 44.2,
+        "heading_candidate_forward_sign": 1.0,
+        "heading_semantic_front_sign": 1.0,
+        "scale_ratio_from_anchor": 1.003,
+        "yaw_jump_from_anchor_deg": 3.3,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+    flipped = {
+        "score": 1.93,
+        "visible_mask_iou": 0.925,
+        "visible_bbox_iou": 1.0,
+        "visible_contour_score": 0.573,
+        "visible_contour_mean_distance_px": 1.84,
+        "visible_profile_mean_distance_px": 3.46,
+        "truncated_visual_quality_gate": 1.0,
+        "ground_contact_mean_abs_m": 0.048,
+        "ground_contact_max_abs_m": 0.087,
+        "temporal_score": 0.0,
+        "temporal_loss": 114.7,
+        "heading_prior_angle_error_deg": 46.7,
+        "heading_candidate_forward_sign": 1.0,
+        "heading_semantic_front_sign": -1.0,
+        "scale_ratio_from_anchor": 1.024,
+        "yaw_jump_from_anchor_deg": 178.4,
+        "initializer_metadata": {"source": "coarse_search"},
+    }
+
+    selected = choose_best_refined_result(
+        [temporal_prior, flipped],
+        args,
+        {"is_truncated": True, "truncation_sides": ["right"], "truncation_severity": "light"},
+    )
+
+    assert selected is temporal_prior
+    assert temporal_prior["final_ground_constrained_selected"] is True
+    assert temporal_prior["final_ground_relaxed_selected"] is True
+    assert "yaw_jump" in flipped["truncated_anchor_gate_reasons"]
+
+
+def test_severe_truncation_fallback_rejects_anchor_inconsistent_candidate() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "final_ground_constrained_selection_enabled": True,
+            "final_ground_select_mean_max_m": 0.09,
+            "final_ground_select_max_max_m": 0.16,
+            "truncated_final_visual_selection_enabled": True,
+            "severe_truncation_final_gate_enabled": True,
+            "severe_truncation_visible_mask_iou_min": 0.95,
+            "severe_truncation_visible_contour_mean_px_max": 1.0,
+            "severe_truncation_visible_profile_mean_px_max": 2.0,
+            "severe_truncation_ground_mean_m_max": 0.085,
+            "severe_truncation_ground_max_m_max": 0.18,
+            "severe_truncation_upright_deg_max": 35.0,
+            "severe_truncation_yaw_jump_deg_max": 25.0,
+            "severe_truncation_fallback_visible_mask_iou_min": 0.76,
+            "severe_truncation_fallback_visible_contour_mean_px_max": 5.5,
+            "severe_truncation_fallback_visible_profile_mean_px_max": 8.5,
+            "truncated_anchor_gate_enabled": True,
+            "truncated_anchor_gate_yaw_jump_deg": 12.0,
+            "truncated_anchor_gate_scale_ratio": 1.08,
+            "truncated_anchor_gate_temporal_loss_max": 2.0,
+            "low_observability_anchor_gate_yaw_jump_deg": 8.0,
+            "low_observability_anchor_gate_scale_ratio": 1.04,
+            "low_observability_anchor_gate_temporal_loss_max": 1.0,
+        },
+    )()
+    flipped = {
+        "score": 1.93,
+        "visible_mask_iou": 0.925,
+        "visible_bbox_iou": 1.0,
+        "visible_contour_score": 0.57,
+        "visible_contour_mean_distance_px": 1.84,
+        "visible_profile_mean_distance_px": 3.46,
+        "truncated_visual_quality_gate": 0.95,
+        "ground_contact_mean_abs_m": 0.03,
+        "ground_contact_max_abs_m": 0.06,
+        "upright_angle_error_deg": 1.0,
+        "temporal_score": 0.0,
+        "temporal_loss": 114.0,
+        "scale_ratio_from_anchor": 1.004,
+        "yaw_jump_from_anchor_deg": 173.0,
+        "initializer_metadata": {"source": "coarse_search"},
+    }
+    anchor_consistent = {
+        "score": 2.03,
+        "visible_mask_iou": 0.953,
+        "visible_bbox_iou": 0.975,
+        "visible_contour_score": 0.71,
+        "visible_contour_mean_distance_px": 0.99,
+        "visible_profile_mean_distance_px": 2.44,
+        "truncated_visual_quality_gate": 0.95,
+        "ground_contact_mean_abs_m": 0.07,
+        "ground_contact_max_abs_m": 0.14,
+        "upright_angle_error_deg": 1.0,
+        "temporal_score": 0.07,
+        "temporal_loss": 2.6,
+        "scale_ratio_from_anchor": 1.0,
+        "yaw_jump_from_anchor_deg": 5.9,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    selected = choose_best_refined_result(
+        [flipped, anchor_consistent],
+        args,
+        {"is_truncated": True, "truncation_sides": ["right"], "truncation_severity": "severe"},
+    )
+
+    assert selected is anchor_consistent
+    assert flipped["truncated_anchor_gate_passed"] is False
+    assert "yaw_jump" in flipped["truncated_anchor_gate_reasons"]
 
 
 def test_truncation_observability_marks_bottom_contour_drift_as_severe() -> None:

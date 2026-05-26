@@ -342,6 +342,12 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         t_world_from_cam=t_world_from_cam,
         args=args,
     )
+    trusted_anchor_payload = vehicle_pose_context.get("trusted_temporal_anchor_pose")
+    trusted_anchor_pose = temporal_fast.load_prior_pose_payload(trusted_anchor_payload, t_world_from_cam)
+    if trusted_anchor_pose is not None:
+        vehicle_pose_context["trusted_temporal_anchor_pose"] = trusted_anchor_pose
+    else:
+        vehicle_pose_context.pop("trusted_temporal_anchor_pose", None)
     vehicle_pose_context["mesh_tail_light_prior"] = mesh_tail_light_prior
     mesh_meta = fast.apply_mesh_axis_prior(mesh_meta, vehicle_pose_context.get("mesh_axis_prior"))
     mesh_meta["tail_light_prior"] = mesh_tail_light_prior
@@ -597,6 +603,21 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         args,
         truncation_info,
     )
+    rescue_diagnostics: dict[str, Any] | None = None
+    if selected_result is not None:
+        rescue_result, rescue_history, rescue_diagnostics = temporal_fast.try_non_truncated_visual_ground_rescue(
+            selected_result=selected_result,
+            initial_candidates=initial_candidates,
+            refined_results=[item[0] for item in refined_results],
+            proxy_evaluator=proxy_evaluator,
+            full_evaluator=full_evaluator,
+            args=args,
+            truncation_info=truncation_info,
+        )
+        if rescue_result is not None:
+            rescue_result["candidate_rank"] = len(refined_results) + 1
+            refined_results.append((rescue_result, rescue_history))
+            selected_result = rescue_result
     if selected_result is None:
         best_result = None
         best_history = []
@@ -892,6 +913,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "grabcut": grabcut_info,
         "temporal": temporal_report,
         "track_prior": track_report,
+        "non_truncated_visual_ground_rescue": rescue_diagnostics,
         "partial_visibility": partial_report,
         "edge_assist": edge_report,
         "road_constraint": road_report,
@@ -952,6 +974,14 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "effective_front_sign_penalty_weight": best_result.get("effective_front_sign_penalty_weight"),
             "visual_gate_factor": best_result.get("visual_gate_factor"),
             "visual_gate_reason": best_result.get("visual_gate_reason"),
+            "temporal_anchor_visual_gate_passed": best_result.get("temporal_anchor_visual_gate_passed"),
+            "temporal_anchor_visual_gate_reason": best_result.get("temporal_anchor_visual_gate_reason"),
+            "temporal_anchor_visual_mask_drop": best_result.get("temporal_anchor_visual_mask_drop"),
+            "temporal_anchor_visual_bbox_drop": best_result.get("temporal_anchor_visual_bbox_drop"),
+            "temporal_anchor_visual_yaw_jump_deg": best_result.get("temporal_anchor_visual_yaw_jump_deg"),
+            "temporal_anchor_visual_prior_mask_iou": best_result.get("temporal_anchor_visual_prior_mask_iou"),
+            "temporal_anchor_visual_prior_bbox_iou": best_result.get("temporal_anchor_visual_prior_bbox_iou"),
+            "temporal_anchor_visual_penalty": best_result.get("temporal_anchor_visual_penalty"),
             "visible_mask_bonus": best_result.get("visible_mask_bonus"),
             "visible_mask_bonus_weight": best_result.get("visible_mask_bonus_weight"),
             "visible_mask_iou": best_result.get("visible_mask_iou"),
@@ -989,6 +1019,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "final_ground_constrained_selected": best_result.get("final_ground_constrained_selected"),
             "final_ground_constrained_rank_score": best_result.get("final_ground_constrained_rank_score"),
             "final_selection_mode": best_result.get("final_selection_mode"),
+            "non_truncated_visual_ground_rescue_gate": best_result.get("non_truncated_visual_ground_rescue_gate"),
             "final_visual_selection_weights": best_result.get("final_visual_selection_weights"),
             "effective_visual_bbox_weight": best_result.get("effective_visual_bbox_weight"),
             "effective_hard_mask_weight": best_result.get("effective_hard_mask_weight"),

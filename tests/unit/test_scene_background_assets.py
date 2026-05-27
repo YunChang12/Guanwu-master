@@ -58,6 +58,17 @@ def _mask_instance(object_id: str, label: str, mask: np.ndarray, bbox: list[floa
     }
 
 
+def _project_test_vertices(vertices: np.ndarray, camera: dict) -> tuple[np.ndarray, np.ndarray]:
+    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
+    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
+    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
+    return image_x, image_y
+
+
+def _road_plane_vertex_mask(vertices: np.ndarray, *, plane_z: float = 5.0) -> np.ndarray:
+    return np.abs(vertices[:, 2] - float(plane_z)) < 1e-5
+
+
 def test_build_dynamic_mask_uses_only_movable_categories_and_expands_shadow() -> None:
     car = np.zeros((24, 32), dtype=bool)
     car[8:14, 10:18] = True
@@ -897,6 +908,37 @@ def test_load_background_asset_meshes_prefers_manifest_split_order(tmp_path: Pat
     ]
 
 
+def test_load_background_asset_meshes_prefers_global_fused_background_mesh(tmp_path: Path) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    background = assets / "background_global_fused_v1.glb"
+    background.write_bytes(b"glb")
+    road = assets / "road_mesh.obj"
+    road.write_text("o x\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
+    manifest = assets / "background_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "assets": {
+                    "background_mesh": str(background),
+                    "road_mesh": str(road),
+                    "road_surface_mesh": str(assets / "old_road_surface.glb"),
+                    "static_background_mesh": str(assets / "old_static_background.glb"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meshes = load_background_asset_meshes(str(manifest))
+
+    assert [(name, path.name) for name, path in meshes] == [("background", "background_global_fused_v1.glb")]
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "road_surface_mesh" not in updated_manifest["assets"]
+    assert "static_background_mesh" not in updated_manifest["assets"]
+
+
 def test_generate_depth_background_mesh_assets_writes_colored_glb_and_manifest(tmp_path: Path) -> None:
     rgb = np.zeros((24, 32, 3), dtype=np.uint8)
     rgb[..., 0] = np.arange(32, dtype=np.uint8)[None, :] * 4
@@ -934,7 +976,7 @@ def test_generate_depth_background_mesh_assets_writes_colored_glb_and_manifest(t
     assert [(name, path.name) for name, path in meshes] == [("depth_background", "depth_background.glb")]
 
 
-def test_load_background_asset_meshes_builds_multiframe_global_road_and_static_background(tmp_path: Path) -> None:
+def test_load_background_asset_meshes_builds_multiframe_global_fused_background(tmp_path: Path) -> None:
     rgb = np.zeros((24, 32, 3), dtype=np.uint8)
     rgb[:8, :] = (70, 78, 86)
     rgb[8:, :] = (110, 112, 116)
@@ -993,6 +1035,8 @@ def test_load_background_asset_meshes_builds_multiframe_global_road_and_static_b
                     "road_mask": str(road_mask_path),
                     "dynamic_mask": str(dynamic_mask_path),
                     "depth_background_glb": depth_background,
+                    "road_surface_mesh": str(tmp_path / "old_road_surface.glb"),
+                    "static_background_mesh": str(tmp_path / "old_static_background.glb"),
                 },
             }
         ),
@@ -1033,31 +1077,32 @@ def test_load_background_asset_meshes_builds_multiframe_global_road_and_static_b
         camera_trajectory_path=camera_trajectory,
     )
 
-    assert [(name, path.name) for name, path in meshes] == [
-        ("road_surface", "road_surface_global_multiframe_v1.glb"),
-        ("static_background", "static_background_multiframe_no_road_v1.glb"),
-    ]
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    road_vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    assert np.max(np.abs(road_vertices[:, 2] - 5.0)) < 1e-5
+    assert [(name, path.name) for name, path in meshes] == [("background", "background_global_fused_v1.glb")]
+    fused_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
+    vertices = np.asarray(fused_mesh.vertices, dtype=np.float64)
+    assert len(vertices) > 0
 
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (road_vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
+    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
     image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
     image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    assert not np.any((image_y >= 8.0) & (image_y < 12.0))
-    assert np.any((image_y >= 12.0) & (image_y < 20.0) & (image_x >= 10.0) & (image_x < 18.0))
+    road_vertices = vertices[image_y >= 16.0]
+    assert len(road_vertices) > 0
+    assert np.max(np.abs(road_vertices[:, 2] - 5.0)) < 1e-5
+    dynamic_road = (image_y >= 12.0) & (image_y < 20.0) & (image_x >= 10.0) & (image_x < 18.0)
+    assert np.any(dynamic_road)
+    assert np.max(np.abs(vertices[dynamic_road, 2] - 5.0)) < 1e-5
+    static_top = vertices[image_y < 8.0]
+    assert len(static_top) > 0
+    assert np.max(static_top[:, 2]) > 6.5
 
-    static_mesh = trimesh.load(str(meshes[1][1]), force="mesh")
-    static_vertices = np.asarray(static_mesh.vertices, dtype=np.float64)
-    static_points_cam = (
-        np.asarray(camera["R"], dtype=np.float64).T @ (static_vertices - np.asarray(camera["t"], dtype=np.float64)).T
-    ).T
-    static_image_y = camera["fy"] * static_points_cam[:, 1] / static_points_cam[:, 2] + camera["cy"]
-    static_image_x = camera["fx"] * static_points_cam[:, 0] / static_points_cam[:, 2] + camera["cx"]
-    assert len(static_vertices) > 0
-    assert np.min(static_image_y) < 8.0
-    assert not np.any(static_image_y >= 16.0)
-    assert not np.any((static_image_y >= 12.0) & (static_image_y < 20.0) & (static_image_x >= 10.0) & (static_image_x <= 18.0))
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    assert updated_manifest["assets"]["background_mesh"].endswith("background_global_fused_v1.glb")
+    assert updated_manifest["quality"]["background_mode"] == "global_fused_single_mesh"
+    assert updated_manifest["quality"]["road_depth_source"] == "global_road_plane"
+    assert updated_manifest["quality"]["static_depth_source"] == "robust_multiframe_depth"
+    assert updated_manifest["quality"]["background_mesh_vertex_count"] == len(vertices)
+    assert "road_surface_mesh" not in updated_manifest["assets"]
+    assert "static_background_mesh" not in updated_manifest["assets"]
 
 
 def test_multiframe_road_surface_uses_semantic_mask_not_depth_plane_extent(tmp_path: Path) -> None:
@@ -1148,14 +1193,11 @@ def test_multiframe_road_surface_uses_semantic_mask_not_depth_plane_extent(tmp_p
         camera_trajectory_path=camera_trajectory,
     )
 
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    near_rows = image_y >= 16.0
-    assert np.min(image_x[near_rows]) >= 7.5
-    assert np.max(image_x[near_rows]) <= 24.5
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert np.any(road_support[16:, 8:24])
+    assert not np.any(road_support[16:, :7])
+    assert not np.any(road_support[16:, 25:])
 
 
 def test_multiframe_road_surface_uses_global_plane_when_keyframe_differs(tmp_path: Path) -> None:
@@ -1240,9 +1282,11 @@ def test_multiframe_road_surface_uses_global_plane_when_keyframe_differs(tmp_pat
         camera_trajectory_path=camera_trajectory,
     )
 
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    assert np.max(np.abs(vertices[:, 2] - 5.0)) < 1e-5
+    background_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
+    vertices = np.asarray(background_mesh.vertices, dtype=np.float64)
+    road_vertices = vertices[_road_plane_vertex_mask(vertices)]
+    assert len(road_vertices) > 0
+    assert np.max(np.abs(road_vertices[:, 2] - 5.0)) < 1e-5
 
 
 def test_multiframe_global_road_support_does_not_expand_into_side_nonroad(tmp_path: Path) -> None:
@@ -1332,14 +1376,11 @@ def test_multiframe_global_road_support_does_not_expand_into_side_nonroad(tmp_pa
         camera_trajectory_path=camera_trajectory,
     )
 
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    near_rows = image_y >= 16.0
-    assert np.min(image_x[near_rows]) >= 5.5
-    assert np.max(image_x[near_rows]) <= 26.5
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert np.any(road_support[16:, 8:24])
+    assert not np.any(road_support[16:, :6])
+    assert not np.any(road_support[16:, 26:])
 
 
 def test_multiframe_global_road_support_ignores_unreliable_full_width_seed(tmp_path: Path) -> None:
@@ -1430,14 +1471,11 @@ def test_multiframe_global_road_support_ignores_unreliable_full_width_seed(tmp_p
         camera_trajectory_path=camera_trajectory,
     )
 
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    near_rows = image_y >= 16.0
-    assert np.min(image_x[near_rows]) >= 7.5
-    assert np.max(image_x[near_rows]) <= 24.5
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert np.any(road_support[16:, 8:24])
+    assert not np.any(road_support[16:, :7])
+    assert not np.any(road_support[16:, 25:])
 
 
 def test_multiframe_global_road_support_excludes_static_guard_regions(tmp_path: Path) -> None:
@@ -1531,13 +1569,10 @@ def test_multiframe_global_road_support_excludes_static_guard_regions(tmp_path: 
         camera_trajectory_path=camera_trajectory,
     )
 
-    road_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(road_mesh.vertices, dtype=np.float64)
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    near_rows = image_y >= 16.0
-    assert np.max(image_x[near_rows]) <= 23.5
+    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert np.any(road_support[16:, :24])
+    assert not np.any(road_support[16:, 24:])
 
 
 def test_generate_target_frame_background_assets_prefers_clean_depth_estimator(tmp_path: Path) -> None:

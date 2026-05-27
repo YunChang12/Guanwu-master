@@ -579,6 +579,82 @@ def test_apply_usd_visibility_samples_hides_before_between_and_after_segments() 
     assert imageable.ComputeVisibility(Usd.TimeCode(64.0)) == UsdGeom.Tokens.invisible
 
 
+def test_fixed_camera_usd_export_writes_static_main_camera(tmp_path: Path) -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD camera checks")
+    from pxr import Usd
+
+    trimesh = pytest.importorskip("trimesh")
+    usdc_path = tmp_path / "scene.usdc"
+    mesh_path = tmp_path / "object.glb"
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(mesh_path))
+
+    moving_wildgs_poses = []
+    for frame in range(5):
+        T = np.eye(4, dtype=np.float64)
+        T[:3, 3] = [0.0, 0.0, float(frame) * 2.0]
+        if frame == 4:
+            T[1, 3] = 2.0
+        moving_wildgs_poses.append(
+            {
+                "frame": frame,
+                "T_world_from_cam": T.tolist(),
+                "intrinsics": {"fx": 100.0, "fy": 100.0, "cx": 50.0, "cy": 40.0},
+            }
+        )
+    cam_traj = [
+        {
+            "frame_id": frame + 1,
+            "K": [[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]],
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, float(frame) * 2.0],
+        }
+        for frame in range(5)
+    ]
+    corrected = {
+        "obj_000001": {
+            "frames": [
+                {
+                    "frame_id": 1,
+                    "timestamp_sec": 0.0,
+                    "centroid_world": [0.0, 0.0, 4.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+                {
+                    "frame_id": 5,
+                    "timestamp_sec": 1.0,
+                    "centroid_world": [0.0, 0.0, 12.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+            ]
+        }
+    }
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = type("Context", (), {"artifacts": {}})()
+    ProjectExecutor._export_usdc(
+        executor,
+        usdc_path,
+        {"obj_000001": {"files": [{"format": "glb", "path": str(mesh_path)}]}},
+        corrected,
+        None,
+        moving_wildgs_poses,
+        cam_traj,
+        fixed_camera_reference_frame_id=3,
+        fixed_camera_road_plane={"normal_world": [0.0, 1.0, 0.0], "offset": 0.0},
+    )
+
+    stage = Usd.Stage.Open(str(usdc_path))
+    camera = stage.GetPrimAtPath("/World/Cameras/MainCamera")
+
+    assert camera.GetAttribute("xformOp:translate").GetTimeSamples() == []
+    assert camera.GetAttribute("xformOp:orient").GetTimeSamples() == []
+    obj_translate = stage.GetPrimAtPath("/World/Objects/obj_000001").GetAttribute("xformOp:translate")
+    assert obj_translate.GetTimeSamples() == [1.0, 5.0]
+    assert np.allclose(obj_translate.Get(Usd.TimeCode(1.0)), obj_translate.Get(Usd.TimeCode(5.0)), atol=1e-5)
+
+
 def test_temporal_candidate_trajectory_prefers_smooth_pose_over_visual_outlier() -> None:
     frame_candidates = {
         1: [_pose_record(frame_id=1, x=0.0, yaw_deg=0.0, score=0.80)],

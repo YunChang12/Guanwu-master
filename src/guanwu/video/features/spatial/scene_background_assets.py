@@ -447,6 +447,15 @@ def load_background_asset_meshes(
         return []
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     assets = data.get("assets", {})
+    background_mesh = assets.get("background_mesh") or assets.get("global_fused_background_mesh")
+    if background_mesh:
+        path = Path(background_mesh)
+        if path.exists():
+            if "road_surface_mesh" in assets or "static_background_mesh" in assets:
+                assets.pop("road_surface_mesh", None)
+                assets.pop("static_background_mesh", None)
+                manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return [("background", path)]
     depth_bg = assets.get("depth_background_glb") or assets.get("depth_background_mesh")
     if depth_bg:
         path = Path(depth_bg)
@@ -509,8 +518,7 @@ def _build_multiframe_global_background_assets(
         return None
 
     out_dir = depth_background_path.parent
-    road_out = out_dir / "road_surface_global_multiframe_v1.glb"
-    static_out = out_dir / "static_background_multiframe_no_road_v1.glb"
+    background_out = out_dir / "background_global_fused_v1.glb"
     mask_out = out_dir / "road_support_global_multiframe_v1.png"
     try:
         source_mtimes = [
@@ -527,8 +535,8 @@ def _build_multiframe_global_background_assets(
                 source_mtimes.append(Path(raw).stat().st_mtime)
         source_mtimes.extend(path.stat().st_mtime for path in depth_files)
         source_mtime = max(source_mtimes)
-        if road_out.exists() and static_out.exists() and min(road_out.stat().st_mtime, static_out.stat().st_mtime) >= source_mtime:
-            return [("road_surface", road_out), ("static_background", static_out)]
+        if background_out.exists() and background_out.stat().st_mtime >= source_mtime:
+            return [("background", background_out)]
     except OSError:
         pass
 
@@ -569,42 +577,53 @@ def _build_multiframe_global_background_assets(
     )
     seam_pixels = int(np.count_nonzero(road_surface_mask & ~road_support))
 
-    road_mesh = _build_road_surface_mesh_from_mask(
-        rgb=rgb,
+    static_depth = _robust_multiframe_depth(depth_stack)
+    final_depth = static_depth.copy()
+    road_plane_depth = _road_plane_depth_map_for_mask(
         road_mask=road_surface_mask,
         camera=camera,
         road_plane=road_plane,
     )
-    if road_mesh is None:
+    road_depth_valid = np.isfinite(road_plane_depth) & (road_plane_depth > 1e-6)
+    road_surface_valid = road_surface_mask & road_depth_valid
+    if int(np.count_nonzero(road_surface_valid)) == 0:
         return None
-
-    static_depth = _robust_multiframe_depth(depth_stack)
-    static_mask = np.isfinite(static_depth) & (static_depth > 1e-6) & (~static_remove)
-    static_mesh = _build_masked_depth_mesh(
+    static_valid = np.isfinite(static_depth) & (static_depth > 1e-6)
+    static_mask = static_valid & (~road_surface_mask)
+    final_depth[road_surface_valid] = road_plane_depth[road_surface_valid]
+    final_valid = static_mask | road_surface_valid
+    background_mesh = _build_masked_depth_mesh(
         rgb=rgb,
-        depth=static_depth,
-        mask=static_mask,
+        depth=final_depth,
+        mask=final_valid,
         camera=camera,
         grid_stride=4,
         max_depth=120.0,
     )
-    if static_mesh is None:
+    if background_mesh is None:
         return None
 
     try:
-        road_mesh.export(str(road_out))
-        static_mesh.export(str(static_out))
+        background_mesh.export(str(background_out))
         Image.fromarray((road_support.astype(np.uint8) * 255)).save(mask_out)
-        manifest.setdefault("assets", {})["road_surface_mesh"] = str(road_out)
-        manifest["assets"]["static_background_mesh"] = str(static_out)
+        manifest.setdefault("assets", {})["background_mesh"] = str(background_out)
+        manifest["assets"]["global_fused_background_mesh"] = str(background_out)
+        manifest["assets"]["road_support_mask"] = str(mask_out)
+        manifest["assets"].pop("road_surface_mesh", None)
+        manifest["assets"].pop("static_background_mesh", None)
         quality = manifest.setdefault("quality", {})
+        quality["background_mode"] = "global_fused_single_mesh"
+        quality["road_depth_source"] = "global_road_plane"
+        quality["static_depth_source"] = "robust_multiframe_depth"
         quality["road_surface_extra_seam_pixels"] = seam_pixels
         quality["road_surface_mask_fraction"] = float(np.mean(road_surface_mask))
-        quality["static_background_removed_fraction"] = float(np.mean(static_remove))
+        quality["static_background_removed_fraction"] = float(np.mean(road_surface_mask))
+        quality["background_mesh_vertex_count"] = int(len(background_mesh.vertices))
+        quality["background_mesh_face_count"] = int(len(background_mesh.faces))
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         return None
-    return [("road_surface", road_out), ("static_background", static_out)]
+    return [("background", background_out)]
 
 
 def _depth_map_files(depth_maps_dir: Path) -> list[Path]:
@@ -1310,6 +1329,30 @@ def _build_road_surface_mesh_from_mask(
     mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=np.float32), faces=np.asarray(faces, dtype=np.int64), process=False)
     mesh.visual = ColorVisuals(mesh=mesh, vertex_colors=np.asarray(colors, dtype=np.uint8))
     return mesh
+
+
+def _road_plane_depth_map_for_mask(
+    *,
+    road_mask: np.ndarray,
+    camera: dict[str, Any],
+    road_plane: dict[str, Any],
+) -> np.ndarray:
+    height, width = road_mask.shape[:2]
+    depth = np.full((height, width), np.nan, dtype=np.float64)
+    ys, xs = np.nonzero(road_mask.astype(bool))
+    if len(xs) == 0:
+        return depth
+    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
+    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+    for y, x in zip(ys.tolist(), xs.tolist(), strict=False):
+        point = _camera_pixel_ray_plane_intersection(float(x), float(y), camera, road_plane)
+        if point is None:
+            continue
+        point_cam = rotation.T @ (np.asarray(point, dtype=np.float64).reshape(3) - translation)
+        z = float(point_cam[2])
+        if math.isfinite(z) and z > 1e-6:
+            depth[int(y), int(x)] = z
+    return depth
 
 
 def _camera_pixel_ray_plane_intersection(

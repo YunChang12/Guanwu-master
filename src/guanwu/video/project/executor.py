@@ -8090,6 +8090,8 @@ class ProjectExecutor:
         cam_traj,
         bg_meshes=None,
         conversion_report_path=None,
+        fixed_camera_reference_frame_id=None,
+        fixed_camera_road_plane=None,
     ):
         import numpy as np
         from pxr import Usd, UsdGeom, Gf, Sdf, Vt
@@ -8134,6 +8136,97 @@ class ProjectExecutor:
             except Exception:
                 return False
             return bool(np.all(np.isfinite(arr)))
+        def _camera_pose_record_for_frame(frame_id: int):
+            target_wildgs_frame = int(frame_id) - 1
+            if wildgs_poses:
+                exact = next((p for p in wildgs_poses if int(p.get("frame", -999999)) == target_wildgs_frame), None)
+                pose = exact or min(wildgs_poses, key=lambda p: abs(int(p.get("frame", -999999)) - target_wildgs_frame))
+                T = pose.get("T_world_from_cam")
+                if T is not None:
+                    try:
+                        matrix = np.asarray(T, dtype=np.float64).reshape(4, 4)
+                    except Exception:
+                        matrix = None
+                    if matrix is not None and np.all(np.isfinite(matrix)):
+                        return pose, matrix
+            if cam_traj:
+                exact = next((p for p in cam_traj if int(p.get("frame_id", -999999)) == int(frame_id)), None)
+                pose = exact or min(cam_traj, key=lambda p: abs(int(p.get("frame_id", -999999)) - int(frame_id)))
+                try:
+                    rotation = np.asarray(pose.get("R"), dtype=np.float64).reshape(3, 3)
+                    translation = np.asarray(pose.get("t"), dtype=np.float64).reshape(3)
+                except Exception:
+                    return None, None
+                matrix = np.eye(4, dtype=np.float64)
+                matrix[:3, :3] = rotation
+                matrix[:3, 3] = translation
+                if np.all(np.isfinite(matrix)):
+                    return pose, matrix
+            return None, None
+
+        fixed_camera_reference_frame_id = (
+            int(fixed_camera_reference_frame_id)
+            if fixed_camera_reference_frame_id is not None and int(fixed_camera_reference_frame_id) > 0
+            else None
+        )
+        fixed_camera_reference_pose = None
+        fixed_camera_T_ref = None
+        fixed_camera_road_normal = None
+        fixed_camera_road_offset = None
+        if isinstance(fixed_camera_road_plane, dict):
+            try:
+                fixed_camera_road_normal = np.asarray(fixed_camera_road_plane.get("normal_world"), dtype=np.float64).reshape(3)
+                fixed_camera_road_norm = float(np.linalg.norm(fixed_camera_road_normal))
+                if fixed_camera_road_norm > 1e-8:
+                    fixed_camera_road_normal = fixed_camera_road_normal / fixed_camera_road_norm
+                    fixed_camera_road_offset = float(fixed_camera_road_plane.get("offset", 0.0))
+                else:
+                    fixed_camera_road_normal = None
+            except Exception:
+                fixed_camera_road_normal = None
+                fixed_camera_road_offset = None
+        if fixed_camera_reference_frame_id is not None:
+            fixed_camera_reference_pose, fixed_camera_T_ref = _camera_pose_record_for_frame(fixed_camera_reference_frame_id)
+            if fixed_camera_T_ref is None:
+                fixed_camera_reference_frame_id = None
+
+        def _fixed_camera_grounded_pose(frame_id: int, rotation, translation, local_vertices, scale):
+            rot_world, trans_world = _fixed_camera_world_pose(frame_id, rotation, translation)
+            if fixed_camera_T_ref is None or fixed_camera_road_normal is None or fixed_camera_road_offset is None:
+                return rot_world, trans_world
+            try:
+                local = np.asarray(local_vertices, dtype=np.float64)
+                scale_arr = np.asarray(scale, dtype=np.float64).reshape(3)
+                transformed = (rot_world @ (local * scale_arr[None, :]).T).T
+            except Exception:
+                return rot_world, trans_world
+            if transformed.ndim != 2 or transformed.shape[0] == 0 or transformed.shape[1] != 3:
+                return rot_world, trans_world
+            bottom_rel = float(np.min(transformed @ fixed_camera_road_normal))
+            if not np.isfinite(bottom_rel):
+                return rot_world, trans_world
+            bottom_distance = float(fixed_camera_road_normal @ trans_world + fixed_camera_road_offset + bottom_rel)
+            if not np.isfinite(bottom_distance):
+                return rot_world, trans_world
+            trans_world = trans_world - fixed_camera_road_normal * bottom_distance
+            return rot_world, trans_world
+
+        def _fixed_camera_world_pose(frame_id: int, rotation, translation):
+            rot_world = np.eye(3, dtype=np.float64) if rotation is None else np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+            trans_world = np.asarray(translation, dtype=np.float64).reshape(3)
+            if fixed_camera_T_ref is None:
+                return rot_world, trans_world
+            _, T_frame = _camera_pose_record_for_frame(int(frame_id))
+            if T_frame is None:
+                return rot_world, trans_world
+            try:
+                correction = fixed_camera_T_ref @ np.linalg.inv(T_frame)
+            except np.linalg.LinAlgError:
+                return rot_world, trans_world
+            out_rot = correction[:3, :3] @ rot_world
+            out_trans = correction[:3, :3] @ trans_world + correction[:3, 3]
+            return out_rot, out_trans
+
 
         stage = Usd.Stage.CreateNew(str(usdc_path))
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
@@ -8195,7 +8288,12 @@ class ProjectExecutor:
             ground_plane_offset_world=0.0,
             stage_up_axis="Y",
         )
-        coord_report = build_coordinate_report(coord_convention, camera_track=wildgs_poses or cam_traj)
+        report_camera_track = [fixed_camera_reference_pose] if fixed_camera_reference_pose is not None else (wildgs_poses or cam_traj)
+        coord_report = build_coordinate_report(coord_convention, camera_track=report_camera_track)
+        coord_report["fixed_camera"] = {
+            "enabled": fixed_camera_reference_frame_id is not None,
+            "reference_frame_id": fixed_camera_reference_frame_id,
+        }
         if conversion_report_path is not None:
             Path(conversion_report_path).write_text(json.dumps(coord_report, indent=2), encoding="utf-8")
 
@@ -8238,7 +8336,7 @@ class ProjectExecutor:
                 _set_normals(mesh_prim, convert_world_normals_to_usd(normals, coord_convention))
 
         # Camera animation
-        if wildgs_poses:
+        if wildgs_poses or cam_traj:
             UsdGeom.Xform.Define(stage, "/World/Cameras")
             cam = UsdGeom.Camera.Define(stage, "/World/Cameras/MainCamera")
             cam_xf = UsdGeom.Xformable(cam.GetPrim())
@@ -8269,16 +8367,35 @@ class ProjectExecutor:
                 cam.CreateHorizontalApertureAttr().Set(float(h_aperture))
                 cam.CreateVerticalApertureAttr().Set(float(v_aperture))
                 cam.CreateFocalLengthAttr().Set(float((focal_h + focal_v) * 0.5))
-            for wp in wildgs_poses:
-                frame_num = float(wp.get("frame", 0)) + 1
-                T = wp.get("T_world_from_cam")
-                if T:
-                    T_usd = convert_cv_camera_pose_to_usd(T, coord_convention)
-                    cam_translate.Set(
-                        Gf.Vec3d(float(T_usd[0, 3]), float(T_usd[1, 3]), float(T_usd[2, 3])),
-                        frame_num,
-                    )
-                    _set_quat(cam_orient, T_usd[:3, :3], frame_num)
+            if fixed_camera_T_ref is not None:
+                T_usd = convert_cv_camera_pose_to_usd(fixed_camera_T_ref, coord_convention)
+                cam_translate.Set(Gf.Vec3d(float(T_usd[0, 3]), float(T_usd[1, 3]), float(T_usd[2, 3])))
+                _set_quat(cam_orient, T_usd[:3, :3])
+            else:
+                for wp in wildgs_poses:
+                    frame_num = float(wp.get("frame", 0)) + 1
+                    T = wp.get("T_world_from_cam")
+                    if T:
+                        T_usd = convert_cv_camera_pose_to_usd(T, coord_convention)
+                        cam_translate.Set(
+                            Gf.Vec3d(float(T_usd[0, 3]), float(T_usd[1, 3]), float(T_usd[2, 3])),
+                            frame_num,
+                        )
+                        _set_quat(cam_orient, T_usd[:3, :3], frame_num)
+                if not wildgs_poses and cam_traj:
+                    for pose in cam_traj:
+                        frame_num = float(pose.get("frame_id", 0) or 0)
+                        if frame_num <= 0:
+                            continue
+                        _, T = _camera_pose_record_for_frame(int(frame_num))
+                        if T is None:
+                            continue
+                        T_usd = convert_cv_camera_pose_to_usd(T, coord_convention)
+                        cam_translate.Set(
+                            Gf.Vec3d(float(T_usd[0, 3]), float(T_usd[1, 3]), float(T_usd[2, 3])),
+                            frame_num,
+                        )
+                        _set_quat(cam_orient, T_usd[:3, :3], frame_num)
 
         # Load object attrs + labels for metadata
         attr_artifact = self.context.artifacts.get("object.attr")
@@ -8359,16 +8476,24 @@ class ProjectExecutor:
             for rec in frames:
                 frame_num = float(rec.get("frame_id", 0))
                 cx, cy, cz = rec["centroid_world"]
-                rot_usd, trans_usd = convert_world_pose_to_usd(
+                scale = np.asarray(rec.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64).reshape(3)
+
+                rot_world, trans_world = _fixed_camera_grounded_pose(
+                    int(frame_num),
                     rec.get("rotation_matrix"),
                     [cx, cy, cz],
+                    verts,
+                    scale,
+                )
+                rot_usd, trans_usd = convert_world_pose_to_usd(
+                    rot_world,
+                    trans_world,
                     coord_convention,
                 )
                 tr_op.Set(
                     Gf.Vec3d(float(trans_usd[0]), float(trans_usd[1]), float(trans_usd[2])),
                     frame_num,
                 )
-                scale = np.asarray(rec.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64).reshape(3)
                 vis_scale.Set(
                     Gf.Vec3f(float(scale[0]), float(scale[1]), float(scale[2])),
                     frame_num,
@@ -8693,6 +8818,19 @@ class ProjectExecutor:
             cam_traj = self._json_load(geometry.outputs["camera_trajectory"]) if geometry else []
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
 
+            fixed_camera_reference_frame_id = None
+            fixed_camera_road_plane = None
+            if pose_road_geometry_path and Path(pose_road_geometry_path).exists():
+                try:
+                    road_geometry = self._json_load(pose_road_geometry_path)
+                except Exception:
+                    road_geometry = {}
+                if str(road_geometry.get("default_plane_policy", "")).strip().lower() == "global_for_fixed_camera":
+                    fixed_camera_reference_frame_id = self._background_assets_target_frame_id(geometry)
+                    if fixed_camera_reference_frame_id is None:
+                        fixed_camera_reference_frame_id = self._pose_target_frame_id() or 1
+                    fixed_camera_road_plane = select_road_plane_for_frame(road_geometry, int(fixed_camera_reference_frame_id), policy="global_for_fixed_camera")
+
             usdc_path = out_dir / "scene.usdc"
             conversion_report_path = out_dir / "conversion_report.json"
             coord_report = self._export_usdc(
@@ -8704,6 +8842,8 @@ class ProjectExecutor:
                 cam_traj,
                 bg_meshes=bg_meshes,
                 conversion_report_path=conversion_report_path,
+                fixed_camera_reference_frame_id=fixed_camera_reference_frame_id,
+                fixed_camera_road_plane=fixed_camera_road_plane,
             )
 
             outputs = {"usdc": str(usdc_path), "conversion_report": str(conversion_report_path)}

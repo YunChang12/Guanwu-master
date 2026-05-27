@@ -43,6 +43,7 @@ from guanwu.video.features.spatial.scene_background_assets import (
     generate_target_frame_background_assets,
     load_background_asset_meshes,
 )
+from guanwu.video.features.temporal.trajectory_smoothing import smooth_object_trajectories
 from guanwu.video.features.simulation.usd_coordinate_convention import (
     USDCoordinateConvention,
     build_coordinate_report,
@@ -414,7 +415,7 @@ class ProjectExecutor:
     ) -> dict[str, tuple[FrameDetections, DetectedInstance]]:
         """Return the frame with highest visibility score per object.
 
-        Score = instance.score * bbox_area (in pixels²).
+        Score favors confident, large-enough, centered, non-truncated object views.
         Iterates all geometry.lift frames and picks the best for each object.
         """
         geometry = self.context.artifacts.get("geometry.lift")
@@ -422,7 +423,7 @@ class ProjectExecutor:
             raise RuntimeError("geometry.lift outputs are required")
         summary = self._json_load(geometry.outputs["summary"])
 
-        best: dict[str, tuple[float, FrameDetections, DetectedInstance]] = {}
+        best: dict[str, tuple[tuple[int, float], FrameDetections, DetectedInstance]] = {}
         for entry in summary.get("frames", []):
             det_path = entry.get("detections")
             if not det_path:
@@ -436,14 +437,143 @@ class ProjectExecutor:
                 obj_id = inst.object_id
                 if obj_id not in object_ids:
                     continue
-                b = inst.bbox
-                area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-                score = inst.score * area
+                score_info = self._mesh_frame_selection_score(inst)
+                score = (0 if score_info["truncated"] else 1, float(score_info["score"]))
                 prev = best.get(obj_id)
                 if prev is None or score > prev[0]:
                     best[obj_id] = (score, detections, inst)
 
         return {oid: (fd, inst) for oid, (_, fd, inst) in best.items()}
+
+    @staticmethod
+    def _mesh_frame_image_size(inst: DetectedInstance | dict) -> tuple[float | None, float | None]:
+        def get_value(key: str) -> object:
+            if isinstance(inst, dict):
+                return inst.get(key)
+            return getattr(inst, key, None)
+
+        width = get_value("image_width") or get_value("width")
+        height = get_value("image_height") or get_value("height")
+        if width is not None and height is not None:
+            try:
+                return float(width), float(height)
+            except (TypeError, ValueError):
+                return None, None
+
+        mask_rle = get_value("mask_rle")
+        if mask_rle is None:
+            return None, None
+        try:
+            rle = json.loads(mask_rle) if isinstance(mask_rle, str) else mask_rle
+        except Exception:
+            return None, None
+        if not isinstance(rle, dict):
+            return None, None
+        size = rle.get("size")
+        if not isinstance(size, (list, tuple)) or len(size) < 2:
+            return None, None
+        try:
+            return float(size[1]), float(size[0])
+        except (TypeError, ValueError):
+            return None, None
+
+    @staticmethod
+    def _mesh_frame_selection_score(inst: DetectedInstance | dict) -> dict[str, float | bool]:
+        def get_value(key: str) -> object:
+            if isinstance(inst, dict):
+                return inst.get(key)
+            return getattr(inst, key, None)
+
+        bbox = get_value("bbox_xyxy") or get_value("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return {
+                "score": 0.0,
+                "truncated": True,
+                "area_px": 0.0,
+                "edge_margin_px": 0.0,
+                "edge_score": 0.1,
+                "center_score": 0.1,
+                "size_score": 0.0,
+            }
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        except (TypeError, ValueError):
+            return {
+                "score": 0.0,
+                "truncated": True,
+                "area_px": 0.0,
+                "edge_margin_px": 0.0,
+                "edge_score": 0.1,
+                "center_score": 0.1,
+                "size_score": 0.0,
+            }
+
+        width = max(x2 - x1, 0.0)
+        height = max(y2 - y1, 0.0)
+        area = width * height
+        if area <= 0.0:
+            return {
+                "score": 0.0,
+                "truncated": True,
+                "area_px": 0.0,
+                "edge_margin_px": 0.0,
+                "edge_score": 0.1,
+                "center_score": 0.1,
+                "size_score": 0.0,
+            }
+
+        image_width, image_height = ProjectExecutor._mesh_frame_image_size(inst)
+        edge_margin = min(x1, y1)
+        right_gap = bottom_gap = None
+        if image_width is not None:
+            right_gap = image_width - 1.0 - x2
+            edge_margin = min(edge_margin, right_gap)
+        if image_height is not None:
+            bottom_gap = image_height - 1.0 - y2
+            edge_margin = min(edge_margin, bottom_gap)
+        edge_margin = max(float(edge_margin), 0.0)
+
+        explicit_truncated = bool(get_value("is_truncated") or get_value("truncated"))
+        truncation_info = get_value("truncation_info")
+        if isinstance(truncation_info, dict):
+            explicit_truncated = explicit_truncated or bool(
+                truncation_info.get("is_truncated") or truncation_info.get("touches_image_border")
+            )
+        touches_border = (
+            x1 <= 1.0
+            or y1 <= 1.0
+            or (right_gap is not None and right_gap <= 1.0)
+            or (bottom_gap is not None and bottom_gap <= 1.0)
+        )
+        truncated = bool(explicit_truncated or touches_border)
+
+        size_score = min(area / 12000.0, 1.0)
+        if area < 2500.0:
+            size_score *= max(area / 2500.0, 0.1)
+
+        edge_score = max(0.1, min(edge_margin / 24.0, 1.0))
+        if truncated:
+            edge_score *= 0.2
+
+        center_score = 1.0
+        if image_width is not None and image_height is not None and image_width > 0.0 and image_height > 0.0:
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            dx = abs(cx - 0.5 * image_width) / max(0.5 * image_width, 1.0)
+            dy = abs(cy - 0.5 * image_height) / max(0.5 * image_height, 1.0)
+            center_score = max(0.25, 1.0 - 0.5 * (dx + dy))
+
+        confidence_score = max(float(get_value("score") or 0.0), 0.05)
+        score = confidence_score * size_score * edge_score * center_score
+        return {
+            "score": float(score),
+            "truncated": truncated,
+            "area_px": float(area),
+            "edge_margin_px": float(edge_margin),
+            "edge_score": float(edge_score),
+            "center_score": float(center_score),
+            "size_score": float(size_score),
+        }
 
     def _reconstruct_object_meshes(
         self,
@@ -478,10 +608,7 @@ class ProjectExecutor:
     ) -> float:
         _ = obj
         _, inst = frame_data
-        bbox = list(inst.bbox) if inst.bbox else [0.0, 0.0, 0.0, 0.0]
-        area = max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
-        visibility = self._instance_anchor_visibility({"bbox": bbox})
-        return max(float(inst.score or 0.0), 0.05) * max(area, 1.0) * max(visibility, 0.1)
+        return float(self._mesh_frame_selection_score(inst)["score"])
 
     def _select_zaiwu_mesh_candidates(
         self,
@@ -1374,6 +1501,17 @@ class ProjectExecutor:
                 fd, inst = frame_data
                 entry["reconstruction_frame_idx"] = fd.frame_idx
                 entry["mask_rle"] = inst.mask_rle
+                selection = self._mesh_frame_selection_score(inst)
+                entry["mesh_frame_selection"] = {
+                    "frame_idx": fd.frame_idx,
+                    "score": selection["score"],
+                    "truncated": selection["truncated"],
+                    "area_px": selection["area_px"],
+                    "edge_margin_px": selection["edge_margin_px"],
+                    "edge_score": selection["edge_score"],
+                    "center_score": selection["center_score"],
+                    "size_score": selection["size_score"],
+                }
         self._json_dump(meshes_path, meshes)
         outputs = {"sam3d_meshes": str(meshes_path)}
         summary = {
@@ -1957,7 +2095,6 @@ class ProjectExecutor:
                 }
                 skipped_objects += 1
                 continue
-            selected_target_objects += 1
 
             if not all_frames_mode:
                 frame_ids = self._pose_temporal_window_frame_ids(
@@ -1977,6 +2114,33 @@ class ProjectExecutor:
                 }
                 skipped_objects += 1
                 continue
+            first_pose_frame_id = int(min(frame_ids))
+            first_pose_inst = self._get_instance_for_frame(obj_id, first_pose_frame_id, detection_frames)
+            first_truncation_decision = self._pose_first_frame_truncation_skip_decision(
+                first_pose_inst,
+                frame_id=first_pose_frame_id,
+            )
+            if first_truncation_decision.get("skip_object"):
+                manifest["objects"][obj_id] = {
+                    "status": "skipped",
+                    "reason": first_truncation_decision.get("reason"),
+                    "target_frame_mode": target_frame_mode,
+                    "target_frame_id": target_frame_id,
+                    "first_pose_frame_id": first_pose_frame_id,
+                    "truncated_sides": first_truncation_decision.get("truncated_sides", []),
+                    "truncation_severity": first_truncation_decision.get("truncation_severity"),
+                    "low_observability": first_truncation_decision.get("low_observability"),
+                    "frame_ids": frame_ids,
+                    "frames": {
+                        f"frame_{first_pose_frame_id:06d}": {
+                            "status": "skipped",
+                            **first_truncation_decision,
+                        }
+                    },
+                }
+                skipped_objects += 1
+                continue
+            selected_target_objects += 1
 
             seed_track, seed_meta = self._build_edge_pose_seed_track(
                 obj_id=obj_id,
@@ -2817,6 +2981,81 @@ class ProjectExecutor:
             radius += 1
         return max(int(min_radius), min(int(max_radius), int(radius)))
 
+    @staticmethod
+    def _pose_first_frame_truncation_skip_decision(inst: dict | None, *, frame_id: int) -> dict:
+        inst = inst if isinstance(inst, dict) else {}
+        truncated = bool(inst.get("is_truncated") or inst.get("truncated"))
+        low_observability = False
+        severity = ""
+        sides: set[str] = set()
+
+        truncation_info = inst.get("truncation_info")
+        if isinstance(truncation_info, dict):
+            truncated = truncated or bool(
+                truncation_info.get("is_truncated")
+                or truncation_info.get("touches_image_border")
+                or truncation_info.get("low_observability")
+            )
+            low_observability = bool(truncation_info.get("low_observability"))
+            severity = str(
+                truncation_info.get("truncation_severity")
+                or truncation_info.get("severity")
+                or ""
+            ).lower()
+            raw_sides = truncation_info.get("truncation_sides") or truncation_info.get("sides") or []
+            if isinstance(raw_sides, str):
+                raw_sides = [raw_sides]
+            if isinstance(raw_sides, (list, tuple, set)):
+                sides.update(str(side).strip().lower() for side in raw_sides if str(side).strip())
+
+        bbox = inst.get("bbox_xyxy") or inst.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+                width = inst.get("image_width") or inst.get("width")
+                height = inst.get("image_height") or inst.get("height")
+                if (width is None or height is None) and inst.get("mask_rle"):
+                    try:
+                        rle = json.loads(inst["mask_rle"]) if isinstance(inst["mask_rle"], str) else inst["mask_rle"]
+                        size = rle.get("size") if isinstance(rle, dict) else None
+                        if isinstance(size, (list, tuple)) and len(size) >= 2:
+                            height, width = int(size[0]), int(size[1])
+                    except Exception:
+                        pass
+                if width is not None and height is not None:
+                    w = float(width)
+                    h = float(height)
+                    if x1 <= 1.0:
+                        sides.add("left")
+                    if y1 <= 1.0:
+                        sides.add("top")
+                    if x2 >= w - 1.0:
+                        sides.add("right")
+                    if y2 >= h - 1.0:
+                        sides.add("bottom")
+                    truncated = truncated or bool(sides)
+            except Exception:
+                pass
+
+        if not severity:
+            if low_observability or len(sides) >= 2 or "bottom" in sides:
+                severity = "severe"
+            elif sides:
+                severity = "light"
+            elif truncated:
+                severity = "unknown"
+
+        if not truncated:
+            return {"skip_object": False, "reason": "first_pose_frame_observable", "frame_id": int(frame_id)}
+        return {
+            "skip_object": True,
+            "reason": "first_pose_frame_truncated",
+            "frame_id": int(frame_id),
+            "truncated_sides": sorted(sides),
+            "truncation_severity": severity or "unknown",
+            "low_observability": bool(low_observability),
+        }
+
     def _build_pose_track_observations(
         self,
         *,
@@ -3536,6 +3775,8 @@ class ProjectExecutor:
         corrected_trajectories: dict[str, list[dict]] = {}
         manifest: list[dict] = []
         traj_path = out_dir / "corrected_trajectories.json"
+        raw_traj_path = out_dir / "corrected_trajectories.raw.json"
+        smoothing_report_path = out_dir / "trajectory_smoothing_report.json"
         manifest_path = out_dir / "scene_manifest.json"
         frame_scene_manifest_path = out_dir / "frame_scene_manifest.json"
 
@@ -3570,7 +3811,12 @@ class ProjectExecutor:
             corrected_trajectories = scene_manifest["corrected_trajectories"]
             manifest = scene_manifest["manifest"]
             placed = scene_manifest["placed"]
-            self._json_dump(traj_path, corrected_trajectories)
+            corrected_trajectories, smoothing_report = self._smooth_scene_corrected_trajectories(
+                corrected_trajectories,
+                raw_traj_path=raw_traj_path,
+                smoothed_traj_path=traj_path,
+                smoothing_report_path=smoothing_report_path,
+            )
             self._json_dump(manifest_path, manifest)
             self._json_dump(frame_scene_manifest_path, scene_manifest["frame_manifest"])
 
@@ -3586,6 +3832,8 @@ class ProjectExecutor:
                 "composed_scene_glb": str(glb_path),
                 "composed_scene_viewer_glb": str(viewer_glb_path),
                 "corrected_trajectories": str(traj_path),
+                "corrected_trajectories_raw": str(raw_traj_path),
+                "trajectory_smoothing_report": str(smoothing_report_path),
                 "scene_manifest": str(manifest_path),
                 "frame_scene_manifest": str(frame_scene_manifest_path),
             }
@@ -3596,6 +3844,12 @@ class ProjectExecutor:
                 "background_source": "background_assets" if bg_meshes else "wildgs",
                 "pose_source": self._pose_source_from_tracks(pose_tracks),
                 "selected_frame_id": selected_frame_id,
+                "trajectory_smoothing": {
+                    "corrected_translation_outliers": smoothing_report.get("corrected_translation_outliers", 0),
+                    "corrected_rotation_outliers": smoothing_report.get("corrected_rotation_outliers", 0),
+                    "max_translation_adjust_m": smoothing_report.get("max_translation_adjust_m", 0.0),
+                    "max_rotation_adjust_deg": smoothing_report.get("max_rotation_adjust_deg", 0.0),
+                },
             }
             return self._base_result(
                 "scene.compose",
@@ -3902,7 +4156,12 @@ class ProjectExecutor:
             glb_path.write_bytes(b"")
             viewer_glb_path.write_bytes(b"")
 
-        self._json_dump(traj_path, corrected_trajectories)
+        corrected_trajectories, smoothing_report = self._smooth_scene_corrected_trajectories(
+            corrected_trajectories,
+            raw_traj_path=raw_traj_path,
+            smoothed_traj_path=traj_path,
+            smoothing_report_path=smoothing_report_path,
+        )
 
         self._json_dump(manifest_path, manifest)
 
@@ -3910,12 +4169,45 @@ class ProjectExecutor:
             "composed_scene_glb": str(glb_path),
             "composed_scene_viewer_glb": str(viewer_glb_path),
             "corrected_trajectories": str(traj_path),
+            "corrected_trajectories_raw": str(raw_traj_path),
+            "trajectory_smoothing_report": str(smoothing_report_path),
             "scene_manifest": str(manifest_path),
         }
-        summary = {"placed_objects": placed, "total_objects": len(sam3d_meshes), "has_background": bg_mesh_path is not None}
+        summary = {
+            "placed_objects": placed,
+            "total_objects": len(sam3d_meshes),
+            "has_background": bg_mesh_path is not None,
+            "trajectory_smoothing": {
+                "corrected_translation_outliers": smoothing_report.get("corrected_translation_outliers", 0),
+                "corrected_rotation_outliers": smoothing_report.get("corrected_rotation_outliers", 0),
+                "max_translation_adjust_m": smoothing_report.get("max_translation_adjust_m", 0.0),
+                "max_rotation_adjust_deg": smoothing_report.get("max_rotation_adjust_deg", 0.0),
+            },
+        }
         return self._base_result("scene.compose", summary, outputs)
 
     # ── scene.compose helpers ──
+
+    def _smooth_scene_corrected_trajectories(
+        self,
+        corrected_trajectories: dict,
+        *,
+        raw_traj_path: Path,
+        smoothed_traj_path: Path,
+        smoothing_report_path: Path,
+    ) -> tuple[dict, dict]:
+        self._json_dump(raw_traj_path, corrected_trajectories)
+        smoothed, report = smooth_object_trajectories(corrected_trajectories)
+        self._json_dump(smoothed_traj_path, smoothed)
+        self._json_dump(smoothing_report_path, report)
+        _logger.info(
+            "[scene.compose] trajectory smoothing: translation_outliers=%s rotation_outliers=%s max_translation=%.3fm max_rotation=%.2fdeg",
+            report.get("corrected_translation_outliers", 0),
+            report.get("corrected_rotation_outliers", 0),
+            float(report.get("max_translation_adjust_m", 0.0) or 0.0),
+            float(report.get("max_rotation_adjust_deg", 0.0) or 0.0),
+        )
+        return smoothed, report
 
     @staticmethod
     def _scene_glb_viewer_coordinate_convention() -> USDCoordinateConvention:

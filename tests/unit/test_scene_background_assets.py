@@ -12,6 +12,7 @@ import trimesh
 from guanwu.video.features.spatial.scene_background_assets import (
     _fill_low_candidate_dynamic_regions,
     _estimate_global_road_plane_from_semantic_depth,
+    _road_surface_mask_for_static_gap,
     build_dynamic_mask,
     expand_road_mask_with_side_boundaries,
     build_road_full_mask_from_visible,
@@ -182,6 +183,26 @@ def test_build_road_full_mask_keeps_perspective_narrow_road_connected_to_top() -
     assert not full[0, 130]
     assert full[79, 40]
     assert full[79, 150]
+
+
+def test_road_surface_mask_covers_static_background_removal_ring() -> None:
+    road = np.zeros((32, 48), dtype=bool)
+    road[8:30, 18:31] = True
+    static_remove = cv2.dilate(road.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
+    static_guard = np.zeros_like(road)
+    static_guard[:, :4] = True
+
+    render_mask = _road_surface_mask_for_static_gap(
+        road_support=road,
+        static_remove=static_remove,
+        static_guard_mask=static_guard,
+    )
+
+    seam_ring = static_remove & ~road & ~static_guard
+    assert np.count_nonzero(seam_ring) > 0
+    assert np.all(render_mask[seam_ring])
+    assert np.all(render_mask[road])
+    assert not render_mask[0, 0]
 
 
 def test_expand_road_mask_with_side_boundaries_ignores_clipped_rows_and_extends_to_bottom() -> None:

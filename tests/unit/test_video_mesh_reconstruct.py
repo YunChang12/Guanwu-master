@@ -43,7 +43,7 @@ def _build_mesh_reconstruct_executor(tmp_path: Path) -> ProjectExecutor:
         instances.append(
             DetectedInstance(
                 mask_ref=f"mask://frame_00001/{object_id}",
-                bbox=[0.0, 0.0, width, 10.0],
+                bbox=[10.0, 10.0, 10.0 + width, 20.0],
                 object_id=object_id,
                 concept_label="car",
                 segment_kind="object",
@@ -113,6 +113,88 @@ def _build_mesh_reconstruct_executor(tmp_path: Path) -> ProjectExecutor:
     return executor
 
 
+def test_mesh_reconstruct_best_frame_prefers_complete_view_over_larger_border_frame(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo_project"
+    config = ProjectConfig(
+        project=ProjectMetadata(
+            project_id="demo_project",
+            name="demo_project",
+            input_video="/tmp/demo.mp4",
+            root_dir=str(project_root),
+            provider_mode="zaiwu",
+            video_copy_mode="copy",
+        ),
+    )
+    context = ProjectContext.create(project_root, config)
+    executor = ProjectExecutor(context)
+
+    geometry_dir = context.stage_output_dir("geometry.lift")
+    summary_path = geometry_dir / "summary.json"
+
+    def _write_detections(frame_idx: int, bbox: list[float], score: float) -> Path:
+        detections_path = geometry_dir / f"frame_{frame_idx:06d}_detections.json"
+        detections_path.write_text(
+            json.dumps(
+                FrameDetections(
+                    frame_idx=frame_idx,
+                    timestamp=frame_idx / 30.0,
+                    image_b64="ZmFrZQ==",
+                    instances=[
+                        DetectedInstance(
+                            mask_ref=f"mask://frame_{frame_idx:05d}/obj_000012",
+                            bbox=bbox,
+                            object_id="obj_000012",
+                            concept_label="suv",
+                            segment_kind="object",
+                            score=score,
+                            mask_rle={"size": [360, 640], "counts": f"frame-{frame_idx}"},
+                        )
+                    ],
+                ).model_dump(mode="json"),
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return detections_path
+
+    frame14_path = _write_detections(14, [491.0, 144.0, 623.0, 253.0], 0.596)
+    frame16_path = _write_detections(16, [502.0, 157.0, 639.0, 286.0], 0.607)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {"frame_idx": 14, "timestamp": 14 / 30.0, "detections": str(frame14_path)},
+                    {"frame_idx": 16, "timestamp": 16 / 30.0, "detections": str(frame16_path)},
+                ],
+                "latest_objects": [
+                    ObjectNode(
+                        object_id="obj_000012",
+                        label="suv",
+                        confidence=0.9,
+                        segment_kind="object",
+                    ).model_dump(mode="json")
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    context.artifacts.set(
+        ArtifactRecord(
+            stage="geometry.lift",
+            created_at="2026-05-26T00:00:00Z",
+            inputs_hash="geometry",
+            params_hash="geometry",
+            outputs={"summary": str(summary_path)},
+            summary={},
+        )
+    )
+
+    best_frames = executor._find_best_frame_per_object({"obj_000012"})
+
+    assert best_frames["obj_000012"][0].frame_idx == 14
+
+
 def test_mesh_reconstruct_attempts_all_zaiwu_movable_rigid_candidates(tmp_path: Path, monkeypatch) -> None:
     executor = _build_mesh_reconstruct_executor(tmp_path)
     attempted_ids: list[str] = []
@@ -146,6 +228,9 @@ def test_mesh_reconstruct_attempts_all_zaiwu_movable_rigid_candidates(tmp_path: 
     assert result["summary"]["failed_count"] == 4
     assert result["summary"]["skipped_count"] == 0
     assert set(meshes_payload) == {"obj_000005"}
+    assert meshes_payload["obj_000005"]["mesh_frame_selection"]["frame_idx"] == 1
+    assert meshes_payload["obj_000005"]["mesh_frame_selection"]["truncated"] is False
+    assert meshes_payload["obj_000005"]["mesh_frame_selection"]["area_px"] == 500.0
 
 
 def test_mesh_reconstruct_uses_extended_sam3d_per_object_timeout(tmp_path: Path, monkeypatch) -> None:

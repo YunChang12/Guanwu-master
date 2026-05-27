@@ -2662,6 +2662,53 @@ def test_pose_all_frame_candidate_frame_ids_read_detection_file(tmp_path: Path) 
     assert frame_ids == [7]
 
 
+def test_pose_first_frame_truncation_skip_decision_rejects_explicit_truncation() -> None:
+    decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(
+        {
+            "object_id": "obj_000001",
+            "label": "car",
+            "is_truncated": True,
+            "bbox_xyxy": [20.0, 30.0, 120.0, 130.0],
+        },
+        frame_id=1,
+    )
+
+    assert decision["skip_object"] is True
+    assert decision["reason"] == "first_pose_frame_truncated"
+    assert decision["frame_id"] == 1
+
+
+def test_pose_first_frame_truncation_skip_decision_detects_image_border() -> None:
+    decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(
+        {
+            "object_id": "obj_000001",
+            "label": "car",
+            "bbox_xyxy": [0.0, 30.0, 120.0, 130.0],
+            "image_width": 640,
+            "image_height": 360,
+        },
+        frame_id=1,
+    )
+
+    assert decision["skip_object"] is True
+    assert "left" in decision["truncated_sides"]
+
+
+def test_pose_first_frame_truncation_skip_decision_allows_clear_first_frame() -> None:
+    decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(
+        {
+            "object_id": "obj_000001",
+            "label": "car",
+            "bbox_xyxy": [20.0, 30.0, 120.0, 130.0],
+            "image_width": 640,
+            "image_height": 360,
+        },
+        frame_id=1,
+    )
+
+    assert decision["skip_object"] is False
+
+
 def test_pose_dynamic_window_radius_expands_for_truncated_or_small_targets() -> None:
     large_clear = {
         "bbox_xyxy": [120.0, 80.0, 260.0, 180.0],

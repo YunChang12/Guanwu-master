@@ -556,21 +556,28 @@ def _build_multiframe_global_background_assets(
     if int(np.count_nonzero(road_support)) == 0:
         return None
 
-    road_mesh = _build_road_surface_mesh_from_mask(
-        rgb=rgb,
-        road_mask=road_support,
-        camera=camera,
-        road_plane=road_plane,
-    )
-    if road_mesh is None:
-        return None
-
     static_remove_radius = max(1, min(2, int(round(width * 0.003))))
     static_remove_kernel = np.ones((static_remove_radius * 2 + 1, static_remove_radius * 2 + 1), dtype=np.uint8)
     static_remove = cv2.dilate(road_support.astype(np.uint8), static_remove_kernel, iterations=1) > 0
     if dynamic_mask is not None:
         near_road = cv2.dilate(road_support.astype(np.uint8), np.ones((13, 13), dtype=np.uint8), iterations=1) > 0
         static_remove |= dynamic_mask & near_road
+    road_surface_mask = _road_surface_mask_for_static_gap(
+        road_support=road_support,
+        static_remove=static_remove,
+        static_guard_mask=static_guard_mask,
+    )
+    seam_pixels = int(np.count_nonzero(road_surface_mask & ~road_support))
+
+    road_mesh = _build_road_surface_mesh_from_mask(
+        rgb=rgb,
+        road_mask=road_surface_mask,
+        camera=camera,
+        road_plane=road_plane,
+    )
+    if road_mesh is None:
+        return None
+
     static_depth = _robust_multiframe_depth(depth_stack)
     static_mask = np.isfinite(static_depth) & (static_depth > 1e-6) & (~static_remove)
     static_mesh = _build_masked_depth_mesh(
@@ -588,6 +595,13 @@ def _build_multiframe_global_background_assets(
         road_mesh.export(str(road_out))
         static_mesh.export(str(static_out))
         Image.fromarray((road_support.astype(np.uint8) * 255)).save(mask_out)
+        manifest.setdefault("assets", {})["road_surface_mesh"] = str(road_out)
+        manifest["assets"]["static_background_mesh"] = str(static_out)
+        quality = manifest.setdefault("quality", {})
+        quality["road_surface_extra_seam_pixels"] = seam_pixels
+        quality["road_surface_mask_fraction"] = float(np.mean(road_surface_mask))
+        quality["static_background_removed_fraction"] = float(np.mean(static_remove))
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         return None
     return [("road_surface", road_out), ("static_background", static_out)]
@@ -814,6 +828,23 @@ def _semantic_road_support_mask(
     road = _bottom_connected_mask(road)
     if static_guard is not None:
         road &= ~static_guard
+    return road
+
+
+def _road_surface_mask_for_static_gap(
+    *,
+    road_support: np.ndarray,
+    static_remove: np.ndarray,
+    static_guard_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    road = road_support.astype(bool).copy()
+    if static_remove is None or static_remove.shape != road.shape:
+        return road
+    seam_ring = static_remove.astype(bool) & ~road
+    if static_guard_mask is not None and static_guard_mask.shape == road.shape:
+        seam_ring &= ~static_guard_mask.astype(bool)
+    if seam_ring.any():
+        road |= seam_ring
     return road
 
 

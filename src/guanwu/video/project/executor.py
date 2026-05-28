@@ -112,6 +112,36 @@ _EDGE_POSE_TRUNCATION_METRIC_KEYS = (
     "severe_truncation_gate_passed",
     "severe_truncation_gate_reasons",
 )
+_GENERIC_POSE_METRIC_KEYS = (
+    "soft_mask_iou",
+    "mask_blend_score",
+    "contour_score",
+    "edge_score",
+    "edge_confidence",
+    "depth_score",
+    "depth_confidence",
+    "depth_error",
+    "valid_depth_ratio",
+    "appearance_score",
+    "appearance_confidence",
+    "color_soft_iou",
+    "color_precision",
+    "color_recall",
+    "background_leakage",
+    "fg_bg_distance",
+    "temporal_score",
+    "generic_temporal_loss",
+    "scale_prior_score",
+    "optional_prior_score",
+    "support_plane_confidence",
+    "observation_score",
+    "optional_prior_gate",
+    "projection_valid_ratio",
+    "visible_ratio",
+    "truncation_ratio",
+    "acceptance_status",
+    "reject_reasons",
+)
 
 
 class ProjectExecutor:
@@ -1555,7 +1585,7 @@ class ProjectExecutor:
         target_frame_id = self._pose_target_frame_id()
         target_window_radius = self._pose_target_window_radius()
         pose_strategy = self._pose_optimizer_mode()
-        if pose_strategy == "edge_contour_fast_temporal":
+        if pose_strategy in {"edge_contour_fast_temporal", "generic_appearance_temporal"}:
             return self._run_edge_contour_temporal_pose_optimize(
                 out_dir=out_dir,
                 sam3d_meshes=sam3d_meshes,
@@ -1570,6 +1600,7 @@ class ProjectExecutor:
                 scene_up=scene_up,
                 target_frame_id=target_frame_id,
                 target_window_radius=target_window_radius,
+                pose_strategy=pose_strategy,
             )
         object_pose_tracks: dict[str, dict] = {}
         per_frame_object_poses: dict[str, dict] = {}
@@ -1821,6 +1852,8 @@ class ProjectExecutor:
     def _pose_optimizer_mode() -> str:
         raw = os.environ.get("GUANWU_POSE_OPTIMIZER_MODE", "edge_contour_fast_temporal")
         value = str(raw or "").strip().lower().replace("-", "_")
+        if value in {"generic", "generic_appearance", "generic_appearance_temporal"}:
+            return "generic_appearance_temporal"
         if value in {"depth", "depth_temporal", "depth_icp", "depth_icp_temporal"}:
             return "depth_icp_temporal"
         return "edge_contour_fast_temporal"
@@ -1959,9 +1992,12 @@ class ProjectExecutor:
         scene_up,
         target_frame_id: int | None,
         target_window_radius: int,
+        pose_strategy: str = "edge_contour_fast_temporal",
     ) -> dict:
         import numpy as np
 
+        pose_strategy = str(pose_strategy or "edge_contour_fast_temporal")
+        generic_mode = pose_strategy == "generic_appearance_temporal"
         target_frame_mode = self._pose_target_frame_mode()
         all_frames_mode = target_frame_mode == "all_frames"
         dynamic_window_enabled = self._pose_env_bool("GUANWU_POSE_DYNAMIC_WINDOW", default=all_frames_mode)
@@ -1991,7 +2027,7 @@ class ProjectExecutor:
         pose_quality_report: dict[str, dict] = {}
         manifest: dict[str, dict] = {
             "schema": "guanwu.pose_track.v1",
-            "strategy": "edge_contour_fast_temporal",
+            "strategy": pose_strategy,
             "target_frame_mode": target_frame_mode,
             "target_frame_id": target_frame_id,
             "target_window_radius": target_window_radius,
@@ -2003,18 +2039,29 @@ class ProjectExecutor:
             "target_object_ids": sorted(target_object_ids) if target_object_ids else None,
             "max_target_objects": max_target_objects,
             "resume_results": resume_results,
-            "acceptance": {
-                "bbox_area_hard_filter": False,
-                "mask_iou_min": 0.20,
-                "bbox_iou_min": 0.20,
-                "bbox_center_error_px_max": 120.0,
-                "temporal_jump_rejection": True,
-                "upright_angle_error_deg_max": 35.0,
-                "ground_contact_max_abs_m_max": 0.65,
-                "bbox_bottom_ground_distance_m_max": 1.25,
-                "lock_mesh_up_sign": True,
-                "lock_mesh_forward_sign": False,
-            },
+            "acceptance": (
+                {
+                    "min_visible_mask_iou": 0.12,
+                    "min_bbox_iou": 0.10,
+                    "max_center_error_px": "max(120, 0.35*bbox_diag)",
+                    "min_projection_valid_ratio": 0.50,
+                    "depth_gate_when_confident": True,
+                    "road_heading_ground_upright_hard_gates": False,
+                }
+                if generic_mode
+                else {
+                    "bbox_area_hard_filter": False,
+                    "mask_iou_min": 0.20,
+                    "bbox_iou_min": 0.20,
+                    "bbox_center_error_px_max": 120.0,
+                    "temporal_jump_rejection": True,
+                    "upright_angle_error_deg_max": 35.0,
+                    "ground_contact_max_abs_m_max": 0.65,
+                    "bbox_bottom_ground_distance_m_max": 1.25,
+                    "lock_mesh_up_sign": True,
+                    "lock_mesh_forward_sign": False,
+                }
+            ),
             "objects": {},
         }
 
@@ -2051,11 +2098,16 @@ class ProjectExecutor:
                     obj_id=obj_id,
                     detection_frames=detection_frames,
                     min_bbox_area_px=_POSE_MATCH_MIN_BBOX_AREA_PX,
+                    generic_mode=generic_mode,
                 )
                 if not frame_ids:
                     manifest["objects"][obj_id] = {
                         "status": "skipped",
-                        "reason": "missing_vehicle_observations_above_bbox_threshold",
+                        "reason": (
+                            "missing_generic_observations_above_bbox_threshold"
+                            if generic_mode
+                            else "missing_vehicle_observations_above_bbox_threshold"
+                        ),
                         "target_frame_mode": target_frame_mode,
                         "min_bbox_area_px": _POSE_MATCH_MIN_BBOX_AREA_PX,
                     }
@@ -2067,10 +2119,10 @@ class ProjectExecutor:
                 target_inst = self._get_instance_for_frame(obj_id, int(target_frame_id), detection_frames)
                 target_bbox = (target_inst or {}).get("bbox_xyxy") or (target_inst or {}).get("bbox")
                 target_obs = {"bbox": target_bbox, "bbox_area_px": self._bbox_area_px(target_bbox)}
-                if not self._is_target_frame_vehicle_candidate(target_inst, target_obs):
+                if not self._is_target_pose_candidate(target_inst, target_obs, generic_mode=generic_mode):
                     manifest["objects"][obj_id] = {
                         "status": "skipped",
-                        "reason": "missing_target_vehicle_observation",
+                        "reason": "missing_target_generic_observation" if generic_mode else "missing_target_vehicle_observation",
                         "target_frame_id": target_frame_id,
                         "target_bbox_area_px": target_obs["bbox_area_px"],
                     }
@@ -2120,7 +2172,7 @@ class ProjectExecutor:
                 first_pose_inst,
                 frame_id=first_pose_frame_id,
             )
-            if first_truncation_decision.get("skip_object"):
+            if first_truncation_decision.get("skip_object") and not generic_mode:
                 manifest["objects"][obj_id] = {
                     "status": "skipped",
                     "reason": first_truncation_decision.get("reason"),
@@ -2165,7 +2217,7 @@ class ProjectExecutor:
                 mesh_basis = np.eye(3, dtype=np.float64).tolist()
             axis_roles = seed_meta.get("axis_roles") or self._infer_source_axis_roles(verts)
             mesh_axis_prior = self._mesh_axis_prior_for_pose_optimizer(verts, axis_roles=axis_roles)
-            heading_info = seed_meta.get("heading") or {"source": "edge_contour_fast_temporal"}
+            heading_info = seed_meta.get("heading") or {"source": pose_strategy}
 
             accepted_records: list[dict] = []
             object_attempted = 0
@@ -2263,6 +2315,16 @@ class ProjectExecutor:
                     ),
                     target_window_radius=target_window_radius,
                 )
+                if generic_mode:
+                    vehicle_pose_context = {
+                        "schema": "generic_pose_context.v1",
+                        "object_id": obj_id,
+                        "frame_id": int(frame_id),
+                        "support_plane": "auto",
+                    }
+                    depth_map_path = self._resolve_depth_map_for_frame(depth_maps_dir, int(frame_id))
+                    if depth_map_path:
+                        vehicle_pose_context["depth_map_path"] = str(depth_map_path)
                 vehicle_pose_context["temporal_window"] = {
                     "mode": target_frame_mode,
                     "base_radius": int(target_window_radius),
@@ -2307,7 +2369,11 @@ class ProjectExecutor:
                         "reused_optimizer_result": True,
                     }
                 else:
-                    run_info = self._run_edge_contour_fast(task_dir, result_dir)
+                    run_info = (
+                        self._run_generic_appearance_temporal(task_dir, result_dir)
+                        if generic_mode
+                        else self._run_edge_contour_fast(task_dir, result_dir)
+                    )
                     report_path = result_dir / "optimization_report.json"
                 record_base = {
                     "frame_id": int(frame_id),
@@ -2324,10 +2390,14 @@ class ProjectExecutor:
                         **record_base,
                     }
                     frame_records[f"frame_{int(frame_id):06d}"] = failed_record
-                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
-                        failed_record,
-                        inst=inst,
-                        frame_id=int(frame_id),
+                    object_fail_fast = (
+                        {"skip_object": False, "reason": "generic_mode"}
+                        if generic_mode
+                        else self._pose_truncated_object_fail_fast_decision(
+                            failed_record,
+                            inst=inst,
+                            frame_id=int(frame_id),
+                        )
                     )
                     if object_fail_fast.get("skip_object"):
                         break
@@ -2347,18 +2417,30 @@ class ProjectExecutor:
                         **record_base,
                     }
                     frame_records[f"frame_{int(frame_id):06d}"] = failed_record
-                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
-                        failed_record,
-                        inst=inst,
-                        frame_id=int(frame_id),
+                    object_fail_fast = (
+                        {"skip_object": False, "reason": "generic_mode"}
+                        if generic_mode
+                        else self._pose_truncated_object_fail_fast_decision(
+                            failed_record,
+                            inst=inst,
+                            frame_id=int(frame_id),
+                        )
                     )
                     if object_fail_fast.get("skip_object"):
                         break
                     continue
 
-                decision = self._pose_optimizer_acceptance(report)
+                decision = (
+                    self._generic_pose_optimizer_acceptance(report)
+                    if generic_mode
+                    else self._pose_optimizer_acceptance(report)
+                )
                 if decision.get("accepted"):
-                    jump_decision = self._pose_optimizer_temporal_jump_acceptance(report, previous_accepted)
+                    jump_decision = self._pose_optimizer_temporal_jump_acceptance(
+                        report,
+                        previous_accepted,
+                        generic_mode=generic_mode,
+                    )
                     if not jump_decision.get("accepted"):
                         decision = jump_decision
 
@@ -2385,7 +2467,11 @@ class ProjectExecutor:
                 accepted_candidate_records = []
                 for candidate_record in candidate_records:
                     candidate_report = self._pose_optimizer_report_from_candidate(report, candidate_record)
-                    candidate_decision = self._pose_optimizer_acceptance(candidate_report)
+                    candidate_decision = (
+                        self._generic_pose_optimizer_acceptance(candidate_report)
+                        if generic_mode
+                        else self._pose_optimizer_acceptance(candidate_report)
+                    )
                     candidate_record["base_acceptance"] = candidate_decision
                     if candidate_decision.get("accepted"):
                         accepted_candidate_records.append(candidate_record)
@@ -2395,7 +2481,11 @@ class ProjectExecutor:
                 pose_record["reason"] = decision.get("reason", "")
 
                 if decision.get("accepted"):
-                    anchor_decision = self._pose_anchor_temporal_gate(pose_record, previous_anchor)
+                    anchor_decision = (
+                        {"accepted": True, "reason": "generic_mode"}
+                        if generic_mode
+                        else self._pose_anchor_temporal_gate(pose_record, previous_anchor)
+                    )
                     pose_record["anchor_temporal_gate"] = anchor_decision
                     if not anchor_decision.get("accepted"):
                         decision = anchor_decision
@@ -2463,10 +2553,14 @@ class ProjectExecutor:
                     rejected_frames += 1
                     object_rejected += 1
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
-                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
-                        pose_record,
-                        inst=inst,
-                        frame_id=int(frame_id),
+                    object_fail_fast = (
+                        {"skip_object": False, "reason": "generic_mode"}
+                        if generic_mode
+                        else self._pose_truncated_object_fail_fast_decision(
+                            pose_record,
+                            inst=inst,
+                            frame_id=int(frame_id),
+                        )
                     )
                     if object_fail_fast.get("skip_object"):
                         break
@@ -2501,16 +2595,20 @@ class ProjectExecutor:
                 selected_records, trajectory_selection_summary = self._select_edge_pose_candidate_trajectory(
                     candidate_records_by_frame,
                     target_frame_id=target_frame_id,
+                    generic_mode=generic_mode,
                 )
                 has_required_target = all_frames_mode or any(
                     int(rec.get("frame_id") or 0) == int(target_frame_id) for rec in selected_records
                 )
                 if selected_records and has_required_target:
-                    selected_records, anchor_gate_summary = self._apply_anchor_temporal_gate_to_selected_records(
-                        selected_records,
-                        frame_ids=frame_ids,
-                        frame_records=frame_records,
-                    )
+                    if generic_mode:
+                        anchor_gate_summary = {"applied": False, "reason": "generic_mode"}
+                    else:
+                        selected_records, anchor_gate_summary = self._apply_anchor_temporal_gate_to_selected_records(
+                            selected_records,
+                            frame_ids=frame_ids,
+                            frame_records=frame_records,
+                        )
                     if anchor_gate_summary.get("applied"):
                         trajectory_selection_summary["anchor_temporal_gate"] = anchor_gate_summary
                     accepted_records = selected_records
@@ -2560,7 +2658,7 @@ class ProjectExecutor:
                 "selection": trajectory_selection_summary,
                 "stabilization": stabilization_summary,
             }
-            frames = [self._edge_pose_track_frame(record) for record in accepted_records]
+            frames = [self._edge_pose_track_frame(record, pose_source=pose_strategy) for record in accepted_records]
             frames = [frame for frame in frames if frame is not None]
             frames.sort(key=lambda item: int(item.get("frame_id") or 0))
             if not frames:
@@ -2584,7 +2682,7 @@ class ProjectExecutor:
                 "schema": "guanwu.object_pose_track.v1",
                 "object_id": obj_id,
                 "mesh_path": str(glb_path),
-                "pose_source": "edge_contour_fast_temporal",
+                "pose_source": pose_strategy,
                 "mesh_basis": mesh_basis,
                 "axis_roles": axis_roles,
                 "scale": track_scale,
@@ -2592,7 +2690,7 @@ class ProjectExecutor:
                 "orientation_quat": target_frame["orientation_quat"],
                 "heading": heading_info,
                 "target_frame_refinement": {
-                    "status": "edge_contour_fast_temporal",
+                    "status": pose_strategy,
                     "mode": target_frame_mode,
                     "target_frame_id": target_frame_id,
                     "window_radius": target_window_radius,
@@ -2650,7 +2748,7 @@ class ProjectExecutor:
                 "target_frame_id": target_frame_id,
                 "target_confidence": float(target_frame.get("confidence", 0.0) or 0.0),
                 "target_metrics": target_record.get("metrics", {}),
-                "pose_source": "edge_contour_fast_temporal",
+                "pose_source": pose_strategy,
             }
 
         object_tracks_path = out_dir / "object_pose_tracks.json"
@@ -2690,7 +2788,7 @@ class ProjectExecutor:
             "reused_pose_frame_count": reused_frames,
             "per_frame_count": len(per_frame_object_poses),
             "road_geometry_available": bool((road_geometry or {}).get("available")),
-            "strategy": "edge_contour_fast_temporal",
+            "strategy": pose_strategy,
             "target_frame_mode": target_frame_mode,
             "target_frame_id": target_frame_id,
             "target_window_radius": target_window_radius,
@@ -2711,7 +2809,7 @@ class ProjectExecutor:
             summary,
             outputs,
             params={
-                "strategy": "edge_contour_fast_temporal",
+                "strategy": pose_strategy,
                 "target_frame_mode": target_frame_mode,
                 "target_frame_id": target_frame_id,
                 "target_window_radius": target_window_radius,
@@ -2877,6 +2975,7 @@ class ProjectExecutor:
         obj_id: str,
         detection_frames: list[dict],
         min_bbox_area_px: float,
+        generic_mode: bool = False,
     ) -> list[int]:
         frame_range = ProjectExecutor._pose_frame_id_range_filter()
         frame_ids: list[int] = []
@@ -2905,7 +3004,7 @@ class ProjectExecutor:
                 obs = {"bbox": bbox, "bbox_area_px": ProjectExecutor._bbox_area_px(bbox)}
                 if obs["bbox_area_px"] < float(min_bbox_area_px):
                     continue
-                if not ProjectExecutor._is_target_frame_vehicle_candidate(inst, obs):
+                if not ProjectExecutor._is_target_pose_candidate(inst, obs, generic_mode=generic_mode):
                     continue
                 frame_ids.append(frame_id)
                 break
@@ -3515,6 +3614,35 @@ class ProjectExecutor:
         touches_top = y1 <= 1.0 and height <= 24.0
         wide_static = aspect > 4.2 and height < 55.0
         return not (touches_top or wide_static)
+
+    @staticmethod
+    def _is_target_pose_candidate(inst: dict | None, obs: dict, *, generic_mode: bool = False) -> bool:
+        if not generic_mode:
+            return ProjectExecutor._is_target_frame_vehicle_candidate(inst, obs)
+        if not isinstance(inst, dict):
+            return False
+        label = str(
+            inst.get("concept_label")
+            or inst.get("label")
+            or inst.get("class_name")
+            or inst.get("category")
+            or ""
+        ).lower()
+        static_terms = ("road", "lane", "sidewalk", "sky", "wall", "floor", "ceiling")
+        if any(term in label for term in static_terms):
+            return False
+        bbox = obs.get("bbox") or inst.get("bbox_xyxy") or inst.get("bbox")
+        if not bbox or len(bbox) < 4:
+            return False
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        except Exception:
+            return False
+        width = max(x2 - x1, 0.0)
+        height = max(y2 - y1, 0.0)
+        if width <= 0.0 or height <= 0.0:
+            return False
+        return width * height >= 250.0
 
     @staticmethod
     def _pose_center_from_depth_and_ground(source, target_points, rotation, scale, scene_up, road_geometry, frame_id):
@@ -4573,7 +4701,12 @@ class ProjectExecutor:
         }
 
     @staticmethod
-    def _pose_optimizer_temporal_jump_acceptance(report: dict, previous: dict | None) -> dict:
+    def _pose_optimizer_temporal_jump_acceptance(
+        report: dict,
+        previous: dict | None,
+        *,
+        generic_mode: bool = False,
+    ) -> dict:
         import numpy as np
 
         if previous is None:
@@ -4590,27 +4723,30 @@ class ProjectExecutor:
         translation = np.asarray(pose.get("translation_world"), dtype=np.float64)
         prev_translation = np.asarray(prev_pose.get("translation_world"), dtype=np.float64)
         jump_m = float(np.linalg.norm(translation - prev_translation))
-        if jump_m > max(4.0, 2.2 * dt):
+        translation_limit = max(4.0, 2.2 * dt) if not generic_mode else max(4.0, 2.5 * dt)
+        if jump_m > translation_limit:
             return {"accepted": False, "reason": f"temporal_translation_jump:{jump_m:.3f}m"}
 
         rotation = pose.get("rotation_matrix")
         prev_rotation = prev_pose.get("rotation_matrix")
         if isinstance(rotation, list) and isinstance(prev_rotation, list):
             jump_deg = ProjectExecutor._rotation_geodesic_deg(rotation, prev_rotation)
-            if math.isfinite(jump_deg) and jump_deg > max(55.0, 35.0 * dt):
+            rotation_limit = max(55.0, 35.0 * dt) if not generic_mode else max(90.0, 55.0 * dt)
+            if math.isfinite(jump_deg) and jump_deg > rotation_limit:
                 return {"accepted": False, "reason": f"temporal_rotation_jump:{jump_deg:.1f}deg"}
-            up_axis = ProjectExecutor._pose_report_axis_idx(report, "up_axis_idx", "shortest_axis")
-            if up_axis is not None:
-                try:
-                    cur = np.asarray(rotation, dtype=np.float64)[:, int(up_axis)]
-                    prev = np.asarray(prev_rotation, dtype=np.float64)[:, int(up_axis)]
-                    dot = float(cur @ prev) / max(float(np.linalg.norm(cur) * np.linalg.norm(prev)), 1e-8)
-                    dot = max(-1.0, min(1.0, dot))
-                    up_jump_deg = math.degrees(math.acos(dot))
-                    if up_jump_deg > max(40.0, 25.0 * dt):
-                        return {"accepted": False, "reason": f"temporal_up_flip:{up_jump_deg:.1f}deg"}
-                except Exception:
-                    return {"accepted": False, "reason": "invalid_temporal_up_axis"}
+            if not generic_mode:
+                up_axis = ProjectExecutor._pose_report_axis_idx(report, "up_axis_idx", "shortest_axis")
+                if up_axis is not None:
+                    try:
+                        cur = np.asarray(rotation, dtype=np.float64)[:, int(up_axis)]
+                        prev = np.asarray(prev_rotation, dtype=np.float64)[:, int(up_axis)]
+                        dot = float(cur @ prev) / max(float(np.linalg.norm(cur) * np.linalg.norm(prev)), 1e-8)
+                        dot = max(-1.0, min(1.0, dot))
+                        up_jump_deg = math.degrees(math.acos(dot))
+                        if up_jump_deg > max(40.0, 25.0 * dt):
+                            return {"accepted": False, "reason": f"temporal_up_flip:{up_jump_deg:.1f}deg"}
+                    except Exception:
+                        return {"accepted": False, "reason": "invalid_temporal_up_axis"}
 
         scale = pose.get("scale")
         prev_scale = prev_pose.get("scale")
@@ -4619,7 +4755,8 @@ class ProjectExecutor:
             prev_scale_arr = np.asarray(prev_scale, dtype=np.float64)
             ratio = scale_arr / np.maximum(prev_scale_arr, 1e-6)
             max_ratio = float(max(np.max(ratio), np.max(1.0 / np.maximum(ratio, 1e-6))))
-            if max_ratio > 1.8:
+            max_scale_ratio = 2.2 if generic_mode else 1.8
+            if max_ratio > max_scale_ratio:
                 return {"accepted": False, "reason": f"temporal_scale_jump:{max_ratio:.3f}x"}
         return {"accepted": True, "reason": "accepted"}
 
@@ -4653,6 +4790,7 @@ class ProjectExecutor:
         }
         record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
         record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_TRUNCATION_METRIC_KEYS if key in metrics})
+        record_metrics.update({key: metrics.get(key) for key in _GENERIC_POSE_METRIC_KEYS if key in metrics})
         return {
             "object_id": obj_id,
             "frame_id": int(frame_id),
@@ -4727,6 +4865,7 @@ class ProjectExecutor:
             }
             record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_HEADING_METRIC_KEYS if key in metrics})
             record_metrics.update({key: metrics.get(key) for key in _EDGE_POSE_TRUNCATION_METRIC_KEYS if key in metrics})
+            record_metrics.update({key: metrics.get(key) for key in _GENERIC_POSE_METRIC_KEYS if key in metrics})
             record = {
                 "object_id": obj_id,
                 "frame_id": int(frame_id),
@@ -4760,7 +4899,7 @@ class ProjectExecutor:
         return report
 
     @staticmethod
-    def _edge_pose_track_frame(record: dict) -> dict | None:
+    def _edge_pose_track_frame(record: dict, pose_source: str = "edge_contour_fast_temporal") -> dict | None:
         import numpy as np
 
         pose = record.get("pose", {})
@@ -4787,8 +4926,8 @@ class ProjectExecutor:
             "scale": [float(v) for v in scale],
             "T_world_from_object": T.tolist(),
             "confidence": confidence,
-            "source": "edge_contour_fast_temporal",
-            "geometry_status": "edge_contour_fast_temporal",
+            "source": pose_source,
+            "geometry_status": pose_source,
             "quality": {
                 "pose_optimizer_report": record.get("report"),
                 "pose_optimizer_output_dir": record.get("output_dir"),
@@ -4857,10 +4996,14 @@ class ProjectExecutor:
 
     @staticmethod
     def _pose_record_updates_temporal_anchor(record: dict) -> bool:
+        if ProjectExecutor._pose_record_is_generic(record):
+            return ProjectExecutor._pose_record_is_generic_anchor(record)
         return ProjectExecutor._pose_record_is_high_quality_anchor(record)
 
     @staticmethod
     def _pose_record_promotes_temporal_candidate(record: dict, *, stable_streak_count: int = 0) -> bool:
+        if ProjectExecutor._pose_record_is_generic(record):
+            return ProjectExecutor._pose_record_is_generic_anchor(record)
         if ProjectExecutor._pose_record_is_high_quality_anchor(record):
             return True
         return (
@@ -4869,7 +5012,42 @@ class ProjectExecutor:
         )
 
     @staticmethod
+    def _pose_record_is_generic(record: dict) -> bool:
+        metrics = record.get("metrics") if isinstance(record, dict) and isinstance(record.get("metrics"), dict) else {}
+        return any(key in metrics for key in ("appearance_score", "depth_score", "projection_valid_ratio", "observation_score"))
+
+    @staticmethod
+    def _pose_record_is_generic_anchor(record: dict) -> bool:
+        if not isinstance(record, dict):
+            return False
+        if str(record.get("status") or "accepted") != "accepted":
+            return False
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        try:
+            mask_iou = float(metrics.get("visible_mask_iou") or metrics.get("soft_mask_iou") or metrics.get("mask_iou") or 0.0)
+            bbox_iou = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            center_error = float(metrics.get("bbox_center_error_px") or 1e9)
+            projection_valid_ratio = float(metrics.get("projection_valid_ratio") or 0.0)
+            appearance = float(metrics.get("appearance_score") or 0.0) * float(metrics.get("appearance_confidence") or 0.0)
+            depth = float(metrics.get("depth_score") or 0.0) * float(metrics.get("depth_confidence") or 0.0)
+        except Exception:
+            return False
+        pose = record.get("pose") if isinstance(record.get("pose"), dict) else {}
+        return (
+            mask_iou >= 0.35
+            and bbox_iou >= 0.30
+            and center_error <= 100.0
+            and projection_valid_ratio >= 0.50
+            and (appearance >= 0.12 or depth >= 0.20 or mask_iou >= 0.55)
+            and ProjectExecutor._valid_vec3_like(pose.get("translation_world"))
+            and ProjectExecutor._valid_vec3_like(pose.get("scale"))
+            and isinstance(pose.get("rotation_matrix"), list)
+        )
+
+    @staticmethod
     def _pose_record_is_stable_temporal_anchor(record: dict) -> bool:
+        if ProjectExecutor._pose_record_is_generic(record):
+            return ProjectExecutor._pose_record_is_generic_anchor(record)
         if not isinstance(record, dict):
             return False
         if str(record.get("status") or "accepted") != "accepted":
@@ -4951,6 +5129,8 @@ class ProjectExecutor:
 
     @staticmethod
     def _pose_temporal_anchor_kind(record: dict) -> str | None:
+        if ProjectExecutor._pose_record_is_generic_anchor(record):
+            return "generic_visual"
         if ProjectExecutor._pose_record_is_high_quality_anchor(record):
             return "high_quality"
         if ProjectExecutor._pose_record_is_stable_temporal_anchor(record):
@@ -5453,6 +5633,7 @@ class ProjectExecutor:
         frame_candidates: dict[int, list[dict]],
         *,
         target_frame_id: int | None,
+        generic_mode: bool = False,
     ) -> tuple[list[dict], dict]:
         import copy
         import numpy as np
@@ -5480,6 +5661,20 @@ class ProjectExecutor:
             score = float(metrics.get("score") or 0.0)
             mask = float(metrics.get("visible_mask_iou") or metrics.get("mask_iou") or 0.0)
             bbox = float(metrics.get("visible_bbox_iou") or metrics.get("bbox_iou") or 0.0)
+            if generic_mode:
+                appearance = float(metrics.get("appearance_score") or 0.0) * float(metrics.get("appearance_confidence") or 0.0)
+                depth = float(metrics.get("depth_score") or 0.0) * float(metrics.get("depth_confidence") or 0.0)
+                temporal = float(metrics.get("temporal_score") or 0.0)
+                center = float(metrics.get("bbox_center_error_px") or 120.0)
+                return (
+                    -score
+                    -0.55 * mask
+                    -0.20 * bbox
+                    -0.18 * appearance
+                    -0.18 * depth
+                    -0.10 * temporal
+                    + 0.003 * min(center, 240.0)
+                )
             severity = str(metrics.get("truncation_severity") or "")
             severe = severity == "severe" or bool(metrics.get("low_observability"))
             truncated = severe or severity in {"light", "moderate"}
@@ -6311,11 +6506,25 @@ class ProjectExecutor:
         return all(math.isfinite(v) for v in vals)
 
     def _run_edge_contour_fast(self, task_dir: Path, result_dir: Path) -> dict:
+        return self._run_pose_optimizer_cli(
+            task_dir,
+            result_dir,
+            config_filename="edge_contour_fast_quick.yaml",
+        )
+
+    def _run_generic_appearance_temporal(self, task_dir: Path, result_dir: Path) -> dict:
+        return self._run_pose_optimizer_cli(
+            task_dir,
+            result_dir,
+            config_filename="generic_appearance_temporal.yaml",
+        )
+
+    def _run_pose_optimizer_cli(self, task_dir: Path, result_dir: Path, *, config_filename: str) -> dict:
         guanwu_root = Path(__file__).resolve().parents[4]
         bundled_optimizer_root = guanwu_root / "process" / "pose_optimizer"
         workspace_root = guanwu_root if bundled_optimizer_root.exists() else guanwu_root.parent
         optimizer_root = workspace_root / "process" / "pose_optimizer"
-        config_path = optimizer_root / "configs" / "edge_contour_fast_quick.yaml"
+        config_path = optimizer_root / "configs" / config_filename
         command = [
             sys.executable,
             "-m",
@@ -6391,6 +6600,56 @@ class ProjectExecutor:
                     return {"accepted": False, "reason": f"bbox_bottom_ground_distance_too_large:{float(bottom_distance):.3f}m"}
             except Exception:
                 return {"accepted": False, "reason": "invalid_road_constraint_metrics"}
+        pose = report.get("optimized_corrected_pose_world", {})
+        if not ProjectExecutor._valid_vec3_like(pose.get("translation_world")):
+            return {"accepted": False, "reason": "invalid_translation"}
+        if not ProjectExecutor._valid_vec3_like(pose.get("scale")):
+            return {"accepted": False, "reason": "invalid_scale"}
+        return {"accepted": True, "reason": "accepted"}
+
+    @staticmethod
+    def _generic_pose_optimizer_acceptance(report: dict) -> dict:
+        metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
+        if metrics.get("acceptance_status") == "rejected":
+            reasons = metrics.get("reject_reasons")
+            if isinstance(reasons, list) and reasons:
+                return {"accepted": False, "reason": ",".join(str(item) for item in reasons)}
+        try:
+            visible_iou = float(
+                metrics.get("visible_mask_iou")
+                or metrics.get("visible_soft_mask_iou")
+                or metrics.get("soft_mask_iou")
+                or metrics.get("mask_iou")
+                or 0.0
+            )
+            bbox_iou = float(metrics.get("bbox_iou") or 0.0)
+            center_error = float(metrics.get("bbox_center_error_px") or 1e9)
+            projection_ratio = float(metrics.get("projection_valid_ratio") or 0.0)
+        except Exception:
+            return {"accepted": False, "reason": "invalid_generic_metrics"}
+        bbox = report.get("json_bbox") or []
+        bbox_diag = 0.0
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            try:
+                bbox_diag = math.hypot(float(bbox[2]) - float(bbox[0]), float(bbox[3]) - float(bbox[1]))
+            except Exception:
+                bbox_diag = 0.0
+        if visible_iou < 0.12:
+            return {"accepted": False, "reason": f"visible_mask_or_soft_iou_below_threshold:{visible_iou:.3f}"}
+        if bbox_iou < 0.10:
+            return {"accepted": False, "reason": f"bbox_iou_below_threshold:{bbox_iou:.3f}"}
+        if center_error > max(120.0, 0.35 * bbox_diag):
+            return {"accepted": False, "reason": f"center_error_too_large:{center_error:.1f}"}
+        if projection_ratio < 0.50:
+            return {"accepted": False, "reason": f"projection_valid_ratio_below_threshold:{projection_ratio:.3f}"}
+        try:
+            depth_confidence = float(metrics.get("depth_confidence") or 0.0)
+            depth_score = float(metrics.get("depth_score") or 0.0)
+        except Exception:
+            depth_confidence = 0.0
+            depth_score = 0.0
+        if depth_confidence >= 0.70 and depth_score < 0.25:
+            return {"accepted": False, "reason": f"depth_score_below_threshold:{depth_score:.3f}"}
         pose = report.get("optimized_corrected_pose_world", {})
         if not ProjectExecutor._valid_vec3_like(pose.get("translation_world")):
             return {"accepted": False, "reason": "invalid_translation"}
@@ -6595,6 +6854,28 @@ class ProjectExecutor:
             except OSError:
                 continue
         return str(raw) if raw else None
+
+    @staticmethod
+    def _resolve_depth_map_for_frame(depth_maps_dir: str | Path | None, frame_id: int) -> Path | None:
+        if not depth_maps_dir:
+            return None
+        root = Path(depth_maps_dir)
+        frame_id = int(frame_id)
+        candidates = [
+            root / f"{frame_id:05d}.npy",
+            root / f"{max(frame_id - 1, 0):05d}.npy",
+            root / "depth_maps" / f"{frame_id:05d}.npy",
+            root / "depth_maps" / f"{max(frame_id - 1, 0):05d}.npy",
+            root / "depth_maps" / "depth_maps" / f"{frame_id:05d}.npy",
+            root / "depth_maps" / "depth_maps" / f"{max(frame_id - 1, 0):05d}.npy",
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return candidate
+            except OSError:
+                continue
+        return None
 
     @staticmethod
     def _find_bg_mesh(bg_mesh_dir: str | None) -> "Path | None":

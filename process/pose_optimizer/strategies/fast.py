@@ -1621,6 +1621,8 @@ class CameraPoseEvaluator:
         if self._pyrender_renderer is not None:
             try:
                 self._pyrender_renderer.delete()
+            except Exception as exc:
+                print(f"[warn] pyrender renderer cleanup failed: {exc}")
             finally:
                 self._pyrender_renderer = None
         self._torch_renderer = None
@@ -2900,7 +2902,12 @@ def draw_stroked_text(
 
 def draw_bbox(image: np.ndarray, bbox: list[float], color: tuple[int, int, int], label: str | None = None) -> np.ndarray:
     out = image.copy()
+    height, width = out.shape[:2]
     x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+    x1 = int(np.clip(x1, 0, max(0, width - 1)))
+    x2 = int(np.clip(x2, 0, max(0, width - 1)))
+    y1 = int(np.clip(y1, 0, max(0, height - 1)))
+    y2 = int(np.clip(y2, 0, max(0, height - 1)))
     cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, lineType=cv2.LINE_AA)
     if label:
         draw_stroked_text(out, label, (x1, max(18, y1 - 8)), color, scale=0.54)
@@ -3202,7 +3209,7 @@ def save_optimized_glb_projection_views(
     t_cam_from_object = make_transform(rotation_cam, translation_cam)
     points_cam = transform_points(vertices * scale.reshape(1, 3), t_cam_from_object)
     projected_uv, valid_z = project_points(points_cam, **intrinsics)
-    projected_bbox = bbox_from_projected_points(projected_uv, valid_z)
+    projected_bbox = best_result.get("projected_bbox") or bbox_from_projected_points(projected_uv, valid_z)
 
     rendered_mask = best_result.get("rendered_mask")
     if rendered_mask is None:
@@ -3656,9 +3663,9 @@ def save_result_collages(
     focus_bbox = expanded_focus_bbox(
         best_final_overlay.shape,
         [json_bbox, projected_bbox],
-        padding_ratio=0.42,
-        min_size=220,
-        top_extra_ratio=0.30,
+        padding_ratio=0.55,
+        min_size=260,
+        top_extra_ratio=0.35,
     )
     pose_closeup_collage_path = save_image_collage(
         output_dir / "02_pose_inspection.png",

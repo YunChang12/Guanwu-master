@@ -48,4 +48,13 @@ VARIANTS: dict[str, Variant] = {
             "temporal prior, and edge-assisted scoring."
         ),
     ),
+    "generic_appearance_temporal": Variant(
+        name="generic_appearance_temporal",
+        module_name="process.pose_optimizer.strategies.generic_appearance_temporal",
+        config_path=PACKAGE_DIR / "configs" / "generic_appearance_temporal.yaml",
+        description=(
+            "Generic optimizer using mask/bbox/contour, image appearance, depth consistency, "
+            "and SE(3) temporal smoothness without default road/vehicle hard priors."
+        ),
+    ),
 }

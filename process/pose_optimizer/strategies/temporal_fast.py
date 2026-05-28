@@ -1616,11 +1616,9 @@ def compute_visible_bbox_score(
     projected = _clip_bbox_to_image(projected_bbox, image_size)
     target = _clip_bbox_to_image(target_bbox, image_size)
     band = max(0.0, float(getattr(args, "ignore_truncated_border_band_px", 0)))
-    visible = _visible_region_mask(image_size, truncation_info, args)
-
     if rendered_mask is not None and target_mask is not None:
-        visible_rendered = np.logical_and(np.asarray(rendered_mask).astype(bool), visible)
-        visible_target = np.logical_and(np.asarray(target_mask).astype(bool), visible)
+        visible_rendered = np.asarray(rendered_mask).astype(bool)
+        visible_target = np.asarray(target_mask).astype(bool)
         rendered_bbox = _bbox_from_binary_mask(visible_rendered)
         target_mask_bbox = _bbox_from_binary_mask(visible_target)
         if rendered_bbox is not None and target_mask_bbox is not None:
@@ -1629,7 +1627,7 @@ def compute_visible_bbox_score(
                 "visible_bbox_center_error_px": fast.bbox_center_error(rendered_bbox, target_mask_bbox),
                 "visible_projected_bbox": rendered_bbox,
                 "visible_target_bbox": target_mask_bbox,
-                "visible_bbox_source": "visible_mask_bbox",
+                "visible_bbox_source": "in_frame_mask_bbox",
             }
 
     if "left" in sides:

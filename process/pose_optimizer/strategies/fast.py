@@ -1280,7 +1280,7 @@ def oriented_plane(
 
 
 def find_depth_map_for_task(sample_dir: Path, frame_idx: int) -> Path | None:
-    frame_name = f"{int(frame_idx):05d}.npy"
+    frame_name = f"{max(int(frame_idx) - 1, 0):05d}.npy"
     for parent in [sample_dir, *sample_dir.parents]:
         if parent.name != "outputs":
             continue

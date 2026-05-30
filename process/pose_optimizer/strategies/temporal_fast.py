@@ -1617,8 +1617,9 @@ def compute_visible_bbox_score(
     target = _clip_bbox_to_image(target_bbox, image_size)
     band = max(0.0, float(getattr(args, "ignore_truncated_border_band_px", 0)))
     if rendered_mask is not None and target_mask is not None:
-        visible_rendered = np.asarray(rendered_mask).astype(bool)
-        visible_target = np.asarray(target_mask).astype(bool)
+        visible_region = _visible_region_mask(image_size, truncation_info, args)
+        visible_rendered = np.asarray(rendered_mask).astype(bool) & visible_region
+        visible_target = np.asarray(target_mask).astype(bool) & visible_region
         rendered_bbox = _bbox_from_binary_mask(visible_rendered)
         target_mask_bbox = _bbox_from_binary_mask(visible_target)
         if rendered_bbox is not None and target_mask_bbox is not None:

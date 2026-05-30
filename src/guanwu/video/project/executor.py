@@ -6517,9 +6517,40 @@ class ProjectExecutor:
             task_dir,
             result_dir,
             config_filename="generic_appearance_temporal.yaml",
+            extra_args=self._generic_temporal_speedup_args_for_task(task_dir),
         )
 
-    def _run_pose_optimizer_cli(self, task_dir: Path, result_dir: Path, *, config_filename: str) -> dict:
+    @staticmethod
+    def _generic_temporal_speedup_args_for_task(task_dir: Path) -> list[str]:
+        task_path = Path(task_dir) / "task.json"
+        try:
+            task = json.loads(task_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        temporal_prior = task.get("temporal_prior_pose")
+        if not isinstance(temporal_prior, dict) or not temporal_prior:
+            return []
+        return [
+            "--top_k_candidates",
+            "8",
+            "--refine_top_k",
+            "1",
+            "--stage1_iters",
+            "4",
+            "--stage2_iters",
+            "3",
+            "--stage3_iters",
+            "6",
+        ]
+
+    def _run_pose_optimizer_cli(
+        self,
+        task_dir: Path,
+        result_dir: Path,
+        *,
+        config_filename: str,
+        extra_args: list[str] | None = None,
+    ) -> dict:
         guanwu_root = Path(__file__).resolve().parents[4]
         bundled_optimizer_root = guanwu_root / "process" / "pose_optimizer"
         workspace_root = guanwu_root if bundled_optimizer_root.exists() else guanwu_root.parent
@@ -6536,6 +6567,8 @@ class ProjectExecutor:
             "--output_dir",
             str(result_dir),
         ]
+        if extra_args:
+            command.extend([str(item) for item in extra_args])
         env = os.environ.copy()
         env["PYTHONPATH"] = str(workspace_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         try:
@@ -6861,14 +6894,13 @@ class ProjectExecutor:
             return None
         root = Path(depth_maps_dir)
         frame_id = int(frame_id)
-        candidates = [
-            root / f"{frame_id:05d}.npy",
-            root / f"{max(frame_id - 1, 0):05d}.npy",
-            root / "depth_maps" / f"{frame_id:05d}.npy",
-            root / "depth_maps" / f"{max(frame_id - 1, 0):05d}.npy",
-            root / "depth_maps" / "depth_maps" / f"{frame_id:05d}.npy",
-            root / "depth_maps" / "depth_maps" / f"{max(frame_id - 1, 0):05d}.npy",
+        depth_frame_name = f"{max(frame_id - 1, 0):05d}.npy"
+        roots = [
+            root,
+            root / "depth_maps",
+            root / "depth_maps" / "depth_maps",
         ]
+        candidates = [candidate_root / depth_frame_name for candidate_root in roots]
         for candidate in candidates:
             try:
                 if candidate.exists():

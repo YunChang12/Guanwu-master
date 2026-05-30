@@ -65,12 +65,37 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "scale_prior_score",
     "optional_prior_score",
     "support_plane_confidence",
+    "support_plane_enabled",
+    "support_plane_disable_reason",
+    "support_plane_inlier_ratio",
+    "support_plane_residual_m",
     "support_contact_score",
+    "support_contact_distance_score",
+    "support_contact_coverage",
     "support_contact_mean_abs_m",
     "support_contact_max_abs_m",
+    "support_bottom_selection_mode",
+    "support_axis_index",
+    "support_axis_sign",
+    "support_normal_alignment",
+    "support_normal_angle_deg",
+    "support_orientation_score",
+    "support_orientation_penalty",
+    "support_orientation_penalty_eff",
+    "support_bottom_point_count",
+    "support_bottom_mean_abs_m",
+    "support_bottom_max_abs_m",
+    "support_bottom_signed_m",
+    "support_floating_distance_m",
+    "support_penetration_distance_m",
+    "support_floating_penalty",
+    "support_penetration_penalty",
+    "support_penalty",
+    "support_contact_penalty_eff",
     "upright_confidence",
     "heading_confidence",
     "observation_score",
+    "observation_quality",
     "optional_prior_gate",
     "invalid_projection_penalty",
     "depth_outlier_penalty",
@@ -86,6 +111,13 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
 
 def clamp01(value: float) -> float:
     return float(np.clip(value, 0.0, 1.0))
+
+
+def _normalize(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return vector
+    return vector / norm
 
 
 def compute_generic_temporal_score(
@@ -217,6 +249,114 @@ def _visible_region_from_truncation(
         return None
 
 
+def support_bottom_points_for_pose(
+    vertices: np.ndarray,
+    rotation_cam: np.ndarray,
+    translation_cam: np.ndarray,
+    scale: np.ndarray,
+    plane: dict[str, Any],
+    *,
+    bottom_percentile: float = 3.0,
+    mode: str = "local_axis",
+    max_points: int = 512,
+) -> dict[str, Any]:
+    """Select support-contact vertices from the object's local bottom band.
+
+    Using signed distance alone can pick only the already-lowest edge of a
+    tilted object. The local-axis mode keeps the whole canonical bottom band, so
+    tilt turns into lower contact coverage instead of being hidden by sampling.
+    """
+
+    local = np.asarray(vertices, dtype=np.float64)
+    rotation = np.asarray(rotation_cam, dtype=np.float64)
+    translation = np.asarray(translation_cam, dtype=np.float64)
+    scale_arr = np.asarray(scale, dtype=np.float64).reshape(1, 3)
+    normal = _normalize(np.asarray(plane.get("normal"), dtype=np.float64))
+    offset = float(plane.get("offset", 0.0))
+    scaled_local = local * scale_arr
+    all_cam = scaled_local @ rotation.T + translation.reshape(1, 3)
+    signed_dist = all_cam @ normal + offset
+    mode_value = str(mode or "local_axis").lower()
+    bottom_percentile = float(bottom_percentile)
+
+    if mode_value in {"signed_distance", "plane_distance"}:
+        support_cutoff = float(np.percentile(signed_dist, bottom_percentile))
+        selector = signed_dist <= support_cutoff
+        support_axis_index = None
+        support_axis_sign = None
+        alignment = 0.0
+        angle_deg = None
+    else:
+        axis_vectors = [rotation[:, idx] for idx in range(3)]
+        signed_alignments = [
+            float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal))))
+            for axis in axis_vectors
+        ]
+        support_axis_index = int(np.argmax(np.abs(signed_alignments)))
+        support_axis_sign = 1.0 if signed_alignments[support_axis_index] >= 0.0 else -1.0
+        alignment = abs(float(signed_alignments[support_axis_index]))
+        angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+        local_support_coord = scaled_local[:, support_axis_index] * support_axis_sign
+        local_cutoff = float(np.percentile(local_support_coord, bottom_percentile))
+        selector = local_support_coord <= local_cutoff
+        support_cutoff = float(np.percentile(signed_dist[selector], 50.0)) if np.any(selector) else float(np.percentile(signed_dist, bottom_percentile))
+
+    support_cam = all_cam[selector]
+    if len(support_cam) <= 0:
+        support_cam = all_cam[signed_dist <= float(np.percentile(signed_dist, bottom_percentile))]
+    if len(support_cam) > int(max_points):
+        support_cam = support_cam[np.linspace(0, len(support_cam) - 1, int(max_points), dtype=np.int64)]
+    return {
+        "support_points_cam": support_cam,
+        "support_bottom_signed_m": float(support_cutoff),
+        "support_bottom_selection_mode": mode_value,
+        "support_axis_index": support_axis_index,
+        "support_axis_sign": support_axis_sign,
+        "support_normal_alignment": float(alignment),
+        "support_normal_angle_deg": angle_deg,
+        "support_bottom_point_count": int(len(support_cam)),
+    }
+
+
+def support_orientation_score(
+    rotation_cam: np.ndarray,
+    plane: dict[str, Any],
+    *,
+    sigma_deg: float = 20.0,
+    tolerance_deg: float = 4.0,
+) -> dict[str, Any]:
+    normal = _normalize(np.asarray(plane.get("normal"), dtype=np.float64))
+    if normal.shape != (3,) or float(np.linalg.norm(normal)) <= 1e-12:
+        return {
+            "support_axis_index": None,
+            "support_axis_sign": None,
+            "support_normal_alignment": 0.0,
+            "support_normal_angle_deg": None,
+            "support_orientation_score": 0.0,
+            "support_orientation_penalty": 0.0,
+        }
+    rotation = np.asarray(rotation_cam, dtype=np.float64)
+    alignments = []
+    for idx in range(3):
+        axis = rotation[:, idx]
+        alignments.append(float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal)))))
+    axis_index = int(np.argmax(np.abs(alignments)))
+    axis_sign = 1.0 if alignments[axis_index] >= 0.0 else -1.0
+    alignment = abs(float(alignments[axis_index]))
+    angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+    excess = max(0.0, angle_deg - float(tolerance_deg))
+    sigma = max(1e-6, float(sigma_deg))
+    score = float(math.exp(-((excess / sigma) ** 2)))
+    return {
+        "support_axis_index": axis_index,
+        "support_axis_sign": axis_sign,
+        "support_normal_alignment": alignment,
+        "support_normal_angle_deg": angle_deg,
+        "support_orientation_score": score,
+        "support_orientation_penalty": float(1.0 - score),
+    }
+
+
 def render_depth_for_pose(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -296,42 +436,206 @@ def depth_points_cam_from_region(
     return np.stack([x, y, z], axis=1)
 
 
+def _expanded_bbox_region(
+    shape: tuple[int, int],
+    bbox_xyxy: list[float],
+    expand_ratio: float,
+) -> np.ndarray:
+    height, width = shape
+    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    margin_x = bw * max(0.0, float(expand_ratio))
+    margin_y = bh * max(0.0, float(expand_ratio))
+    ix1 = max(0, int(math.floor(x1 - margin_x)))
+    iy1 = max(0, int(math.floor(y1 - margin_y)))
+    ix2 = min(width, int(math.ceil(x2 + margin_x)))
+    iy2 = min(height, int(math.ceil(y2 + margin_y)))
+    region = np.zeros((height, width), dtype=bool)
+    if ix2 > ix1 and iy2 > iy1:
+        region[iy1:iy2, ix1:ix2] = True
+    return region
+
+
+def _odd_kernel(value: int) -> int:
+    size = max(1, int(round(value)))
+    return size if size % 2 == 1 else size + 1
+
+
+def _support_sample_region(
+    detection_mask: np.ndarray,
+    bbox_xyxy: list[float],
+    args: argparse.Namespace,
+    other_instance_masks: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    mask = (np.asarray(detection_mask) > 0).astype(np.uint8)
+    height, width = mask.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    lower_band = np.zeros((height, width), dtype=bool)
+    if bool(getattr(args, "support_use_lower_band", True)):
+        x_expand = float(getattr(args, "support_lower_band_x_expand_ratio", 0.20))
+        y_extend = float(getattr(args, "support_lower_band_y_extend_ratio", 0.60))
+        sx1 = max(0, int(math.floor(x1 - x_expand * bw)))
+        sx2 = min(width, int(math.ceil(x2 + x_expand * bw)))
+        sy1 = max(0, int(math.floor(y2)))
+        sy2 = min(height, int(math.ceil(y2 + y_extend * bh)))
+        if sx2 > sx1 and sy2 > sy1:
+            lower_band[sy1:sy2, sx1:sx2] = True
+
+    near_ring = np.zeros((height, width), dtype=bool)
+    if bool(getattr(args, "support_use_near_mask_ring", True)):
+        inner = _odd_kernel(int(getattr(args, "support_near_mask_inner_kernel", 9)))
+        outer = max(_odd_kernel(int(getattr(args, "support_near_mask_outer_kernel", 31))), inner + 2)
+        if outer % 2 == 0:
+            outer += 1
+        outer_mask = cv2.dilate(mask, np.ones((outer, outer), dtype=np.uint8), iterations=1).astype(bool)
+        inner_mask = cv2.dilate(mask, np.ones((inner, inner), dtype=np.uint8), iterations=1).astype(bool)
+        expanded_bbox = _expanded_bbox_region(mask.shape, bbox_xyxy, float(getattr(args, "support_bbox_expand_ratio", 0.20)))
+        near_ring = outer_mask & ~inner_mask & expanded_bbox
+
+    sample = lower_band | near_ring
+    exclude_kernel = _odd_kernel(int(getattr(args, "support_exclude_target_mask_dilate_kernel", 9)))
+    excluded = cv2.dilate(mask, np.ones((exclude_kernel, exclude_kernel), dtype=np.uint8), iterations=1).astype(bool)
+    other_pixels = 0
+    if bool(getattr(args, "support_exclude_other_instance_masks", True)) and other_instance_masks:
+        for other in other_instance_masks:
+            other_arr = np.asarray(other)
+            if other_arr.shape == mask.shape:
+                other_bool = other_arr.astype(bool)
+                other_pixels += int(other_bool.sum())
+                excluded |= other_bool
+    sample &= ~excluded
+    debug = {
+        "lower_band_pixels": int(lower_band.sum()),
+        "near_mask_ring_pixels": int(near_ring.sum()),
+        "excluded_target_pixels": int(excluded.sum()),
+        "excluded_other_instance_pixels": int(other_pixels),
+        "final_pixels": int(sample.sum()),
+    }
+    debug_regions = {
+        "lower_band_region": lower_band,
+        "near_mask_ring_region": near_ring,
+    }
+    return sample, {**debug, **debug_regions}
+
+
 def estimate_support_plane_from_observed_depth(
     observed_depth: np.ndarray | None,
     detection_mask: np.ndarray,
     bbox_xyxy: list[float],
     intrinsics: dict[str, float],
     args: argparse.Namespace,
+    other_instance_masks: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict[str, Any]:
     if observed_depth is None:
         return {"available": False, "support_plane_confidence": 0.0, "reason": "depth_unavailable"}
     if str(getattr(args, "support_plane_enabled", "auto")).lower() in {"0", "false", "off", "disabled", "none"}:
         return {"available": False, "support_plane_confidence": 0.0, "reason": "disabled"}
-    height, width = np.asarray(detection_mask).shape[:2]
-    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    sx1 = max(0, int(math.floor(x1 - 0.20 * bw)))
-    sx2 = min(width, int(math.ceil(x2 + 0.20 * bw)))
-    sy1 = max(0, int(math.floor(y2)))
-    sy2 = min(height, int(math.ceil(y2 + 0.60 * bh)))
-    support_region = np.zeros((height, width), dtype=bool)
-    if sx2 > sx1 and sy2 > sy1:
-        support_region[sy1:sy2, sx1:sx2] = True
+    support_region, sample_debug = _support_sample_region(detection_mask, bbox_xyxy, args, other_instance_masks)
     if int(support_region.sum()) <= 0:
-        return {"available": False, "support_plane_confidence": 0.0, "reason": "empty_support_region"}
-    dilated_object = cv2.dilate((np.asarray(detection_mask) > 0).astype(np.uint8), np.ones((9, 9), dtype=np.uint8), iterations=1)
-    support_region &= ~dilated_object.astype(bool)
+        return {
+            "available": False,
+            "support_plane_confidence": 0.0,
+            "reason": "empty_support_region",
+            "support_sample_debug": sample_debug,
+        }
     points = depth_points_cam_from_region(observed_depth, support_region, intrinsics)
-    return fit_support_plane_ransac(
+    object_points = depth_points_cam_from_region(observed_depth, np.asarray(detection_mask) > 0, intrinsics)
+    plane = fit_support_plane_ransac(
         points,
         config=SupportPlaneConfig(
             min_points=int(getattr(args, "support_plane_min_points", 120)),
             ransac_iters=int(getattr(args, "support_plane_ransac_iters", 96)),
             ransac_threshold_m=float(getattr(args, "support_plane_ransac_threshold_m", 0.05)),
             min_confidence=float(getattr(args, "support_plane_min_confidence", 0.70)),
+            residual_scale_m=float(getattr(args, "support_plane_residual_scale_m", 0.08)),
         ),
+        object_points_cam=object_points,
     )
+    if plane.get("normal") is not None and plane.get("offset") is not None:
+        depth_arr = np.asarray(observed_depth, dtype=np.float32)
+        valid = support_region & np.isfinite(depth_arr) & (depth_arr > 0.0)
+        ys, xs = np.nonzero(valid)
+        inlier_region = np.zeros_like(support_region, dtype=bool)
+        if len(xs) > 0:
+            z = depth_arr[ys, xs].astype(np.float64)
+            x = (xs.astype(np.float64) - float(intrinsics["cx"])) * z / float(intrinsics["fx"])
+            y = (ys.astype(np.float64) - float(intrinsics["cy"])) * z / float(intrinsics["fy"])
+            pts = np.stack([x, y, z], axis=1)
+            distances = np.abs(pts @ np.asarray(plane["normal"], dtype=np.float64) + float(plane["offset"]))
+            inlier_region[ys, xs] = distances <= float(getattr(args, "support_plane_ransac_threshold_m", 0.05))
+        plane["support_inlier_region"] = inlier_region
+    plane["support_sample_debug"] = sample_debug
+    plane["support_sample_region"] = support_region
+    return plane
+
+
+def support_plane_report_payload(support_plane: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in support_plane.items()
+        if key
+        not in {
+            "support_sample_region",
+            "support_inlier_region",
+        }
+        and not key.endswith("_region")
+    }
+    sample_debug = payload.get("support_sample_debug")
+    if isinstance(sample_debug, dict):
+        payload["support_sample_debug"] = {
+            key: value
+            for key, value in sample_debug.items()
+            if not str(key).endswith("_region")
+        }
+    return payload
+
+
+def save_support_plane_debug(
+    output_dir: Path,
+    support_plane: dict[str, Any],
+    detection_mask: np.ndarray,
+) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample_region = support_plane.get("support_sample_region")
+    if sample_region is not None:
+        mask = (np.asarray(detection_mask) > 0)
+        sample = np.asarray(sample_region).astype(bool)
+        vis = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        sample_debug = support_plane.get("support_sample_debug") if isinstance(support_plane.get("support_sample_debug"), dict) else {}
+        lower = np.asarray(sample_debug.get("lower_band_region")).astype(bool) if sample_debug.get("lower_band_region") is not None else np.zeros_like(sample)
+        ring = np.asarray(sample_debug.get("near_mask_ring_region")).astype(bool) if sample_debug.get("near_mask_ring_region") is not None else np.zeros_like(sample)
+        vis[lower] = (255, 0, 0)
+        vis[ring] = (0, 180, 255)
+        vis[sample] = (255, 160, 0)
+        vis[mask] = (0, 255, 0)
+        path = output_dir / "support_sample_region.png"
+        cv2.imwrite(str(path), vis)
+        outputs["support_sample_region"] = str(path)
+        inlier_path = output_dir / "support_plane_inliers.png"
+        inlier_region = support_plane.get("support_inlier_region")
+        inlier = np.asarray(inlier_region).astype(bool) if inlier_region is not None else sample
+        cv2.imwrite(str(inlier_path), np.where(inlier, 255, 0).astype(np.uint8))
+        outputs["support_plane_inliers"] = str(inlier_path)
+
+    contact_debug = {
+        key: fast.to_builtin(value)
+        for key, value in support_plane_report_payload(support_plane).items()
+    }
+    if isinstance(contact_debug.get("support_sample_debug"), dict):
+        contact_debug["support_sample_debug"] = {
+            key: value
+            for key, value in contact_debug["support_sample_debug"].items()
+            if not str(key).endswith("_region")
+        }
+    json_path = output_dir / "support_contact_debug.json"
+    json_path.write_text(json.dumps(contact_debug, indent=2), encoding="utf-8")
+    outputs["support_contact_debug"] = str(json_path)
+    return outputs
 
 
 class GenericPoseEvaluator(fast.CameraPoseEvaluator):
@@ -439,36 +743,132 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         confidence = float((self.support_plane or {}).get("support_plane_confidence") or 0.0)
         if confidence < float(getattr(self.generic_args, "support_plane_min_confidence", 0.70)):
             return {
+                "support_plane_enabled": False,
+                "support_plane_disable_reason": (self.support_plane or {}).get("reason", "low_confidence"),
                 "support_plane_confidence": confidence,
+                "support_plane_inlier_ratio": float((self.support_plane or {}).get("inlier_ratio") or 0.0),
+                "support_plane_residual_m": (self.support_plane or {}).get("plane_residual_m"),
                 "support_contact_score": 0.0,
+                "support_contact_distance_score": 0.0,
+                "support_contact_coverage": 0.0,
                 "support_contact_mean_abs_m": None,
                 "support_contact_max_abs_m": None,
+                "support_bottom_selection_mode": None,
+                "support_axis_index": None,
+                "support_axis_sign": None,
+                "support_normal_alignment": 0.0,
+                "support_normal_angle_deg": None,
+                "support_orientation_score": 0.0,
+                "support_orientation_penalty": 0.0,
+                "support_bottom_mean_abs_m": None,
+                "support_bottom_max_abs_m": None,
+                "support_bottom_signed_m": None,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "support_floating_penalty": 0.0,
+                "support_penetration_penalty": 0.0,
+                "support_penalty": 0.0,
             }
         try:
             rotation = np.asarray(result["rotation_cam"], dtype=np.float64)
             translation = np.asarray(result["translation_cam"], dtype=np.float64)
             scale = np.asarray(result["scale"], dtype=np.float64)
             local = np.asarray(self.vertices, dtype=np.float64)
-            normal = np.asarray(self.support_plane.get("normal"), dtype=np.float64)
-            all_cam = (local * scale.reshape(1, 3)) @ rotation.T + translation.reshape(1, 3)
-            support_axis_values = all_cam @ normal
-            support_cutoff = float(np.percentile(support_axis_values, 5.0))
-            support_cam = all_cam[support_axis_values <= support_cutoff]
-            if len(support_cam) > 512:
-                support_cam = support_cam[np.linspace(0, len(support_cam) - 1, 512, dtype=np.int64)]
+            bottom_percentile = float(getattr(self.generic_args, "support_bottom_percentile", 3.0))
+            bottom = support_bottom_points_for_pose(
+                local,
+                rotation,
+                translation,
+                scale,
+                self.support_plane,
+                bottom_percentile=bottom_percentile,
+                mode=str(getattr(self.generic_args, "support_bottom_selection_mode", "local_axis")),
+                max_points=512,
+            )
+            support_cam = np.asarray(bottom["support_points_cam"], dtype=np.float64)
             contact = support_contact_score(
                 support_cam,
                 self.support_plane,
-                sigma_m=float(getattr(self.generic_args, "support_contact_sigma_m", 0.08)),
+                sigma_m=float(getattr(self.generic_args, "support_contact_sigma_m", 0.10)),
+                tolerance_m=float(getattr(self.generic_args, "support_contact_tolerance_m", 0.08)),
+                floating_tolerance_m=float(getattr(self.generic_args, "support_floating_tolerance_m", 0.20)),
+                penetration_tolerance_m=float(getattr(self.generic_args, "support_penetration_tolerance_m", 0.10)),
+                distance_score_weight=float(getattr(self.generic_args, "support_contact_distance_score_weight", 0.70)),
+                coverage_score_weight=float(getattr(self.generic_args, "support_contact_coverage_score_weight", 0.30)),
+                floating_penalty_weight=float(getattr(self.generic_args, "support_floating_penalty_weight", 0.60)),
+                penetration_penalty_weight=float(getattr(self.generic_args, "support_penetration_penalty_weight", 1.00)),
             )
+            orientation = support_orientation_score(
+                rotation,
+                self.support_plane,
+                sigma_deg=float(getattr(self.generic_args, "support_orientation_sigma_deg", 20.0)),
+                tolerance_deg=float(getattr(self.generic_args, "support_orientation_tolerance_deg", 4.0)),
+            )
+            support_cutoff = float(bottom["support_bottom_signed_m"])
+            floating_distance = max(support_cutoff, 0.0)
+            penetration_distance = max(-support_cutoff, 0.0)
+            floating_penalty = float(
+                np.clip(
+                    floating_distance / max(1e-6, float(getattr(self.generic_args, "support_floating_tolerance_m", 0.20))),
+                    0.0,
+                    1.0,
+                )
+            )
+            penetration_penalty = float(
+                np.clip(
+                    penetration_distance / max(1e-6, float(getattr(self.generic_args, "support_penetration_tolerance_m", 0.10))),
+                    0.0,
+                    1.0,
+                )
+            )
+            contact.update(
+                {
+                    **{key: value for key, value in bottom.items() if key != "support_points_cam"},
+                    **orientation,
+                    "support_bottom_signed_m": support_cutoff,
+                    "support_floating_distance_m": float(floating_distance),
+                    "support_penetration_distance_m": float(penetration_distance),
+                    "support_floating_penalty": floating_penalty,
+                    "support_penetration_penalty": penetration_penalty,
+                    "support_penalty": float(
+                        float(getattr(self.generic_args, "support_floating_penalty_weight", 0.60)) * floating_penalty
+                        + float(getattr(self.generic_args, "support_penetration_penalty_weight", 1.00)) * penetration_penalty
+                    ),
+                }
+            )
+            contact["support_plane_enabled"] = True
+            contact["support_plane_disable_reason"] = None
             contact["support_plane_confidence"] = confidence
+            contact["support_plane_inlier_ratio"] = float((self.support_plane or {}).get("inlier_ratio") or 0.0)
+            contact["support_plane_residual_m"] = (self.support_plane or {}).get("plane_residual_m")
             return contact
         except Exception as exc:
             return {
+                "support_plane_enabled": False,
+                "support_plane_disable_reason": str(exc),
                 "support_plane_confidence": confidence,
+                "support_plane_inlier_ratio": float((self.support_plane or {}).get("inlier_ratio") or 0.0),
+                "support_plane_residual_m": (self.support_plane or {}).get("plane_residual_m"),
                 "support_contact_score": 0.0,
+                "support_contact_distance_score": 0.0,
+                "support_contact_coverage": 0.0,
                 "support_contact_mean_abs_m": None,
                 "support_contact_max_abs_m": None,
+                "support_bottom_selection_mode": None,
+                "support_axis_index": None,
+                "support_axis_sign": None,
+                "support_normal_alignment": 0.0,
+                "support_normal_angle_deg": None,
+                "support_orientation_score": 0.0,
+                "support_orientation_penalty": 0.0,
+                "support_bottom_mean_abs_m": None,
+                "support_bottom_max_abs_m": None,
+                "support_bottom_signed_m": None,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "support_floating_penalty": 0.0,
+                "support_penetration_penalty": 0.0,
+                "support_penalty": 0.0,
                 "support_contact_debug": {"reason": str(exc)},
             }
 
@@ -476,7 +876,8 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         reject_reasons: list[str] = []
         visible_iou = float(result.get("visible_mask_iou") or result.get("soft_mask_iou") or result.get("mask_iou") or 0.0)
         bbox_iou = float(result.get("bbox_iou") or 0.0)
-        center_error = float(result.get("bbox_center_error_px") or 1e9)
+        center_error_value = result.get("bbox_center_error_px")
+        center_error = float(center_error_value) if center_error_value is not None else 1e9
         bbox_diag = self.target_bbox_diagonal
         center_threshold = max(120.0, float(getattr(self.generic_args, "generic_acceptance_max_center_error_ratio", 0.35)) * bbox_diag)
         projection_ratio = float(result.get("projection_valid_ratio") or 0.0)
@@ -502,6 +903,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         if result.get("_generic_augmented"):
             return result
 
+        coarse_scoring = bool(getattr(self.generic_args, "generic_coarse_scoring", False))
         result.setdefault("rendered_mask", self._empty_mask())
         rendered_mask = result.get("rendered_mask")
         visible_region = _visible_region_from_truncation(self.image_size, self.truncation_info, self.generic_args)
@@ -596,7 +998,11 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
 
         appearance = (
             self.appearance_prior.score_render_mask(rendered_mask, visible_region=visible_region)
-            if self.appearance_prior is not None and bool(getattr(self.generic_args, "appearance_enabled", True))
+            if (
+                not coarse_scoring
+                and self.appearance_prior is not None
+                and bool(getattr(self.generic_args, "appearance_enabled", True))
+            )
             else {
                 "appearance_score": 0.0,
                 "appearance_confidence": 0.0,
@@ -611,10 +1017,14 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         result.update({key: value for key, value in appearance.items() if key != "debug"})
         result["appearance_debug"] = appearance.get("debug")
 
-        render_depth = self._render_depth_if_needed(result)
+        render_depth = None if coarse_scoring else self._render_depth_if_needed(result)
         depth = (
             self.depth_prior.score(render_depth, rendered_mask, visible_region=visible_region)
-            if self.depth_prior is not None and bool(getattr(self.generic_args, "depth_enabled", True))
+            if (
+                not coarse_scoring
+                and self.depth_prior is not None
+                and bool(getattr(self.generic_args, "depth_enabled", True))
+            )
             else {
                 "depth_score": 0.0,
                 "depth_confidence": 0.0,
@@ -627,7 +1037,11 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         result["depth_debug"] = depth.get("debug")
 
         temporal_score = 0.0
-        if bool(getattr(self.generic_args, "temporal_enabled", True)) and self.temporal_prior is not None:
+        if (
+            not coarse_scoring
+            and bool(getattr(self.generic_args, "temporal_enabled", True))
+            and self.temporal_prior is not None
+        ):
             temporal = compute_generic_temporal_score(
                 np.asarray(result["translation_cam"], dtype=np.float64),
                 np.asarray(result["rotation_cam"], dtype=np.float64),
@@ -643,7 +1057,37 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         scale_prior = self._scale_prior_score(np.asarray(result["scale"], dtype=np.float64))
         result.update(scale_prior)
 
-        support = self._support_contact(result)
+        support = (
+            {
+                "support_plane_enabled": False,
+                "support_plane_disable_reason": "coarse_scoring",
+                "support_plane_confidence": 0.0,
+                "support_plane_inlier_ratio": 0.0,
+                "support_plane_residual_m": None,
+                "support_contact_score": 0.0,
+                "support_contact_distance_score": 0.0,
+                "support_contact_coverage": 0.0,
+                "support_contact_mean_abs_m": None,
+                "support_contact_max_abs_m": None,
+                "support_bottom_selection_mode": None,
+                "support_axis_index": None,
+                "support_axis_sign": None,
+                "support_normal_alignment": 0.0,
+                "support_normal_angle_deg": None,
+                "support_orientation_score": 0.0,
+                "support_orientation_penalty": 0.0,
+                "support_bottom_mean_abs_m": None,
+                "support_bottom_max_abs_m": None,
+                "support_bottom_signed_m": None,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "support_floating_penalty": 0.0,
+                "support_penetration_penalty": 0.0,
+                "support_penalty": 0.0,
+            }
+            if coarse_scoring
+            else self._support_contact(result)
+        )
         support_plane_confidence = float(support.get("support_plane_confidence") or 0.0)
         support_contact_value = float(support.get("support_contact_score") or 0.0)
         support_weight = float(getattr(self.generic_args, "support_plane_weight", 0.20))
@@ -673,7 +1117,19 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             * float(result.get("appearance_confidence") or 0.0)
             * float(result.get("appearance_score") or 0.0)
         )
-        optional_prior_gate = clamp01(observation_score)
+        observation_score_max = (
+            float(getattr(self.generic_args, "generic_mask_weight", 1.0))
+            + float(getattr(self.generic_args, "generic_bbox_weight", 0.15))
+            + float(getattr(self.generic_args, "generic_contour_weight", 0.35))
+            + (float(getattr(self.generic_args, "generic_edge_weight", 0.20)) if self.enable_edge_score else 0.0)
+            + (float(getattr(self.generic_args, "generic_depth_weight", 0.35)) if self.depth_prior is not None and bool(getattr(self.generic_args, "depth_enabled", True)) else 0.0)
+            + (float(getattr(self.generic_args, "generic_appearance_weight", 0.25)) if self.appearance_prior is not None and bool(getattr(self.generic_args, "appearance_enabled", True)) else 0.0)
+            + float(getattr(self.generic_args, "generic_extent_weight", 0.0) or 0.0)
+        )
+        observation_quality = clamp01(observation_score / max(1e-6, observation_score_max))
+        gate_start = float(getattr(self.generic_args, "optional_prior_gate_start", 0.35))
+        gate_range = max(1e-6, float(getattr(self.generic_args, "optional_prior_gate_range", 0.45)))
+        optional_prior_gate = clamp01((observation_quality - gate_start) / gate_range)
         invalid_projection_penalty = 0.0
         depth_outlier_penalty = 0.0
         if (
@@ -682,6 +1138,18 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         ):
             depth_outlier_penalty = float(getattr(self.generic_args, "depth_outlier_penalty", 0.0))
         temporal_jump_penalty = 0.0
+        support_contact_penalty_eff = (
+            support_plane_confidence
+            * optional_prior_gate
+            * float(getattr(self.generic_args, "support_penalty_weight", 0.15))
+            * float(support.get("support_penalty") or 0.0)
+        )
+        support_orientation_penalty_eff = (
+            support_plane_confidence
+            * optional_prior_gate
+            * float(getattr(self.generic_args, "support_orientation_penalty_weight", 0.0))
+            * float(support.get("support_orientation_penalty") or 0.0)
+        )
 
         scaled_vertices = self.vertices * np.asarray(result["scale"], dtype=self.dtype).reshape(1, 3)
         points_cam = scaled_vertices @ np.asarray(result["rotation_cam"], dtype=self.dtype).T + np.asarray(result["translation_cam"], dtype=self.dtype).reshape(1, 3)
@@ -696,14 +1164,19 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             - invalid_projection_penalty
             - depth_outlier_penalty
             - temporal_jump_penalty
+            - support_contact_penalty_eff
+            - support_orientation_penalty_eff
         )
         result.update(
             {
                 "observation_score": float(observation_score),
+                "observation_quality": float(observation_quality),
                 "optional_prior_gate": optional_prior_gate,
                 "invalid_projection_penalty": invalid_projection_penalty,
                 "depth_outlier_penalty": depth_outlier_penalty,
                 "temporal_jump_penalty": temporal_jump_penalty,
+                "support_contact_penalty_eff": float(support_contact_penalty_eff),
+                "support_orientation_penalty_eff": float(support_orientation_penalty_eff),
                 "projection_valid_ratio": proj_ratio,
                 "visible_ratio": _visible_ratio(rendered_mask, visible_region),
                 "truncation_ratio": 1.0 - _visible_ratio(rendered_mask, visible_region),
@@ -764,8 +1237,7 @@ def generic_optimization_history_row(
 ) -> dict[str, Any]:
     row = fast.optimization_history_row(phase, iteration, parameter, direction, result, step_value)
     for key in GENERIC_CANDIDATE_METRIC_KEYS:
-        if key in result:
-            row[key] = result.get(key)
+        row[key] = result.get(key)
     return row
 
 
@@ -991,6 +1463,7 @@ def generate_generic_grid_candidates(
 
     heap: list[tuple[float, int, dict[str, Any]]] = []
     seen: set[tuple[float, ...]] = set()
+    batch_candidate_specs: list[dict[str, Any]] = []
     counter = 0
     if corrected_seed is not None:
         counter = fast.keep_top_k_results(heap, seen, corrected_seed, int(args.top_k_candidates), counter)
@@ -1029,10 +1502,82 @@ def generate_generic_grid_candidates(
                             )
                             if spec is None:
                                 continue
+                            if bool(getattr(args, "enable_batch_gpu_eval", False)):
+                                batch_candidate_specs.append(spec)
+                                continue
                             candidate = fast.evaluate_coarse_candidate_spec(evaluator, spec)
                             if candidate is not None:
                                 counter = fast.keep_top_k_results(heap, seen, candidate, int(args.top_k_candidates), counter)
+    if bool(getattr(args, "enable_batch_gpu_eval", False)):
+        for candidate in fast.batch_prefilter_initial_candidates(evaluator, batch_candidate_specs, args):
+            counter = fast.keep_top_k_results(heap, seen, candidate, int(args.top_k_candidates), counter)
     return [item[2] for item in sorted(heap, key=lambda item: item[0], reverse=True)]
+
+
+def select_generic_refine_candidates(
+    candidates: list[dict[str, Any]],
+    refine_top_k: int,
+    *,
+    corrected_seed: dict[str, Any] | None = None,
+    temporal_seed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Select high-scoring generic candidates while preserving trusted seeds."""
+
+    limit = max(1, int(refine_top_k))
+    combined = [item for item in candidates if item is not None]
+    for seed in (corrected_seed, temporal_seed):
+        if seed is not None:
+            combined.append(seed)
+    if not combined:
+        return []
+
+    if limit == 1 and temporal_seed is not None:
+        return [temporal_seed]
+
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for item in sorted(combined, key=lambda row: float(row.get("score", -1e9)), reverse=True):
+        signature = fast.pose_signature(item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(item)
+
+    required: list[dict[str, Any]] = []
+    required_signatures: set[tuple[float, ...]] = set()
+
+    def add_required(source: str, preferred: dict[str, Any] | None = None) -> None:
+        source_item = None
+        if preferred is not None and preferred.get("initializer_metadata", {}).get("source") == source:
+            source_item = preferred
+        if source_item is None:
+            source_item = next(
+                (item for item in unique if item.get("initializer_metadata", {}).get("source") == source),
+                None,
+            )
+        if source_item is None:
+            return
+        signature = fast.pose_signature(source_item)
+        if signature in required_signatures:
+            return
+        required_signatures.add(signature)
+        required.append(source_item)
+
+    add_required("task_json_corrected_pose", corrected_seed)
+    add_required("temporal_prior", temporal_seed)
+    if len(required) >= limit:
+        return required[:limit]
+
+    selected: list[dict[str, Any]] = []
+    fill_limit = limit - len(required)
+    for item in unique:
+        if fast.pose_signature(item) in required_signatures:
+            continue
+        selected.append(item)
+        if len(selected) >= fill_limit:
+            break
+    selected.extend(required)
+    return selected[:limit]
 
 
 def candidate_summary(result: dict[str, Any], *, t_world_from_cam: np.ndarray) -> dict[str, Any]:
@@ -1073,30 +1618,38 @@ def save_generic_breakdown(output_dir: Path, candidates: list[dict[str, Any]]) -
     row_h = 34
     height = max(220, row_h * (min(12, len(candidates)) + 2))
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-    headers = ["rank", "score", "mask", "bbox", "contour", "edge", "depth", "app", "temp", "status"]
-    xs = [12, 80, 180, 280, 380, 500, 610, 730, 850, 990]
+    headers = ["rank", "score", "mask", "bbox", "contour", "edge", "depth", "app", "temp", "support", "status"]
+    xs = [12, 80, 180, 280, 380, 500, 610, 730, 850, 955, 1110]
     for x, text in zip(xs, headers):
         cv2.putText(canvas, text, (x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
     for row, cand in enumerate(candidates[:12], start=1):
         y = 28 + row_h * row
-        values = [
-            str(cand.get("candidate_rank", row)),
-            f"{float(cand.get('score') or 0.0):.3f}",
-            f"{float(cand.get('mask_blend_score') or cand.get('mask_iou') or 0.0):.3f}",
-            f"{float(cand.get('bbox_iou') or 0.0):.3f}",
-            f"{float(cand.get('contour_score') or 0.0):.3f}",
-            f"{float(cand.get('edge_score') or 0.0):.3f}",
-            f"{float(cand.get('depth_score') or 0.0):.3f}/{float(cand.get('depth_confidence') or 0.0):.2f}",
-            f"{float(cand.get('appearance_score') or 0.0):.3f}/{float(cand.get('appearance_confidence') or 0.0):.2f}",
-            f"{float(cand.get('temporal_score') or 0.0):.3f}",
-            str(cand.get("acceptance_status", "")),
-        ]
+        row_values = generic_breakdown_row_values(cand, row=row)
+        values = [row_values[header] for header in headers]
         color = (20, 120, 20) if cand.get("acceptance_status") == "accepted" else (30, 30, 180)
         for x, text in zip(xs, values):
             cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv2.LINE_AA)
     path = output_dir / "candidate_score_breakdown.png"
     cv2.imwrite(str(path), canvas)
     return path
+
+
+def generic_breakdown_row_values(cand: dict[str, Any], *, row: int) -> dict[str, str]:
+    support_score = float(cand.get("support_contact_score") or 0.0)
+    support_penalty = float(cand.get("support_contact_penalty_eff") or 0.0) + float(cand.get("support_orientation_penalty_eff") or 0.0)
+    return {
+        "rank": str(cand.get("candidate_rank", row)),
+        "score": f"{float(cand.get('score') or 0.0):.3f}",
+        "mask": f"{float(cand.get('mask_blend_score') or cand.get('mask_iou') or 0.0):.3f}",
+        "bbox": f"{float(cand.get('bbox_iou') or 0.0):.3f}",
+        "contour": f"{float(cand.get('contour_score') or 0.0):.3f}",
+        "edge": f"{float(cand.get('edge_score') or 0.0):.3f}",
+        "depth": f"{float(cand.get('depth_score') or 0.0):.3f}/{float(cand.get('depth_confidence') or 0.0):.2f}",
+        "app": f"{float(cand.get('appearance_score') or 0.0):.3f}/{float(cand.get('appearance_confidence') or 0.0):.2f}",
+        "temp": f"{float(cand.get('temporal_score') or 0.0):.3f}",
+        "support": f"{support_score:.3f}/-{support_penalty:.3f}",
+        "status": str(cand.get("acceptance_status", "")),
+    }
 
 
 def _load_temporal_prior(sample_dir: Path, output_dir: Path, task: dict[str, Any], t_world_from_cam: np.ndarray, args: argparse.Namespace) -> tuple[dict[str, Any] | None, dict[str, Any]]:
@@ -1222,6 +1775,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         intrinsics,
         args,
     )
+    support_debug_outputs = save_support_plane_debug(output_dir, support_plane, full_mask)
 
     temporal_prior, temporal_report = _load_temporal_prior(sample_dir, output_dir, task, t_world_from_cam, args)
     if temporal_prior is None:
@@ -1249,6 +1803,9 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         fast.scale_to_uniform_scalar(np.asarray(pose.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64))
     )
 
+    proxy_args = argparse.Namespace(**vars(args))
+    proxy_args.generic_coarse_scoring = True
+
     evaluator_kwargs = dict(
         full_mask=full_mask,
         soft_full_mask=soft_full_mask,
@@ -1271,7 +1828,6 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         pytorch3d_cull_backfaces=args.pytorch3d_cull_backfaces,
         pytorch3d_bin_size=args.pytorch3d_bin_size,
         pytorch3d_max_faces_per_bin=args.pytorch3d_max_faces_per_bin,
-        generic_args=args,
         temporal_prior=temporal_prior,
         truncation_info=truncation_info,
         appearance_prior=appearance_prior,
@@ -1285,6 +1841,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         mesh=None,
         backend="triangle_fill",
         edge_context=None,
+        generic_args=proxy_args,
         **evaluator_kwargs,
     )
     full_evaluator = GenericPoseEvaluator(
@@ -1293,6 +1850,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         mesh=mesh,
         backend=args.render_backend,
         edge_context=edge_context,
+        generic_args=args,
         **evaluator_kwargs,
     )
 
@@ -1346,7 +1904,12 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         preview_rows[-1]["rank"] = index + 1
         preview_rows[-1]["initializer_metadata"] = candidate.get("initializer_metadata", {})
 
-    candidates_to_refine = initial_candidates[: max(1, int(args.refine_top_k))]
+    candidates_to_refine = select_generic_refine_candidates(
+        initial_candidates,
+        args.refine_top_k,
+        corrected_seed=corrected_seed,
+        temporal_seed=temporal_seed,
+    )
     refined_results: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     best_result: dict[str, Any] | None = None
     best_history: list[dict[str, Any]] = []
@@ -1519,10 +2082,25 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "upright_enabled": str(getattr(args, "generic_upright_enabled", "auto")),
             "optional_prior_score": best_result.get("optional_prior_score"),
             "support_plane_confidence": best_result.get("support_plane_confidence"),
-            "support_plane": support_plane,
+            "support_plane": support_plane_report_payload(support_plane),
             "support_contact_score": best_result.get("support_contact_score"),
+            "support_contact_distance_score": best_result.get("support_contact_distance_score"),
+            "support_contact_coverage": best_result.get("support_contact_coverage"),
             "support_contact_mean_abs_m": best_result.get("support_contact_mean_abs_m"),
             "support_contact_max_abs_m": best_result.get("support_contact_max_abs_m"),
+            "support_bottom_signed_m": best_result.get("support_bottom_signed_m"),
+            "support_floating_distance_m": best_result.get("support_floating_distance_m"),
+            "support_penetration_distance_m": best_result.get("support_penetration_distance_m"),
+            "support_penalty": best_result.get("support_penalty"),
+            "support_contact_penalty_eff": best_result.get("support_contact_penalty_eff"),
+            "support_bottom_selection_mode": best_result.get("support_bottom_selection_mode"),
+            "support_axis_index": best_result.get("support_axis_index"),
+            "support_axis_sign": best_result.get("support_axis_sign"),
+            "support_normal_alignment": best_result.get("support_normal_alignment"),
+            "support_normal_angle_deg": best_result.get("support_normal_angle_deg"),
+            "support_orientation_score": best_result.get("support_orientation_score"),
+            "support_orientation_penalty": best_result.get("support_orientation_penalty"),
+            "support_orientation_penalty_eff": best_result.get("support_orientation_penalty_eff"),
         },
         "edge_assist": {
             "enabled": bool(args.edge_score_enabled),
@@ -1552,6 +2130,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "optimized_task": str(output_dir / "task_with_optimized_corrected_pose.json"),
             "score_breakdown": str(breakdown_path) if breakdown_path else None,
             **appearance_debug_outputs,
+            **support_debug_outputs,
         },
         "refined_pose_candidates": [
             candidate_summary(item[0], t_world_from_cam=t_world_from_cam)
@@ -1615,14 +2194,39 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_yaw_degrees", default="0,45,90,135,180,225,270,315")
     parser.add_argument("--generic_pitch_degrees", default="-10,0,10")
     parser.add_argument("--generic_roll_degrees", default="-10,0,10")
+    parser.add_argument("--generic_coarse_scoring", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--support_plane_enabled", default="auto")
     parser.add_argument("--support_plane_min_confidence", type=float, default=0.70)
     parser.add_argument("--support_plane_min_points", type=int, default=120)
     parser.add_argument("--support_plane_ransac_iters", type=int, default=96)
     parser.add_argument("--support_plane_ransac_threshold_m", type=float, default=0.05)
+    parser.add_argument("--support_plane_residual_scale_m", type=float, default=0.08)
+    parser.add_argument("--support_use_lower_band", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_lower_band_x_expand_ratio", type=float, default=0.20)
+    parser.add_argument("--support_lower_band_y_extend_ratio", type=float, default=0.60)
+    parser.add_argument("--support_use_near_mask_ring", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_near_mask_inner_kernel", type=int, default=9)
+    parser.add_argument("--support_near_mask_outer_kernel", type=int, default=31)
+    parser.add_argument("--support_bbox_expand_ratio", type=float, default=0.20)
+    parser.add_argument("--support_exclude_target_mask_dilate_kernel", type=int, default=9)
     parser.add_argument("--support_plane_weight", type=float, default=0.20)
-    parser.add_argument("--support_contact_sigma_m", type=float, default=0.08)
+    parser.add_argument("--support_penalty_weight", type=float, default=0.15)
+    parser.add_argument("--support_bottom_percentile", type=float, default=3.0)
+    parser.add_argument("--support_bottom_selection_mode", choices=["local_axis", "signed_distance", "plane_distance"], default="local_axis")
+    parser.add_argument("--support_contact_sigma_m", type=float, default=0.10)
+    parser.add_argument("--support_contact_tolerance_m", type=float, default=0.08)
+    parser.add_argument("--support_floating_tolerance_m", type=float, default=0.20)
+    parser.add_argument("--support_penetration_tolerance_m", type=float, default=0.10)
+    parser.add_argument("--support_contact_distance_score_weight", type=float, default=0.70)
+    parser.add_argument("--support_contact_coverage_score_weight", type=float, default=0.30)
+    parser.add_argument("--support_floating_penalty_weight", type=float, default=0.60)
+    parser.add_argument("--support_penetration_penalty_weight", type=float, default=1.00)
+    parser.add_argument("--support_orientation_penalty_weight", type=float, default=0.0)
+    parser.add_argument("--support_orientation_sigma_deg", type=float, default=20.0)
+    parser.add_argument("--support_orientation_tolerance_deg", type=float, default=4.0)
+    parser.add_argument("--optional_prior_gate_start", type=float, default=0.35)
+    parser.add_argument("--optional_prior_gate_range", type=float, default=0.45)
     parser.add_argument("--generic_upright_enabled", default="auto")
     parser.add_argument("--generic_upright_min_confidence", type=float, default=0.70)
     parser.add_argument("--generic_upright_weight", type=float, default=0.15)

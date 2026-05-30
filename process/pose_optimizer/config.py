@@ -54,6 +54,7 @@ NEGATED_BOOLEAN_OPTIONS = {
     "non_truncated_visual_ground_rescue_enabled",
     "severe_truncation_final_gate_enabled",
     "generic_temporal_use_yaw_specific_term",
+    "generic_coarse_scoring",
     "generic_rotation_grid_enabled",
     "generic_heading_enabled",
     "save_color_soft_mask",

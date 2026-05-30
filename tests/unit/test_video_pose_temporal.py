@@ -87,6 +87,48 @@ def test_pose_track_scale_prior_ignores_seed_track_and_outliers() -> None:
     assert prior["frame_ids"] == [3, 4]
 
 
+def test_generic_temporal_speedup_args_require_temporal_prior(tmp_path: Path) -> None:
+    task_dir = tmp_path / "obj_000001@000001"
+    task_dir.mkdir()
+    (task_dir / "task.json").write_text(json.dumps({"task_id": "obj_000001@000001"}), encoding="utf-8")
+
+    assert ProjectExecutor._generic_temporal_speedup_args_for_task(task_dir) == []
+
+
+def test_generic_temporal_speedup_args_apply_after_prior_exists(tmp_path: Path) -> None:
+    task_dir = tmp_path / "obj_000001@000002"
+    task_dir.mkdir()
+    (task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": "obj_000001@000002",
+                "temporal_prior_pose": {
+                    "frame_id": 1,
+                    "pose": {
+                        "translation_world": [0.0, 0.0, 5.0],
+                        "rotation_matrix": np.eye(3).tolist(),
+                        "scale": [1.0, 1.0, 1.0],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ProjectExecutor._generic_temporal_speedup_args_for_task(task_dir) == [
+        "--top_k_candidates",
+        "8",
+        "--refine_top_k",
+        "1",
+        "--stage1_iters",
+        "4",
+        "--stage2_iters",
+        "3",
+        "--stage3_iters",
+        "6",
+    ]
+
+
 def test_pose_track_scale_prior_excludes_low_observability_severe_truncation() -> None:
     anchor_a = _pose_record(frame_id=1, scale=1.0, mask_iou=0.88, bbox_iou=0.88)
     anchor_b = _pose_record(frame_id=2, scale=1.1, mask_iou=0.86, bbox_iou=0.86)
@@ -2645,7 +2687,7 @@ def test_find_depth_map_for_task_skips_inaccessible_candidates(tmp_path: Path, m
     outputs_dir = tmp_path / "outputs"
     sample_dir = outputs_dir / "08_pose_optimize" / "tasks" / "obj_000002@000003"
     sample_dir.mkdir(parents=True)
-    inaccessible = outputs_dir / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / "00003.npy"
+    inaccessible = outputs_dir / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / "00002.npy"
 
     original_exists = Path.exists
 
@@ -2657,6 +2699,52 @@ def test_find_depth_map_for_task_skips_inaccessible_candidates(tmp_path: Path, m
     monkeypatch.setattr(Path, "exists", fake_exists)
 
     assert find_depth_map_for_task(sample_dir, 3) is None
+
+
+def test_find_depth_map_for_task_uses_task_frame_minus_one(tmp_path: Path) -> None:
+    outputs_dir = tmp_path / "outputs"
+    sample_dir = outputs_dir / "08_pose_optimize" / "tasks" / "obj_000002@000001"
+    depth_dir = outputs_dir / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps"
+    sample_dir.mkdir(parents=True)
+    depth_dir.mkdir(parents=True)
+    zero_based = depth_dir / "00000.npy"
+    one_based = depth_dir / "00001.npy"
+    zero_based.write_bytes(b"zero")
+    one_based.write_bytes(b"one")
+
+    assert find_depth_map_for_task(sample_dir, 1) == zero_based
+
+
+def test_find_depth_map_for_task_does_not_fallback_to_task_frame_id(tmp_path: Path) -> None:
+    outputs_dir = tmp_path / "outputs"
+    sample_dir = outputs_dir / "08_pose_optimize" / "tasks" / "obj_000002@000001"
+    depth_dir = outputs_dir / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps"
+    sample_dir.mkdir(parents=True)
+    depth_dir.mkdir(parents=True)
+    one_based = depth_dir / "00001.npy"
+    one_based.write_bytes(b"one")
+
+    assert find_depth_map_for_task(sample_dir, 1) is None
+
+
+def test_resolve_depth_map_for_frame_uses_task_frame_minus_one(tmp_path: Path) -> None:
+    depth_maps_dir = tmp_path / "depth_maps"
+    depth_maps_dir.mkdir()
+    zero_based = depth_maps_dir / "00000.npy"
+    one_based = depth_maps_dir / "00001.npy"
+    zero_based.write_bytes(b"zero")
+    one_based.write_bytes(b"one")
+
+    assert ProjectExecutor._resolve_depth_map_for_frame(depth_maps_dir, 1) == zero_based
+
+
+def test_resolve_depth_map_for_frame_does_not_fallback_to_task_frame_id(tmp_path: Path) -> None:
+    depth_maps_dir = tmp_path / "depth_maps"
+    depth_maps_dir.mkdir()
+    one_based = depth_maps_dir / "00001.npy"
+    one_based.write_bytes(b"one")
+
+    assert ProjectExecutor._resolve_depth_map_for_frame(depth_maps_dir, 1) is None
 
 
 def test_pose_all_frame_candidate_frame_ids_keep_vehicle_frames_above_area() -> None:

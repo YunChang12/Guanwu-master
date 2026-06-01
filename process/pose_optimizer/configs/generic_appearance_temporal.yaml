@@ -113,6 +113,7 @@ generic_temporal_depth_sigma: 0.80
 generic_temporal_rotation_sigma_deg: 25.0
 generic_temporal_scale_sigma_log: 0.20
 generic_temporal_use_yaw_specific_term: false
+generic_prefer_temporal_refine_first: true
 
 partial_visibility_enabled: true
 truncation_border_margin: 3
@@ -171,9 +172,13 @@ support_contact_distance_score_weight: 0.70
 support_contact_coverage_score_weight: 0.30
 support_floating_penalty_weight: 0.60
 support_penetration_penalty_weight: 1.00
-support_orientation_penalty_weight: 0.06
-support_orientation_sigma_deg: 20.0
-support_orientation_tolerance_deg: 4.0
+support_orientation_penalty_weight: 0.35
+support_orientation_sigma_deg: 8.0
+support_orientation_tolerance_deg: 2.0
+support_aligned_seed_enabled: true
+support_alignment_trigger_deg: 6.0
+support_aligned_seed_score_margin: 0.20
+support_aligned_seed_source_top_k: 2
 optional_prior_gate_start: 0.35
 optional_prior_gate_range: 0.45
 generic_upright_enabled: auto
@@ -193,10 +198,20 @@ generic_acceptance_min_visible_mask_iou: 0.12
 generic_acceptance_min_bbox_iou: 0.10
 generic_acceptance_max_center_error_ratio: 0.35
 generic_acceptance_min_projection_valid_ratio: 0.50
+generic_acceptance_truncated_min_projection_valid_ratio: 0.30
+generic_acceptance_projection_temporal_exempt_enabled: true
+generic_acceptance_projection_exempt_min_mask_iou: 0.90
+generic_acceptance_projection_exempt_min_bbox_iou: 0.60
+generic_acceptance_projection_exempt_min_temporal_score: 0.50
 generic_acceptance_depth_confidence_high: 0.70
 generic_acceptance_depth_min_threshold: 0.25
+generic_truncated_temporal_early_stop_enabled: true
+generic_truncated_temporal_early_stop_min_score: 2.0
+generic_truncated_temporal_early_stop_min_mask_iou: 0.90
+generic_truncated_temporal_early_stop_min_bbox_iou: 0.60
+generic_truncated_temporal_early_stop_min_temporal_score: 0.50
 
-save_color_soft_mask: true
-save_fg_bg_samples: true
-save_candidate_appearance_overlay: true
-save_score_breakdown: true
+save_color_soft_mask: false
+save_fg_bg_samples: false
+save_candidate_appearance_overlay: false
+save_score_breakdown: false

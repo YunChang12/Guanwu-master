@@ -119,7 +119,7 @@ def test_generic_temporal_speedup_args_apply_after_prior_exists(tmp_path: Path) 
         "--top_k_candidates",
         "8",
         "--refine_top_k",
-        "1",
+        "2",
         "--stage1_iters",
         "4",
         "--stage2_iters",
@@ -491,6 +491,35 @@ def test_truncated_fail_fast_triggers_for_low_observability_failure() -> None:
     assert decision["truncation_severity"] == "severe"
 
 
+def test_generic_truncated_fail_fast_triggers_for_failed_severe_bottom_truncation() -> None:
+    record = {
+        "status": "failed",
+        "reason": "missing_optimization_report",
+        "metrics": {},
+    }
+
+    decision = ProjectExecutor._pose_truncated_object_fail_fast_decision(
+        record,
+        inst={
+            "bbox_xyxy": [135.0, 294.0, 255.0, 360.0],
+            "image_width": 640,
+            "image_height": 360,
+            "truncation_info": {
+                "is_truncated": True,
+                "truncated_sides": ["bottom"],
+                "truncation_severity": "severe",
+                "low_observability": True,
+            },
+        },
+        frame_id=10,
+    )
+
+    assert decision["skip_object"] is True
+    assert decision["frame_id"] == 10
+    assert decision["reason"] == "missing_optimization_report"
+    assert decision["truncation_severity"] == "severe"
+
+
 def test_truncated_fail_fast_ignores_non_truncated_failure() -> None:
     record = {
         "status": "failed",
@@ -538,6 +567,38 @@ def test_truncated_fail_fast_keeps_object_when_prior_frames_were_accepted() -> N
     assert summary["accepted_frame_count_before_failure"] == 2
     assert frame_records["frame_000011"]["status"] == "skipped"
     assert frame_records["frame_000012"]["failed_frame_id"] == 10
+
+
+def test_generic_followup_severe_truncation_pre_skip_requires_prior() -> None:
+    inst = {
+        "bbox_xyxy": [136.0, 275.0, 261.0, 360.0],
+        "image_width": 640,
+        "image_height": 360,
+        "truncation_info": {
+            "is_truncated": True,
+            "truncated_sides": ["bottom"],
+            "truncation_severity": "severe",
+            "low_observability": True,
+        },
+    }
+
+    without_prior = ProjectExecutor._generic_followup_severe_truncation_skip_decision(
+        inst,
+        frame_id=1,
+        has_temporal_prior=False,
+    )
+    with_prior = ProjectExecutor._generic_followup_severe_truncation_skip_decision(
+        inst,
+        frame_id=10,
+        has_temporal_prior=True,
+    )
+
+    assert without_prior["skip_object"] is False
+    assert without_prior["reason"] == "no_temporal_prior"
+    assert with_prior["skip_object"] is True
+    assert with_prior["reason"] == "generic_followup_severe_truncation"
+    assert with_prior["frame_id"] == 10
+    assert with_prior["truncation_severity"] == "severe"
 
 
 def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records() -> None:
@@ -1605,9 +1666,9 @@ def test_truncated_visible_bbox_uses_visible_rendered_mask_bbox() -> None:
         target_mask=target_mask,
     )
 
-    assert score["visible_projected_bbox"] == [45.0, 25.0, 115.0, 84.0]
+    assert score["visible_projected_bbox"] == [20.0, 25.0, 150.0, 100.0]
     assert score["visible_target_bbox"] == [45.0, 25.0, 115.0, 84.0]
-    assert score["visible_bbox_iou"] == 1.0
+    assert np.isclose(score["visible_bbox_iou"], 4130.0 / 9750.0)
 
 
 def test_truncated_visible_bbox_falls_back_without_visible_mask() -> None:

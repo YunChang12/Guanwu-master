@@ -2257,6 +2257,23 @@ class ProjectExecutor:
                     frame_records[f"frame_{int(frame_id):06d}"] = {"status": "skipped", "reason": "missing_camera"}
                     continue
 
+                if generic_mode:
+                    object_fail_fast = self._generic_followup_severe_truncation_skip_decision(
+                        inst,
+                        frame_id=int(frame_id),
+                        has_temporal_prior=bool(previous_candidate_prior if all_frames_mode else previous_accepted),
+                    )
+                    if object_fail_fast.get("skip_object"):
+                        frame_records[f"frame_{int(frame_id):06d}"] = {
+                            "status": "skipped",
+                            "reason": object_fail_fast.get("reason"),
+                            "frame_id": int(frame_id),
+                            "truncation_severity": object_fail_fast.get("truncation_severity"),
+                            "low_observability": object_fail_fast.get("low_observability"),
+                            "truncated_sides": object_fail_fast.get("truncated_sides", []),
+                        }
+                        break
+
                 task_id = f"{obj_id}@{int(frame_id):06d}"
                 task_dir = tasks_dir / task_id
                 result_dir = results_dir / task_id
@@ -2390,14 +2407,10 @@ class ProjectExecutor:
                         **record_base,
                     }
                     frame_records[f"frame_{int(frame_id):06d}"] = failed_record
-                    object_fail_fast = (
-                        {"skip_object": False, "reason": "generic_mode"}
-                        if generic_mode
-                        else self._pose_truncated_object_fail_fast_decision(
-                            failed_record,
-                            inst=inst,
-                            frame_id=int(frame_id),
-                        )
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        failed_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
                     )
                     if object_fail_fast.get("skip_object"):
                         break
@@ -2417,14 +2430,10 @@ class ProjectExecutor:
                         **record_base,
                     }
                     frame_records[f"frame_{int(frame_id):06d}"] = failed_record
-                    object_fail_fast = (
-                        {"skip_object": False, "reason": "generic_mode"}
-                        if generic_mode
-                        else self._pose_truncated_object_fail_fast_decision(
-                            failed_record,
-                            inst=inst,
-                            frame_id=int(frame_id),
-                        )
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        failed_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
                     )
                     if object_fail_fast.get("skip_object"):
                         break
@@ -2553,14 +2562,10 @@ class ProjectExecutor:
                     rejected_frames += 1
                     object_rejected += 1
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
-                    object_fail_fast = (
-                        {"skip_object": False, "reason": "generic_mode"}
-                        if generic_mode
-                        else self._pose_truncated_object_fail_fast_decision(
-                            pose_record,
-                            inst=inst,
-                            frame_id=int(frame_id),
-                        )
+                    object_fail_fast = self._pose_truncated_object_fail_fast_decision(
+                        pose_record,
+                        inst=inst,
+                        frame_id=int(frame_id),
                     )
                     if object_fail_fast.get("skip_object"):
                         break
@@ -3153,6 +3158,40 @@ class ProjectExecutor:
             "truncated_sides": sorted(sides),
             "truncation_severity": severity or "unknown",
             "low_observability": bool(low_observability),
+        }
+
+    @staticmethod
+    def _generic_followup_severe_truncation_skip_decision(
+        inst: dict | None,
+        *,
+        frame_id: int,
+        has_temporal_prior: bool,
+    ) -> dict:
+        if not has_temporal_prior:
+            return {"skip_object": False, "reason": "no_temporal_prior", "frame_id": int(frame_id)}
+        decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(inst, frame_id=frame_id)
+        if not decision.get("skip_object"):
+            return {"skip_object": False, "reason": "not_truncated", "frame_id": int(frame_id)}
+        severity = str(decision.get("truncation_severity") or "").lower()
+        low_observability = bool(decision.get("low_observability"))
+        sides = set(str(side).lower() for side in (decision.get("truncated_sides") or []))
+        severe_bottom = "bottom" in sides and (severity in {"severe", "critical"} or low_observability)
+        if not severe_bottom:
+            return {
+                "skip_object": False,
+                "reason": "truncation_not_severe_bottom",
+                "frame_id": int(frame_id),
+                "truncation_severity": severity or decision.get("truncation_severity"),
+                "low_observability": low_observability,
+                "truncated_sides": sorted(sides),
+            }
+        return {
+            "skip_object": True,
+            "reason": "generic_followup_severe_truncation",
+            "frame_id": int(frame_id),
+            "truncation_severity": severity or "severe",
+            "low_observability": low_observability,
+            "truncated_sides": sorted(sides),
         }
 
     def _build_pose_track_observations(
@@ -6534,7 +6573,7 @@ class ProjectExecutor:
             "--top_k_candidates",
             "8",
             "--refine_top_k",
-            "1",
+            "2",
             "--stage1_iters",
             "4",
             "--stage2_iters",

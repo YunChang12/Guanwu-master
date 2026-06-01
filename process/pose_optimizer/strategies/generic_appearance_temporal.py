@@ -82,6 +82,12 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "support_orientation_score",
     "support_orientation_penalty",
     "support_orientation_penalty_eff",
+    "support_aligned_candidate_used",
+    "support_normal_angle_deg_before_alignment",
+    "support_normal_angle_deg_after_alignment",
+    "support_alignment_axis_index",
+    "support_alignment_axis_sign",
+    "support_alignment_delta_deg",
     "support_bottom_point_count",
     "support_bottom_mean_abs_m",
     "support_bottom_max_abs_m",
@@ -101,6 +107,8 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "depth_outlier_penalty",
     "temporal_jump_penalty",
     "projection_valid_ratio",
+    "projection_acceptance_threshold",
+    "projection_acceptance_exempt",
     "visible_ratio",
     "truncation_ratio",
     "acceptance_status",
@@ -354,6 +362,92 @@ def support_orientation_score(
         "support_normal_angle_deg": angle_deg,
         "support_orientation_score": score,
         "support_orientation_penalty": float(1.0 - score),
+    }
+
+
+def rotation_align_vector(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return the minimal 3D rotation that maps source direction to target."""
+
+    src = _normalize(np.asarray(source, dtype=np.float64).reshape(3))
+    dst = _normalize(np.asarray(target, dtype=np.float64).reshape(3))
+    if float(np.linalg.norm(src)) <= 1e-12 or float(np.linalg.norm(dst)) <= 1e-12:
+        return np.eye(3, dtype=np.float64)
+    dot = float(np.clip(np.dot(src, dst), -1.0, 1.0))
+    if dot > 1.0 - 1e-10:
+        return np.eye(3, dtype=np.float64)
+    if dot < -1.0 + 1e-10:
+        basis = np.eye(3, dtype=np.float64)
+        axis = basis[int(np.argmin(np.abs(src)))]
+        axis = _normalize(axis - np.dot(axis, src) * src)
+        cross_matrix = np.array(
+            [
+                [0.0, -axis[2], axis[1]],
+                [axis[2], 0.0, -axis[0]],
+                [-axis[1], axis[0], 0.0],
+            ],
+            dtype=np.float64,
+        )
+        return np.eye(3, dtype=np.float64) + 2.0 * (cross_matrix @ cross_matrix)
+    axis = np.cross(src, dst)
+    cross_matrix = np.array(
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return np.eye(3, dtype=np.float64) + cross_matrix + (cross_matrix @ cross_matrix) * (1.0 / (1.0 + dot))
+
+
+def _orthonormalize_rotation(rotation: np.ndarray) -> np.ndarray:
+    u, _, vt = np.linalg.svd(np.asarray(rotation, dtype=np.float64))
+    fixed = u @ vt
+    if np.linalg.det(fixed) < 0.0:
+        u[:, -1] *= -1.0
+        fixed = u @ vt
+    return fixed
+
+
+def align_rotation_to_support_normal(
+    rotation_cam: np.ndarray,
+    plane: dict[str, Any],
+    *,
+    axis_index: int | None = None,
+    axis_sign: float | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Minimally rotate a pose so its local support axis follows the plane normal."""
+
+    rotation = _orthonormalize_rotation(np.asarray(rotation_cam, dtype=np.float64).reshape(3, 3))
+    normal = _normalize(np.asarray(plane.get("normal"), dtype=np.float64))
+    before = support_orientation_score(rotation, plane)
+    selected_axis = before.get("support_axis_index") if axis_index is None else axis_index
+    selected_sign = before.get("support_axis_sign") if axis_sign is None else axis_sign
+    if normal.shape != (3,) or float(np.linalg.norm(normal)) <= 1e-12 or selected_axis is None:
+        return rotation, {
+            "support_normal_angle_deg_before_alignment": before.get("support_normal_angle_deg"),
+            "support_normal_angle_deg_after_alignment": before.get("support_normal_angle_deg"),
+            "support_alignment_axis_index": selected_axis,
+            "support_alignment_axis_sign": selected_sign,
+            "support_alignment_delta_deg": 0.0,
+        }
+    selected_axis = int(selected_axis)
+    selected_sign = 1.0 if float(selected_sign or 1.0) >= 0.0 else -1.0
+    support_axis = rotation[:, selected_axis] * selected_sign
+    delta_rotation = rotation_align_vector(support_axis, normal)
+    aligned = _orthonormalize_rotation(delta_rotation @ rotation)
+    after = support_orientation_score(aligned, plane)
+    before_angle = before.get("support_normal_angle_deg")
+    after_angle = after.get("support_normal_angle_deg")
+    delta_angle = 0.0
+    if before_angle is not None and after_angle is not None:
+        delta_angle = max(0.0, float(before_angle) - float(after_angle))
+    return aligned, {
+        "support_normal_angle_deg_before_alignment": before_angle,
+        "support_normal_angle_deg_after_alignment": after_angle,
+        "support_alignment_axis_index": selected_axis,
+        "support_alignment_axis_sign": selected_sign,
+        "support_alignment_delta_deg": float(delta_angle),
     }
 
 
@@ -875,19 +969,40 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
     def _acceptance(self, result: dict[str, Any]) -> dict[str, Any]:
         reject_reasons: list[str] = []
         visible_iou = float(result.get("visible_mask_iou") or result.get("soft_mask_iou") or result.get("mask_iou") or 0.0)
+        mask_iou = float(result.get("mask_iou") or visible_iou)
         bbox_iou = float(result.get("bbox_iou") or 0.0)
         center_error_value = result.get("bbox_center_error_px")
         center_error = float(center_error_value) if center_error_value is not None else 1e9
         bbox_diag = self.target_bbox_diagonal
         center_threshold = max(120.0, float(getattr(self.generic_args, "generic_acceptance_max_center_error_ratio", 0.35)) * bbox_diag)
         projection_ratio = float(result.get("projection_valid_ratio") or 0.0)
+        is_truncated = bool((getattr(self, "truncation_info", {}) or {}).get("is_truncated", False))
+        projection_threshold = float(getattr(self.generic_args, "generic_acceptance_min_projection_valid_ratio", 0.50))
+        if is_truncated:
+            projection_threshold = min(
+                projection_threshold,
+                float(getattr(self.generic_args, "generic_acceptance_truncated_min_projection_valid_ratio", 0.30)),
+            )
+        metadata = result.get("initializer_metadata") if isinstance(result.get("initializer_metadata"), dict) else {}
+        source = str(metadata.get("source", ""))
+        base_source = str(metadata.get("base_source", ""))
+        temporal_like = source == "temporal_prior" or base_source == "temporal_prior"
+        projection_exempt = (
+            is_truncated
+            and bool(getattr(self.generic_args, "generic_acceptance_projection_temporal_exempt_enabled", True))
+            and temporal_like
+            and mask_iou >= float(getattr(self.generic_args, "generic_acceptance_projection_exempt_min_mask_iou", 0.90))
+            and bbox_iou >= float(getattr(self.generic_args, "generic_acceptance_projection_exempt_min_bbox_iou", 0.60))
+            and float(result.get("temporal_score") or 0.0)
+            >= float(getattr(self.generic_args, "generic_acceptance_projection_exempt_min_temporal_score", 0.50))
+        )
         if visible_iou < float(getattr(self.generic_args, "generic_acceptance_min_visible_mask_iou", 0.12)):
             reject_reasons.append("visible_mask_or_soft_iou_below_threshold")
         if bbox_iou < float(getattr(self.generic_args, "generic_acceptance_min_bbox_iou", 0.10)):
             reject_reasons.append("bbox_iou_below_threshold")
         if center_error > center_threshold:
             reject_reasons.append("bbox_center_error_above_threshold")
-        if projection_ratio < float(getattr(self.generic_args, "generic_acceptance_min_projection_valid_ratio", 0.50)):
+        if projection_ratio < projection_threshold and not projection_exempt:
             reject_reasons.append("projection_valid_ratio_below_threshold")
         if (
             float(result.get("depth_confidence") or 0.0) >= float(getattr(self.generic_args, "generic_acceptance_depth_confidence_high", 0.70))
@@ -897,6 +1012,8 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         return {
             "acceptance_status": "accepted" if not reject_reasons else "rejected",
             "reject_reasons": reject_reasons,
+            "projection_acceptance_threshold": float(projection_threshold),
+            "projection_acceptance_exempt": bool(projection_exempt),
         }
 
     def _augment_result(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -1362,6 +1479,37 @@ def refine_candidate_stages(
     return result, history
 
 
+def generic_early_stop_reached(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+    truncation_info: dict[str, Any] | None,
+) -> bool:
+    """Stop refining more candidates once a trustworthy generic result is found."""
+
+    if result.get("acceptance_status") != "accepted":
+        return False
+    if float(result.get("mask_iou") or 0.0) >= float(args.early_stop_mask_iou) and float(result.get("bbox_iou") or 0.0) >= float(args.early_stop_bbox_iou):
+        return True
+
+    if not bool(getattr(args, "generic_truncated_temporal_early_stop_enabled", True)):
+        return False
+    if not bool((truncation_info or {}).get("is_truncated", False)):
+        return False
+    metadata = result.get("initializer_metadata") if isinstance(result.get("initializer_metadata"), dict) else {}
+    source = str(metadata.get("source", ""))
+    base_source = str(metadata.get("base_source", ""))
+    temporal_like = source == "temporal_prior" or base_source == "temporal_prior"
+    if not temporal_like:
+        return False
+    return (
+        float(result.get("score") or 0.0) >= float(getattr(args, "generic_truncated_temporal_early_stop_min_score", 2.0))
+        and float(result.get("mask_iou") or 0.0) >= float(getattr(args, "generic_truncated_temporal_early_stop_min_mask_iou", 0.90))
+        and float(result.get("bbox_iou") or 0.0) >= float(getattr(args, "generic_truncated_temporal_early_stop_min_bbox_iou", 0.60))
+        and float(result.get("temporal_score") or 0.0)
+        >= float(getattr(args, "generic_truncated_temporal_early_stop_min_temporal_score", 0.50))
+    )
+
+
 def make_generic_temporal_seed(prior: dict[str, Any] | None, evaluator: GenericPoseEvaluator) -> dict[str, Any] | None:
     if prior is None:
         return None
@@ -1379,6 +1527,91 @@ def make_generic_temporal_seed(prior: dict[str, Any] | None, evaluator: GenericP
         "prior_pose_source": prior.get("pose_source"),
     }
     return result
+
+
+def make_support_aligned_seed(
+    base_candidate: dict[str, Any] | None,
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Evaluate a variant whose local support axis is aligned to the support plane normal."""
+
+    if base_candidate is None or not bool(getattr(args, "support_aligned_seed_enabled", False)):
+        return None
+    support_plane = getattr(evaluator, "support_plane", None) or {}
+    confidence = float(support_plane.get("support_plane_confidence") or 0.0)
+    if confidence < float(getattr(args, "support_plane_min_confidence", 0.70)):
+        return None
+    before_angle_value = base_candidate.get("support_normal_angle_deg")
+    if before_angle_value is None:
+        before = support_orientation_score(np.asarray(base_candidate["rotation_cam"], dtype=np.float64), support_plane)
+        before_angle_value = before.get("support_normal_angle_deg")
+    if before_angle_value is None:
+        return None
+    trigger_deg = float(getattr(args, "support_alignment_trigger_deg", 6.0))
+    if float(before_angle_value) < trigger_deg:
+        return None
+
+    aligned_rotation, align_meta = align_rotation_to_support_normal(
+        np.asarray(base_candidate["rotation_cam"], dtype=np.float64),
+        support_plane,
+        axis_index=base_candidate.get("support_axis_index"),
+        axis_sign=base_candidate.get("support_axis_sign"),
+    )
+    after_angle = align_meta.get("support_normal_angle_deg_after_alignment")
+    if after_angle is None or float(after_angle) >= float(before_angle_value) - 1e-6:
+        return None
+
+    result = evaluator.evaluate_absolute(
+        np.asarray(base_candidate["translation_cam"], dtype=np.float64),
+        aligned_rotation,
+        np.asarray(base_candidate["scale"], dtype=np.float64),
+    )
+    if result.get("projected_bbox") is None:
+        return None
+    base_meta = dict(base_candidate.get("initializer_metadata") or {})
+    result.update(
+        {
+            "support_aligned_candidate_used": True,
+            **align_meta,
+        }
+    )
+    result["initializer_metadata"] = {
+        **base_meta,
+        "source": "support_aligned_seed",
+        "base_source": base_meta.get("source", "unknown"),
+        "support_normal_angle_deg_before_alignment": align_meta.get("support_normal_angle_deg_before_alignment"),
+        "support_normal_angle_deg_after_alignment": align_meta.get("support_normal_angle_deg_after_alignment"),
+    }
+    return result
+
+
+def make_support_aligned_seeds(
+    candidates: list[dict[str, Any]],
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+    *,
+    temporal_seed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "support_aligned_seed_enabled", False)):
+        return []
+    sources: list[dict[str, Any]] = []
+    if temporal_seed is not None:
+        sources.append(temporal_seed)
+    limit = max(0, int(getattr(args, "support_aligned_seed_source_top_k", 2)))
+    sources.extend(candidates[:limit])
+    aligned: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for candidate in sources:
+        seed = make_support_aligned_seed(candidate, evaluator, args)
+        if seed is None:
+            continue
+        signature = fast.pose_signature(seed)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        aligned.append(seed)
+    return sorted(aligned, key=lambda item: float(item.get("score", -1e9)), reverse=True)
 
 
 def parse_angle_list(value: str | list[Any] | tuple[Any, ...]) -> list[float]:
@@ -1520,18 +1753,43 @@ def select_generic_refine_candidates(
     *,
     corrected_seed: dict[str, Any] | None = None,
     temporal_seed: dict[str, Any] | None = None,
+    support_aligned_seed: dict[str, Any] | None = None,
+    support_alignment_trigger_deg: float = 6.0,
+    support_aligned_seed_score_margin: float = 0.20,
+    prefer_temporal_first: bool = False,
 ) -> list[dict[str, Any]]:
     """Select high-scoring generic candidates while preserving trusted seeds."""
 
     limit = max(1, int(refine_top_k))
     combined = [item for item in candidates if item is not None]
-    for seed in (corrected_seed, temporal_seed):
+    for seed in (corrected_seed, temporal_seed, support_aligned_seed):
         if seed is not None:
             combined.append(seed)
     if not combined:
         return []
 
     if limit == 1 and temporal_seed is not None:
+        if support_aligned_seed is not None:
+            temporal_angle = temporal_seed.get("support_normal_angle_deg")
+            alignment_before_angle = support_aligned_seed.get("support_normal_angle_deg_before_alignment")
+            if temporal_angle is None:
+                temporal_angle = alignment_before_angle
+            aligned_angle = support_aligned_seed.get("support_normal_angle_deg")
+            if aligned_angle is None:
+                aligned_angle = support_aligned_seed.get("support_normal_angle_deg_after_alignment")
+            temporal_score = float(temporal_seed.get("score", -1e9))
+            aligned_score = float(support_aligned_seed.get("score", -1e9))
+            temporal_is_tilted = temporal_angle is not None and float(temporal_angle) >= float(support_alignment_trigger_deg)
+            aligned_improves_angle = (
+                aligned_angle is not None
+                and (
+                    temporal_angle is None
+                    or float(aligned_angle) + 1e-6 < float(temporal_angle)
+                )
+            )
+            aligned_within_margin = aligned_score >= temporal_score - abs(float(support_aligned_seed_score_margin))
+            if temporal_is_tilted and aligned_improves_angle and aligned_within_margin:
+                return [support_aligned_seed]
         return [temporal_seed]
 
     unique: list[dict[str, Any]] = []
@@ -1565,7 +1823,10 @@ def select_generic_refine_candidates(
 
     add_required("task_json_corrected_pose", corrected_seed)
     add_required("temporal_prior", temporal_seed)
+    add_required("support_aligned_seed", support_aligned_seed)
     if len(required) >= limit:
+        if prefer_temporal_first:
+            required = sorted(required, key=_temporal_refine_priority)
         return required[:limit]
 
     selected: list[dict[str, Any]] = []
@@ -1576,8 +1837,19 @@ def select_generic_refine_candidates(
         selected.append(item)
         if len(selected) >= fill_limit:
             break
+    if prefer_temporal_first:
+        required = sorted(required, key=_temporal_refine_priority)
+        return (required + selected)[:limit]
     selected.extend(required)
     return selected[:limit]
+
+
+def _temporal_refine_priority(item: dict[str, Any]) -> tuple[int, float]:
+    meta = item.get("initializer_metadata") if isinstance(item.get("initializer_metadata"), dict) else {}
+    source = str(meta.get("source", ""))
+    base_source = str(meta.get("base_source", ""))
+    temporal_rank = 0 if base_source == "temporal_prior" else 1 if source == "temporal_prior" else 2
+    return temporal_rank, -float(item.get("score", -1e9))
 
 
 def candidate_summary(result: dict[str, Any], *, t_world_from_cam: np.ndarray) -> dict[str, Any]:
@@ -1896,6 +2168,24 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         top_k=args.top_k_candidates,
         refine_top_k=args.refine_top_k,
     )
+    support_aligned_seeds = make_support_aligned_seeds(
+        initial_candidates,
+        proxy_evaluator,
+        args,
+        temporal_seed=temporal_seed,
+    )
+    if support_aligned_seeds:
+        combined_with_support = list(initial_candidates) + list(support_aligned_seeds)
+        seen_support: set[tuple[float, ...]] = set()
+        initial_candidates = []
+        for candidate in sorted(combined_with_support, key=lambda item: float(item.get("score", -1e9)), reverse=True):
+            signature = fast.pose_signature(candidate)
+            if signature in seen_support:
+                continue
+            seen_support.add(signature)
+            initial_candidates.append(candidate)
+        limit = max(int(args.top_k_candidates), int(args.refine_top_k), len(support_aligned_seeds), 1)
+        initial_candidates = initial_candidates[:limit]
     print(f"[generic-search] generated {len(initial_candidates)} candidates")
 
     preview_rows = []
@@ -1909,6 +2199,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         args.refine_top_k,
         corrected_seed=corrected_seed,
         temporal_seed=temporal_seed,
+        support_aligned_seed=support_aligned_seeds[0] if support_aligned_seeds else None,
+        support_alignment_trigger_deg=float(getattr(args, "support_alignment_trigger_deg", 6.0)),
+        support_aligned_seed_score_margin=float(getattr(args, "support_aligned_seed_score_margin", 0.20)),
+        prefer_temporal_first=bool(getattr(args, "generic_prefer_temporal_refine_first", True)),
     )
     refined_results: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     best_result: dict[str, Any] | None = None
@@ -1922,6 +2216,16 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         )
         refined_result, history = refine_candidate_stages(candidate, proxy_evaluator, full_evaluator, args)
         refined_result["initializer_metadata"] = candidate.get("initializer_metadata", {})
+        for alignment_key in (
+            "support_aligned_candidate_used",
+            "support_normal_angle_deg_before_alignment",
+            "support_normal_angle_deg_after_alignment",
+            "support_alignment_axis_index",
+            "support_alignment_axis_sign",
+            "support_alignment_delta_deg",
+        ):
+            if alignment_key in candidate:
+                refined_result[alignment_key] = candidate.get(alignment_key)
         refined_result["candidate_rank"] = rank
         refined_results.append((refined_result, history))
         print(
@@ -1932,7 +2236,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         if best_result is None or float(refined_result["score"]) > float(best_result["score"]):
             best_result = refined_result
             best_history = history
-        if best_result["mask_iou"] >= args.early_stop_mask_iou and best_result["bbox_iou"] >= args.early_stop_bbox_iou:
+        if generic_early_stop_reached(best_result, args, truncation_info):
             break
 
     accepted = [item for item in refined_results if item[0].get("acceptance_status") == "accepted"]
@@ -2083,6 +2387,14 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "optional_prior_score": best_result.get("optional_prior_score"),
             "support_plane_confidence": best_result.get("support_plane_confidence"),
             "support_plane": support_plane_report_payload(support_plane),
+            "support_aligned_seed_enabled": bool(getattr(args, "support_aligned_seed_enabled", False)),
+            "support_aligned_seed_count": len(support_aligned_seeds),
+            "support_aligned_candidate_used": bool(best_result.get("support_aligned_candidate_used", False)),
+            "support_normal_angle_deg_before_alignment": best_result.get("support_normal_angle_deg_before_alignment"),
+            "support_normal_angle_deg_after_alignment": best_result.get("support_normal_angle_deg_after_alignment"),
+            "support_alignment_axis_index": best_result.get("support_alignment_axis_index"),
+            "support_alignment_axis_sign": best_result.get("support_alignment_axis_sign"),
+            "support_alignment_delta_deg": best_result.get("support_alignment_delta_deg"),
             "support_contact_score": best_result.get("support_contact_score"),
             "support_contact_distance_score": best_result.get("support_contact_distance_score"),
             "support_contact_coverage": best_result.get("support_contact_coverage"),
@@ -2188,6 +2500,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_temporal_rotation_sigma_deg", type=float, default=25.0)
     parser.add_argument("--generic_temporal_scale_sigma_log", type=float, default=0.20)
     parser.add_argument("--generic_temporal_use_yaw_specific_term", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--generic_prefer_temporal_refine_first", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--generic_rotation_grid_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generic_rotation_grid_source_top_k", type=int, default=2)
@@ -2225,6 +2538,10 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--support_orientation_penalty_weight", type=float, default=0.0)
     parser.add_argument("--support_orientation_sigma_deg", type=float, default=20.0)
     parser.add_argument("--support_orientation_tolerance_deg", type=float, default=4.0)
+    parser.add_argument("--support_aligned_seed_enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--support_alignment_trigger_deg", type=float, default=6.0)
+    parser.add_argument("--support_aligned_seed_score_margin", type=float, default=0.20)
+    parser.add_argument("--support_aligned_seed_source_top_k", type=int, default=2)
     parser.add_argument("--optional_prior_gate_start", type=float, default=0.35)
     parser.add_argument("--optional_prior_gate_range", type=float, default=0.45)
     parser.add_argument("--generic_upright_enabled", default="auto")
@@ -2237,8 +2554,18 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_acceptance_min_bbox_iou", type=float, default=0.10)
     parser.add_argument("--generic_acceptance_max_center_error_ratio", type=float, default=0.35)
     parser.add_argument("--generic_acceptance_min_projection_valid_ratio", type=float, default=0.50)
+    parser.add_argument("--generic_acceptance_truncated_min_projection_valid_ratio", type=float, default=0.30)
+    parser.add_argument("--generic_acceptance_projection_temporal_exempt_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_acceptance_projection_exempt_min_mask_iou", type=float, default=0.90)
+    parser.add_argument("--generic_acceptance_projection_exempt_min_bbox_iou", type=float, default=0.60)
+    parser.add_argument("--generic_acceptance_projection_exempt_min_temporal_score", type=float, default=0.50)
     parser.add_argument("--generic_acceptance_depth_confidence_high", type=float, default=0.70)
     parser.add_argument("--generic_acceptance_depth_min_threshold", type=float, default=0.25)
+    parser.add_argument("--generic_truncated_temporal_early_stop_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_truncated_temporal_early_stop_min_score", type=float, default=2.0)
+    parser.add_argument("--generic_truncated_temporal_early_stop_min_mask_iou", type=float, default=0.90)
+    parser.add_argument("--generic_truncated_temporal_early_stop_min_bbox_iou", type=float, default=0.60)
+    parser.add_argument("--generic_truncated_temporal_early_stop_min_temporal_score", type=float, default=0.50)
 
     parser.add_argument("--save_color_soft_mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save_fg_bg_samples", action=argparse.BooleanOptionalAction, default=True)

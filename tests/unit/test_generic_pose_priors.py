@@ -273,6 +273,92 @@ def test_support_orientation_score_penalizes_axis_tilt_softly() -> None:
     assert tilted["support_orientation_penalty"] > 0.0
 
 
+def test_align_rotation_to_support_normal_reduces_axis_tilt() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        align_rotation_to_support_normal,
+        support_orientation_score,
+    )
+
+    plane = {"normal": np.array([0.0, 1.0, 0.0], dtype=np.float64)}
+    theta = np.deg2rad(18.0)
+    tilted_rotation = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    aligned_rotation, metadata = align_rotation_to_support_normal(tilted_rotation, plane)
+    before = support_orientation_score(tilted_rotation, plane)
+    after = support_orientation_score(aligned_rotation, plane)
+
+    assert before["support_normal_angle_deg"] > 17.0
+    assert after["support_normal_angle_deg"] < 1.0
+    assert metadata["support_normal_angle_deg_before_alignment"] > 17.0
+    assert metadata["support_normal_angle_deg_after_alignment"] < 1.0
+    assert metadata["support_alignment_axis_index"] == 1
+
+
+def test_make_support_aligned_seed_evaluates_corrected_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import make_support_aligned_seed
+
+    plane = {"normal": np.array([0.0, 1.0, 0.0], dtype=np.float64), "support_plane_confidence": 0.9}
+    theta = np.deg2rad(16.0)
+    tilted_rotation = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    class DummyEvaluator:
+        support_plane = plane
+
+        def evaluate_absolute(self, translation, rotation, scale):
+            from process.pose_optimizer.strategies.generic_appearance_temporal import support_orientation_score
+
+            result = {
+                "score": 0.9,
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "projected_bbox": [0.0, 0.0, 10.0, 10.0],
+            }
+            result.update(support_orientation_score(rotation, plane))
+            result["support_plane_confidence"] = plane["support_plane_confidence"]
+            return result
+
+    args = argparse.Namespace(
+        support_aligned_seed_enabled=True,
+        support_plane_min_confidence=0.70,
+        support_alignment_trigger_deg=6.0,
+    )
+    base = {
+        "score": 1.0,
+        "translation_cam": np.array([0.0, 0.0, 4.0], dtype=np.float64),
+        "rotation_cam": tilted_rotation,
+        "scale": np.ones(3, dtype=np.float64),
+        "support_normal_angle_deg": 16.0,
+        "support_axis_index": 1,
+        "support_axis_sign": 1.0,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    seed = make_support_aligned_seed(base, DummyEvaluator(), args)
+
+    assert seed is not None
+    assert seed["support_normal_angle_deg"] < 1.0
+    assert seed["support_aligned_candidate_used"] is True
+    assert seed["support_normal_angle_deg_before_alignment"] > 15.0
+    assert seed["support_normal_angle_deg_after_alignment"] < 1.0
+    assert seed["initializer_metadata"]["source"] == "support_aligned_seed"
+    assert seed["initializer_metadata"]["base_source"] == "temporal_prior"
+
+
 def test_support_sample_region_uses_near_mask_ring_when_lower_band_is_sparse() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import (
         estimate_support_plane_from_observed_depth,
@@ -698,6 +784,22 @@ def test_generic_config_uses_moderate_support_contact_defaults() -> None:
     assert cfg["support_contact_tolerance_m"] == 0.06
     assert cfg["support_floating_tolerance_m"] == 0.15
     assert cfg["support_penetration_tolerance_m"] == 0.07
+    assert cfg["support_orientation_penalty_weight"] == 0.35
+    assert cfg["support_orientation_sigma_deg"] == 8.0
+    assert cfg["support_orientation_tolerance_deg"] == 2.0
+    assert cfg["support_aligned_seed_enabled"] is True
+    assert cfg["support_alignment_trigger_deg"] == 6.0
+    assert cfg["support_aligned_seed_score_margin"] == 0.20
+    assert cfg["support_aligned_seed_source_top_k"] == 2
+    assert cfg["generic_acceptance_truncated_min_projection_valid_ratio"] == 0.30
+    assert cfg["generic_acceptance_projection_temporal_exempt_enabled"] is True
+    assert cfg["generic_truncated_temporal_early_stop_enabled"] is True
+    assert cfg["generic_prefer_temporal_refine_first"] is True
+    assert cfg["pytorch3d_bin_size"] is None
+    assert cfg["save_color_soft_mask"] is False
+    assert cfg["save_fg_bg_samples"] is False
+    assert cfg["save_candidate_appearance_overlay"] is False
+    assert cfg["save_score_breakdown"] is False
 
 
 def test_generic_proxy_scoring_forces_light_mode_while_full_keeps_config(monkeypatch, tmp_path) -> None:
@@ -860,6 +962,145 @@ def test_select_generic_refine_candidates_uses_temporal_seed_when_single_refine(
     assert selected[0]["initializer_metadata"]["source"] == "temporal_prior"
 
 
+def test_select_generic_refine_candidates_prefers_support_aligned_seed_when_temporal_is_tilted() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    def candidate(score: float, tx: float, source: str, angle: float) -> dict[str, object]:
+        return {
+            "score": score,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "support_normal_angle_deg": angle,
+            "initializer_metadata": {"source": source},
+        }
+
+    temporal_seed = candidate(1.20, 5.0, "temporal_prior", 14.0)
+    support_seed = candidate(1.10, 5.1, "support_aligned_seed", 0.6)
+    selected = select_generic_refine_candidates(
+        [candidate(1.40, 0.0, "generic_grid", 8.0)],
+        refine_top_k=1,
+        temporal_seed=temporal_seed,
+        support_aligned_seed=support_seed,
+        support_alignment_trigger_deg=6.0,
+        support_aligned_seed_score_margin=0.20,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["initializer_metadata"]["source"] == "support_aligned_seed"
+
+
+def test_select_generic_refine_candidates_can_prioritize_temporal_like_candidates() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    def candidate(score: float, tx: float, source: str, base_source: str | None = None) -> dict[str, object]:
+        meta = {"source": source}
+        if base_source is not None:
+            meta["base_source"] = base_source
+        return {
+            "score": score,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": meta,
+        }
+
+    temporal_seed = candidate(1.2, 5.0, "temporal_prior")
+    support_seed = candidate(1.3, 5.1, "support_aligned_seed", "temporal_prior")
+    selected = select_generic_refine_candidates(
+        [candidate(10.0, 0.0, "generic_grid"), candidate(0.2, 4.0, "task_json_corrected_pose")],
+        refine_top_k=4,
+        temporal_seed=temporal_seed,
+        support_aligned_seed=support_seed,
+        prefer_temporal_first=True,
+    )
+
+    sources = [item.get("initializer_metadata", {}).get("source") for item in selected]
+    assert sources[:2] == ["support_aligned_seed", "temporal_prior"]
+
+
+def test_select_generic_refine_candidates_uses_alignment_before_angle_when_temporal_angle_missing() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    temporal_seed = {
+        "score": 1.20,
+        "translation_cam": np.array([5.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+    support_seed = {
+        "score": 1.05,
+        "translation_cam": np.array([5.1, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "support_normal_angle_deg": 0.8,
+        "support_normal_angle_deg_before_alignment": 13.0,
+        "support_normal_angle_deg_after_alignment": 0.8,
+        "initializer_metadata": {"source": "support_aligned_seed"},
+    }
+
+    selected = select_generic_refine_candidates(
+        [],
+        refine_top_k=1,
+        temporal_seed=temporal_seed,
+        support_aligned_seed=support_seed,
+        support_alignment_trigger_deg=6.0,
+        support_aligned_seed_score_margin=0.20,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["initializer_metadata"]["source"] == "support_aligned_seed"
+
+
+def test_generic_early_stop_allows_high_quality_truncated_temporal_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import generic_early_stop_reached
+
+    args = argparse.Namespace(
+        early_stop_mask_iou=0.94,
+        early_stop_bbox_iou=0.94,
+        generic_truncated_temporal_early_stop_enabled=True,
+        generic_truncated_temporal_early_stop_min_score=2.0,
+        generic_truncated_temporal_early_stop_min_mask_iou=0.90,
+        generic_truncated_temporal_early_stop_min_bbox_iou=0.60,
+        generic_truncated_temporal_early_stop_min_temporal_score=0.50,
+    )
+    result = {
+        "score": 2.33,
+        "mask_iou": 0.94,
+        "bbox_iou": 0.71,
+        "temporal_score": 0.86,
+        "acceptance_status": "accepted",
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    assert generic_early_stop_reached(result, args, {"is_truncated": True, "truncation_sides": ["bottom"]})
+
+
+def test_generic_early_stop_keeps_full_bbox_rule_for_non_truncated_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import generic_early_stop_reached
+
+    args = argparse.Namespace(
+        early_stop_mask_iou=0.94,
+        early_stop_bbox_iou=0.94,
+        generic_truncated_temporal_early_stop_enabled=True,
+        generic_truncated_temporal_early_stop_min_score=2.0,
+        generic_truncated_temporal_early_stop_min_mask_iou=0.90,
+        generic_truncated_temporal_early_stop_min_bbox_iou=0.60,
+        generic_truncated_temporal_early_stop_min_temporal_score=0.50,
+    )
+    result = {
+        "score": 2.33,
+        "mask_iou": 0.94,
+        "bbox_iou": 0.71,
+        "temporal_score": 0.86,
+        "acceptance_status": "accepted",
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    assert not generic_early_stop_reached(result, args, {"is_truncated": False, "truncation_sides": []})
+
+
 def test_generic_refine_uses_full_evaluator_for_fine_stage(monkeypatch) -> None:
     from process.pose_optimizer.strategies import generic_appearance_temporal as generic
 
@@ -979,11 +1220,17 @@ def test_generic_acceptance_treats_zero_bbox_center_error_as_valid() -> None:
 
     evaluator = object.__new__(GenericPoseEvaluator)
     evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
     evaluator.generic_args = argparse.Namespace(
         generic_acceptance_max_center_error_ratio=0.35,
         generic_acceptance_min_visible_mask_iou=0.12,
         generic_acceptance_min_bbox_iou=0.10,
         generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
         generic_acceptance_depth_confidence_high=0.70,
         generic_acceptance_depth_min_threshold=0.25,
     )
@@ -999,7 +1246,88 @@ def test_generic_acceptance_treats_zero_bbox_center_error_as_valid() -> None:
         }
     )
 
-    assert decision == {"acceptance_status": "accepted", "reject_reasons": []}
+    assert decision["acceptance_status"] == "accepted"
+    assert decision["reject_reasons"] == []
+    assert decision["projection_acceptance_threshold"] == 0.50
+    assert decision["projection_acceptance_exempt"] is False
+
+
+def test_generic_acceptance_allows_high_quality_truncated_temporal_projection_ratio() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": True, "truncation_sides": ["bottom"]}
+    evaluator.generic_args = argparse.Namespace(
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.94,
+            "mask_iou": 0.94,
+            "bbox_iou": 0.71,
+            "bbox_center_error_px": 9.5,
+            "projection_valid_ratio": 0.445,
+            "temporal_score": 0.86,
+            "initializer_metadata": {"source": "temporal_prior"},
+            "depth_confidence": 1.0,
+            "depth_score": 0.61,
+        }
+    )
+
+    assert decision["acceptance_status"] == "accepted"
+    assert decision["reject_reasons"] == []
+    assert decision["projection_acceptance_threshold"] == 0.30
+    assert decision["projection_acceptance_exempt"] is True
+
+
+def test_generic_acceptance_still_rejects_low_projection_non_truncated_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
+    evaluator.generic_args = argparse.Namespace(
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.94,
+            "mask_iou": 0.94,
+            "bbox_iou": 0.71,
+            "bbox_center_error_px": 9.5,
+            "projection_valid_ratio": 0.445,
+            "temporal_score": 0.86,
+            "initializer_metadata": {"source": "temporal_prior"},
+            "depth_confidence": 1.0,
+            "depth_score": 0.61,
+        }
+    )
+
+    assert decision["acceptance_status"] == "rejected"
+    assert decision["reject_reasons"] == ["projection_valid_ratio_below_threshold"]
 
 
 def test_executor_generic_mode_uses_generic_acceptance_without_road_gates(monkeypatch) -> None:
@@ -1061,7 +1389,7 @@ def test_generic_truncated_visible_bbox_becomes_primary_bbox_score() -> None:
     assert result["full_projected_bbox"] == [10.0, 20.0, 110.0, 240.0]
 
 
-def test_truncated_visible_bbox_uses_visible_region_silhouette() -> None:
+def test_truncated_visible_bbox_uses_full_in_frame_silhouette() -> None:
     from process.pose_optimizer.strategies import temporal_fast
 
     rendered = np.zeros((100, 120), dtype=np.uint8)
@@ -1081,5 +1409,5 @@ def test_truncated_visible_bbox_uses_visible_region_silhouette() -> None:
         target_mask=target,
     )
 
-    assert score["visible_projected_bbox"] == [30.0, 20.0, 80.0, 84.0]
+    assert score["visible_projected_bbox"] == [30.0, 20.0, 80.0, 100.0]
     assert score["visible_target_bbox"] == [28.0, 18.0, 82.0, 84.0]

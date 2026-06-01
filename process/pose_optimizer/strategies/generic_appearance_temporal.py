@@ -1093,9 +1093,13 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 + hard_weight * float(result.get("mask_iou") or 0.0)
             )
             bbox_score = float(result.get("bbox_iou") or 0.0)
-            contour = self._contour_score_cached(rendered_mask)
-            result.update(contour)
-            contour_value = float(contour["contour_score"])
+            if coarse_scoring:
+                result.update({"contour_score": 0.0, "contour_mean_distance_px": None})
+                contour_value = 0.0
+            else:
+                contour = self._contour_score_cached(rendered_mask)
+                result.update(contour)
+                contour_value = float(contour["contour_score"])
             result["visible_mask_iou"] = result.get("mask_iou")
             result["visible_soft_mask_iou"] = result.get("soft_mask_iou")
             result["visible_bbox_iou"] = result.get("bbox_iou")
@@ -1103,14 +1107,15 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
 
         result["mask_blend_score"] = float(mask_blend_score)
 
-        edge = temporal_fast.compute_edge_score(rendered_mask, self.edge_context, self.generic_args) if self.enable_edge_score else {
+        edge_enabled_for_candidate = self.enable_edge_score and not coarse_scoring
+        edge = temporal_fast.compute_edge_score(rendered_mask, self.edge_context, self.generic_args) if edge_enabled_for_candidate else {
             "edge_score": 0.0,
             "edge_mean_distance_px": None,
             "edge_rendered_points": 0,
             "edge_roi": self.edge_context.get("roi") if self.edge_context else None,
         }
         result.update(edge)
-        edge_confidence = 1.0 if self.enable_edge_score and int(edge.get("edge_rendered_points") or 0) > 0 else 0.0
+        edge_confidence = 1.0 if edge_enabled_for_candidate and int(edge.get("edge_rendered_points") or 0) > 0 else 0.0
         result["edge_confidence"] = edge_confidence
 
         appearance = (
@@ -1268,10 +1273,13 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             * float(support.get("support_orientation_penalty") or 0.0)
         )
 
-        scaled_vertices = self.vertices * np.asarray(result["scale"], dtype=self.dtype).reshape(1, 3)
-        points_cam = scaled_vertices @ np.asarray(result["rotation_cam"], dtype=self.dtype).T + np.asarray(result["translation_cam"], dtype=self.dtype).reshape(1, 3)
-        projected_uv, valid_z = fast.project_points(points_cam, **self.intrinsics)
-        proj_ratio = projection_valid_ratio(points_cam, projected_uv, valid_z, self.image_size)
+        if coarse_scoring:
+            proj_ratio = 1.0 if result.get("projected_bbox") is not None else 0.0
+        else:
+            scaled_vertices = self.vertices * np.asarray(result["scale"], dtype=self.dtype).reshape(1, 3)
+            points_cam = scaled_vertices @ np.asarray(result["rotation_cam"], dtype=self.dtype).T + np.asarray(result["translation_cam"], dtype=self.dtype).reshape(1, 3)
+            projected_uv, valid_z = fast.project_points(points_cam, **self.intrinsics)
+            proj_ratio = projection_valid_ratio(points_cam, projected_uv, valid_z, self.image_size)
 
         generic_score = (
             observation_score
@@ -1452,31 +1460,51 @@ def refine_candidate_stages(
     scale = np.asarray(coarse_result["scale"], dtype=np.float64)
     initializer_metadata = dict(coarse_result.get("initializer_metadata") or {})
     history: list[dict[str, Any]] = []
+    lightweight_search = bool(getattr(args, "generic_lightweight_search_scoring", True))
+    original_full_coarse_scoring = bool(getattr(full_evaluator.generic_args, "generic_coarse_scoring", False))
+    result = coarse_result
     for stage_name, evaluator, max_iters in (
         ("coarse", proxy_evaluator, args.stage1_iters),
         ("rotation", proxy_evaluator, args.stage2_iters),
         ("fine", full_evaluator, args.stage3_iters),
     ):
-        result, stage_history = generic_local_search_stage(
-            evaluator=evaluator,
-            base_translation_cam=translation_cam,
-            base_rotation_cam=rotation_cam,
-            base_scale=scale,
-            stage_name=stage_name,
-            max_iters=max_iters,
-            step_decay=args.step_decay,
-            max_translation_delta=args.max_translation_delta,
-            max_rotation_delta_deg=args.max_rotation_delta_deg,
-            scale_min_factor=args.scale_min_factor,
-            scale_max_factor=args.scale_max_factor,
-            save_full_history=args.save_full_history,
-            initializer_metadata=initializer_metadata,
-        )
+        original_stage_coarse_scoring = bool(getattr(evaluator.generic_args, "generic_coarse_scoring", False))
+        if lightweight_search:
+            evaluator.generic_args.generic_coarse_scoring = True
+        try:
+            result, stage_history = generic_local_search_stage(
+                evaluator=evaluator,
+                base_translation_cam=translation_cam,
+                base_rotation_cam=rotation_cam,
+                base_scale=scale,
+                stage_name=stage_name,
+                max_iters=max_iters,
+                step_decay=args.step_decay,
+                max_translation_delta=args.max_translation_delta,
+                max_rotation_delta_deg=args.max_rotation_delta_deg,
+                scale_min_factor=args.scale_min_factor,
+                scale_max_factor=args.scale_max_factor,
+                save_full_history=args.save_full_history,
+                initializer_metadata=initializer_metadata,
+            )
+        finally:
+            evaluator.generic_args.generic_coarse_scoring = original_stage_coarse_scoring
         history.extend(stage_history)
         translation_cam = np.asarray(result["translation_cam"], dtype=np.float64)
         rotation_cam = np.asarray(result["rotation_cam"], dtype=np.float64)
         scale = np.asarray(result["scale"], dtype=np.float64)
-    return result, history
+
+    full_evaluator.generic_args.generic_coarse_scoring = False
+    try:
+        final = full_evaluator.evaluate_absolute(translation_cam, rotation_cam, scale, keep_mask=True)
+    finally:
+        full_evaluator.generic_args.generic_coarse_scoring = original_full_coarse_scoring
+    final["initializer_metadata"] = initializer_metadata
+    if "params" in result:
+        final["params"] = np.asarray(result["params"], dtype=np.float64).copy()
+    if not args.save_full_history:
+        history.append(generic_optimization_history_row("full_rescore", 0, "final", 0, final, 0.0))
+    return final, history
 
 
 def generic_early_stop_reached(
@@ -1633,6 +1661,7 @@ def augment_generic_rotation_candidates(
     source_candidates = candidates[: max(1, int(getattr(args, "generic_rotation_grid_source_top_k", 2)))]
     augmented = list(candidates)
     seen = {fast.pose_signature(item) for item in augmented}
+    batch_specs: list[dict[str, Any]] = []
     for base in source_candidates:
         base_rotation = np.asarray(base["rotation_cam"], dtype=np.float64)
         for yaw in yaw_values:
@@ -1642,21 +1671,47 @@ def augment_generic_rotation_candidates(
                         continue
                     delta = fast.euler_xyz_to_matrix(math.radians(pitch), math.radians(yaw), math.radians(roll))
                     rotation = delta @ base_rotation
-                    result = evaluator.evaluate_absolute(
-                        np.asarray(base["translation_cam"], dtype=np.float64),
-                        rotation,
-                        np.asarray(base["scale"], dtype=np.float64),
-                    )
-                    if result.get("projected_bbox") is None:
-                        continue
-                    sig = fast.pose_signature(result)
-                    if sig in seen:
-                        continue
-                    seen.add(sig)
                     meta = dict(base.get("initializer_metadata") or {})
                     meta.update({"source": "generic_rotation_grid", "yaw_deg": yaw, "pitch_deg": pitch, "roll_deg": roll})
-                    result["initializer_metadata"] = meta
-                    augmented.append(result)
+                    batch_specs.append(
+                        {
+                            "translation_cam": np.asarray(base["translation_cam"], dtype=np.float64),
+                            "rotation_cam": rotation,
+                            "scale": np.asarray(base["scale"], dtype=np.float64),
+                            "initializer_metadata": meta,
+                        }
+                    )
+    if batch_specs and bool(getattr(args, "enable_batch_gpu_eval", False)):
+        results = evaluator.evaluate_absolute_batch(
+            np.stack([spec["translation_cam"] for spec in batch_specs], axis=0),
+            np.stack([spec["rotation_cam"] for spec in batch_specs], axis=0),
+            np.stack([spec["scale"] for spec in batch_specs], axis=0),
+            batch_size=int(getattr(args, "batch_gpu_size", 32)),
+        )
+        for spec, result in zip(batch_specs, results):
+            if result.get("projected_bbox") is None:
+                continue
+            sig = fast.pose_signature(result)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            result["initializer_metadata"] = dict(spec["initializer_metadata"])
+            augmented.append(result)
+    else:
+        for spec in batch_specs:
+            result = evaluator.evaluate_absolute(
+                spec["translation_cam"],
+                spec["rotation_cam"],
+                spec["scale"],
+            )
+            if result.get("projected_bbox") is None:
+                continue
+            sig = fast.pose_signature(result)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            result["initializer_metadata"] = dict(spec["initializer_metadata"])
+            augmented.append(result)
     return sorted(augmented, key=lambda item: float(item.get("score", -1e9)), reverse=True)[: max(len(candidates), int(args.top_k_candidates))]
 
 
@@ -2508,6 +2563,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_pitch_degrees", default="-10,0,10")
     parser.add_argument("--generic_roll_degrees", default="-10,0,10")
     parser.add_argument("--generic_coarse_scoring", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_lightweight_search_scoring", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--support_plane_enabled", default="auto")
     parser.add_argument("--support_plane_min_confidence", type=float, default=0.70)

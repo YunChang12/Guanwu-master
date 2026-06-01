@@ -2561,6 +2561,16 @@ class ProjectExecutor:
                 else:
                     rejected_frames += 1
                     object_rejected += 1
+                    if generic_mode:
+                        self._abandon_generic_rejected_pose_frame(
+                            pose_record,
+                            frame_ids=frame_ids,
+                            frame_records=frame_records,
+                            results_dir=results_dir,
+                            result_dir=result_dir,
+                            task_id=task_id,
+                        )
+                        break
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
                     object_fail_fast = self._pose_truncated_object_fail_fast_decision(
                         pose_record,
@@ -3142,7 +3152,7 @@ class ProjectExecutor:
                 pass
 
         if not severity:
-            if low_observability or len(sides) >= 2 or "bottom" in sides:
+            if low_observability or len(sides) >= 2:
                 severity = "severe"
             elif sides:
                 severity = "light"
@@ -5897,6 +5907,43 @@ class ProjectExecutor:
             return rejected_dir
         except Exception:
             return result_dir
+
+    @staticmethod
+    def _abandon_generic_rejected_pose_frame(
+        record: dict,
+        *,
+        frame_ids: list[int],
+        frame_records: dict[str, dict],
+        results_dir: Path,
+        result_dir: Path,
+        task_id: str,
+    ) -> dict:
+        frame_id = int(record.get("frame_id") or 0)
+        abandoned_dir = ProjectExecutor._rename_rejected_pose_result_dir(results_dir, result_dir, task_id)
+        abandoned = dict(record)
+        abandoned["status"] = "abandoned"
+        abandoned["reason"] = str(record.get("reason") or "generic_pose_rejected")
+        abandoned["abandoned_after_rejection"] = True
+        abandoned["output_dir"] = str(abandoned_dir)
+        report_path = abandoned_dir / "optimization_report.json"
+        if report_path.exists():
+            abandoned["report"] = str(report_path)
+        frame_records[f"frame_{frame_id:06d}"] = abandoned
+
+        remaining_count = 0
+        for remaining_frame_id in sorted({int(fid) for fid in frame_ids if int(fid) > frame_id}):
+            remaining_count += 1
+            frame_records[f"frame_{remaining_frame_id:06d}"] = {
+                "status": "skipped",
+                "reason": "skipped_after_generic_pose_rejection",
+                "abandoned_frame_id": frame_id,
+            }
+        return {
+            "stop_object": True,
+            "abandoned_frame_id": frame_id,
+            "remaining_frame_count": remaining_count,
+            "abandoned_output_dir": str(abandoned_dir),
+        }
 
     @staticmethod
     def _load_frame_image_for_detection(inst: dict):

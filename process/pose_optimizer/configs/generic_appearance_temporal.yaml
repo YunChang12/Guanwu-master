@@ -131,6 +131,7 @@ generic_yaw_degrees: "0,45,90,135,180,225,270,315"
 generic_pitch_degrees: "-10,0,10"
 generic_roll_degrees: "-10,0,10"
 generic_coarse_scoring: false
+generic_lightweight_search_scoring: true
 
 road_constraint_enabled: false
 road_depth_fallback_enabled: false

@@ -569,6 +569,39 @@ def test_truncated_fail_fast_keeps_object_when_prior_frames_were_accepted() -> N
     assert frame_records["frame_000012"]["failed_frame_id"] == 10
 
 
+def test_generic_rejected_frame_is_abandoned_and_stops_followups(tmp_path: Path) -> None:
+    results_dir = tmp_path / "results"
+    result_dir = results_dir / "obj_000001@000010"
+    result_dir.mkdir(parents=True)
+    (result_dir / "optimization_report.json").write_text("{}", encoding="utf-8")
+    record = _pose_record(frame_id=10, status="rejected")
+    record["reason"] = "projection_valid_ratio_below_threshold:0.431"
+    record["output_dir"] = str(result_dir)
+    record["report"] = str(result_dir / "optimization_report.json")
+    frame_records: dict[str, dict] = {}
+
+    summary = ProjectExecutor._abandon_generic_rejected_pose_frame(
+        record,
+        frame_ids=[1, 2, 10, 11, 12],
+        frame_records=frame_records,
+        results_dir=results_dir,
+        result_dir=result_dir,
+        task_id="obj_000001@000010",
+    )
+
+    rejected_dir = results_dir / "obj_000001@000010__rejected"
+    assert summary["stop_object"] is True
+    assert summary["abandoned_frame_id"] == 10
+    assert summary["remaining_frame_count"] == 2
+    assert rejected_dir.exists()
+    assert not result_dir.exists()
+    assert frame_records["frame_000010"]["status"] == "abandoned"
+    assert frame_records["frame_000010"]["output_dir"] == str(rejected_dir)
+    assert frame_records["frame_000011"]["status"] == "skipped"
+    assert frame_records["frame_000011"]["reason"] == "skipped_after_generic_pose_rejection"
+    assert frame_records["frame_000012"]["abandoned_frame_id"] == 10
+
+
 def test_generic_followup_severe_truncation_pre_skip_requires_prior() -> None:
     inst = {
         "bbox_xyxy": [136.0, 275.0, 261.0, 360.0],
@@ -599,6 +632,27 @@ def test_generic_followup_severe_truncation_pre_skip_requires_prior() -> None:
     assert with_prior["reason"] == "generic_followup_severe_truncation"
     assert with_prior["frame_id"] == 10
     assert with_prior["truncation_severity"] == "severe"
+
+
+def test_generic_followup_bottom_only_border_touch_does_not_pre_skip() -> None:
+    inst = {
+        "bbox_xyxy": [155.0, 208.0, 278.0, 359.0],
+        "image_width": 640,
+        "image_height": 360,
+    }
+
+    decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(inst, frame_id=5)
+    followup = ProjectExecutor._generic_followup_severe_truncation_skip_decision(
+        inst,
+        frame_id=5,
+        has_temporal_prior=True,
+    )
+
+    assert decision["skip_object"] is True
+    assert decision["truncated_sides"] == ["bottom"]
+    assert decision["truncation_severity"] == "light"
+    assert followup["skip_object"] is False
+    assert followup["reason"] == "truncation_not_severe_bottom"
 
 
 def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records() -> None:

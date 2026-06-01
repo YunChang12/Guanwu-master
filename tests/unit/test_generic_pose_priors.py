@@ -646,6 +646,234 @@ def test_generic_coarse_scoring_skips_depth_and_appearance_heavy_terms() -> None
     assert result["score"] >= 0.0
 
 
+def test_generic_coarse_scoring_skips_cpu_heavy_terms(monkeypatch) -> None:
+    from process.pose_optimizer.strategies import generic_appearance_temporal as generic
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("coarse scoring should not run this CPU-heavy term")
+
+    monkeypatch.setattr(GenericPoseEvaluator, "_contour_score_cached", explode)
+    monkeypatch.setattr(GenericPoseEvaluator, "_support_contact", explode)
+    monkeypatch.setattr(generic.temporal_fast, "compute_edge_score", explode)
+    monkeypatch.setattr(generic, "projection_valid_ratio", explode)
+
+    vertices = np.array(
+        [
+            [-0.2, -0.2, 0.0],
+            [0.2, -0.2, 0.0],
+            [0.2, 0.2, 0.0],
+            [-0.2, 0.2, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[24:40, 24:40] = 1
+    args = argparse.Namespace(
+        edge_score_enabled=True,
+        generic_coarse_scoring=True,
+        depth_enabled=False,
+        appearance_enabled=False,
+        hard_mask_weight=0.3,
+        generic_contour_sigma_px=4.0,
+        generic_mask_weight=1.0,
+        generic_bbox_weight=0.15,
+        generic_contour_weight=0.35,
+        generic_edge_weight=0.20,
+        generic_depth_weight=0.35,
+        generic_appearance_weight=0.25,
+        temporal_enabled=False,
+        generic_temporal_weight=0.55,
+        generic_scale_prior_weight=0.30,
+        support_plane_min_confidence=0.70,
+        support_plane_weight=0.20,
+        optional_prior_gate_start=0.35,
+        optional_prior_gate_range=0.45,
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.0,
+        generic_acceptance_min_bbox_iou=0.0,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+        depth_outlier_score_threshold=0.1,
+        depth_outlier_penalty=0.0,
+    )
+    evaluator = GenericPoseEvaluator(
+        vertices=vertices,
+        faces=faces,
+        mesh=None,
+        full_mask=mask,
+        soft_full_mask=mask.astype(np.float32),
+        json_bbox=[24.0, 24.0, 40.0, 40.0],
+        intrinsics={"fx": 80.0, "fy": 80.0, "cx": 32.0, "cy": 32.0},
+        image_size=(64, 64),
+        bbox_weight=0.0,
+        hard_mask_weight=0.3,
+        backend="triangle_fill",
+        enable_bbox_prefilter=False,
+        prefilter_bbox_iou_min=0.0,
+        prefilter_center_factor=2.0,
+        prefilter_size_ratio_min=0.1,
+        prefilter_size_ratio_max=10.0,
+        roi_iou_margin=4,
+        disable_roi_iou=False,
+        fast_float32=True,
+        profile_timings=False,
+        generic_args=args,
+        temporal_prior=None,
+        truncation_info={"is_truncated": False, "truncation_sides": []},
+        edge_context={"roi": [0, 0, 64, 64]},
+        appearance_prior=None,
+        depth_prior=None,
+        support_plane={
+            "available": True,
+            "normal": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+            "offset": 0.0,
+            "support_plane_confidence": 1.0,
+            "inlier_ratio": 1.0,
+            "plane_residual_m": 0.0,
+        },
+    )
+
+    result = evaluator.evaluate_absolute(
+        np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        np.eye(3, dtype=np.float64),
+        np.ones(3, dtype=np.float64),
+    )
+
+    assert result["contour_score"] == 0.0
+    assert result["edge_confidence"] == 0.0
+    assert result["support_plane_enabled"] is False
+    assert result["projection_valid_ratio"] == 1.0
+    assert result["acceptance_status"] == "accepted"
+
+
+def test_generic_rotation_grid_uses_batch_evaluation_when_enabled() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import augment_generic_rotation_candidates
+
+    class DummyEvaluator:
+        def __init__(self):
+            self.batch_calls = 0
+
+        def evaluate_absolute(self, *_args, **_kwargs):
+            raise AssertionError("rotation grid should use evaluate_absolute_batch")
+
+        def evaluate_absolute_batch(self, translations, rotations, scales, batch_size=32):
+            self.batch_calls += 1
+            return [
+                {
+                    "translation_cam": np.asarray(translation, dtype=np.float64),
+                    "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                    "scale": np.asarray(scale, dtype=np.float64),
+                    "projected_bbox": [1.0, 1.0, 5.0, 5.0],
+                    "score": float(index + 1),
+                    "mask_iou": 0.8,
+                    "soft_mask_iou": 0.8,
+                    "bbox_iou": 0.8,
+                    "bbox_center_error_px": 0.0,
+                }
+                for index, (translation, rotation, scale) in enumerate(zip(translations, rotations, scales))
+            ]
+
+    base = {
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "projected_bbox": [1.0, 1.0, 5.0, 5.0],
+        "score": 0.5,
+        "initializer_metadata": {"source": "base"},
+    }
+    evaluator = DummyEvaluator()
+    args = argparse.Namespace(
+        generic_rotation_grid_enabled=True,
+        generic_rotation_grid_source_top_k=1,
+        generic_yaw_degrees="0,45",
+        generic_pitch_degrees="0",
+        generic_roll_degrees="0",
+        top_k_candidates=4,
+        enable_batch_gpu_eval=True,
+        batch_gpu_size=8,
+    )
+
+    candidates = augment_generic_rotation_candidates([base], evaluator, args)
+
+    assert evaluator.batch_calls == 1
+    assert len(candidates) == 2
+    assert any(
+        item.get("initializer_metadata", {}).get("source") == "generic_rotation_grid"
+        for item in candidates
+    )
+
+
+def test_generic_refine_candidate_stages_light_search_then_single_full_score() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import refine_candidate_stages
+
+    class DummyEvaluator:
+        def __init__(self, coarse: bool, label: str):
+            self.generic_args = argparse.Namespace(generic_coarse_scoring=coarse)
+            self.label = label
+            self.delta_modes: list[bool] = []
+            self.absolute_modes: list[bool] = []
+
+        def set_initializer_metadata(self, _metadata):
+            pass
+
+        def evaluate_delta(self, base_translation, base_rotation, base_scale, params, keep_mask=False):
+            self.delta_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(base_translation, base_rotation, base_scale, score=1.0, keep_mask=keep_mask)
+
+        def evaluate_absolute(self, translation, rotation, scale, keep_mask=False):
+            self.absolute_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(translation, rotation, scale, score=2.0, keep_mask=keep_mask)
+
+        def _result(self, translation, rotation, scale, *, score: float, keep_mask: bool):
+            result = {
+                "score": score,
+                "mask_iou": 0.8,
+                "soft_mask_iou": 0.8,
+                "bbox_iou": 0.8,
+                "bbox_center_error_px": 0.0,
+                "projected_bbox": [1.0, 1.0, 5.0, 5.0],
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "acceptance_status": "accepted",
+            }
+            if keep_mask:
+                result["rendered_mask"] = np.ones((8, 8), dtype=np.uint8)
+            return result
+
+    candidate = {
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "candidate"},
+    }
+    proxy = DummyEvaluator(coarse=True, label="proxy")
+    full = DummyEvaluator(coarse=False, label="full")
+    args = argparse.Namespace(
+        stage1_iters=0,
+        stage2_iters=0,
+        stage3_iters=0,
+        step_decay=0.5,
+        max_translation_delta=0.8,
+        max_rotation_delta_deg=45.0,
+        scale_min_factor=0.5,
+        scale_max_factor=2.2,
+        save_full_history=False,
+        generic_lightweight_search_scoring=True,
+    )
+
+    refined, _history = refine_candidate_stages(candidate, proxy, full, args)
+
+    assert full.delta_modes == [True, True]
+    assert full.absolute_modes == [False]
+    assert full.generic_args.generic_coarse_scoring is False
+    assert refined["score"] == 2.0
+    assert "rendered_mask" in refined
+
+
 def test_generic_support_penalty_uses_normalized_observation_gate() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
@@ -1101,7 +1329,7 @@ def test_generic_early_stop_keeps_full_bbox_rule_for_non_truncated_candidate() -
     assert not generic_early_stop_reached(result, args, {"is_truncated": False, "truncation_sides": []})
 
 
-def test_generic_refine_uses_full_evaluator_for_fine_stage(monkeypatch) -> None:
+def test_generic_refine_uses_light_fine_search_then_full_rescore(monkeypatch) -> None:
     from process.pose_optimizer.strategies import generic_appearance_temporal as generic
 
     calls = []
@@ -1153,6 +1381,7 @@ def test_generic_refine_uses_full_evaluator_for_fine_stage(monkeypatch) -> None:
         scale_min_factor=0.5,
         scale_max_factor=2.2,
         save_full_history=False,
+        generic_lightweight_search_scoring=True,
     )
     coarse_result = {
         "translation_cam": np.array([0.0, 0.0, 2.0]),
@@ -1170,9 +1399,11 @@ def test_generic_refine_uses_full_evaluator_for_fine_stage(monkeypatch) -> None:
 
     assert ("stage:coarse", True, False) in calls
     assert ("stage:rotation", True, False) in calls
-    assert ("stage:fine", False, False) in calls
-    assert ("full", False, True) not in calls
-    assert result["score"] == 1.0
+    assert ("stage:fine", True, False) in calls
+    assert ("full", False, True) in calls
+    assert result["score"] == 2.0
+    assert result["depth_score"] == 0.6
+    assert result["appearance_score"] == 0.7
 
 
 def test_generic_temporal_score_omits_yaw_specific_term() -> None:

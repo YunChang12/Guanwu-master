@@ -41,6 +41,18 @@ class VideoPipelineConfig(BaseModel):
     object_detection_backend: str = "seg2track_sam2"
     pose_optimizer_timeout_sec: float = 1800.0
     pose_optimize_min_bbox_area_px: float = 5000.0
+    mesh_reconstruct_object_ids: list[str] = Field(default_factory=list)
+    mesh_proxy_mode: str = "auto"
+    mesh_proxy_target_faces: int = 1500
+    mesh_proxy_use_for_pose: bool = True
+    mesh_proxy_keep_original_for_export: bool = True
+    background_mode: str = "auto"
+    background_disable_road_semantics: bool = False
+    task_foreground_object_ids: list[str] = Field(default_factory=list)
+    background_cleaner: str = "temporal"
+    background_cleaner_config_path: str | None = None
+    background_cleaner_model: str = "gpt-image-2"
+    background_cleaner_reference_frame_id: int = 1
 
 
 class PoliciesConfig(BaseModel):

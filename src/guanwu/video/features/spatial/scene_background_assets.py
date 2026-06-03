@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
+import os
 import zlib
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +20,27 @@ DYNAMIC_LABELS = ("car", "truck", "bus", "van", "motorcycle", "bicycle", "person
 STATIC_GUARD_LABELS = ("fence", "road", "sidewalk", "rail", "wall", "track", "building")
 ROAD_LABELS = ("road", "roadway", "asphalt", "lane", "street")
 NON_ROAD_STATIC_LABELS = ("sidewalk", "rail", "track", "fence", "wall", "building", "grass", "curb")
+TASK_BACKGROUND_LABELS = (
+    "table",
+    "tabletop",
+    "wooden board",
+    "board",
+    "metal table",
+    "metal surface",
+    "groove",
+    "rail",
+    "track",
+    "base",
+    "floor",
+    "wall",
+)
+DEFAULT_OPENAI_IMAGE_EDIT_PROMPT = (
+    "Using the input image as a visual reference, generate a clean foundational background for this "
+    "robotic manipulation scene. Remove the robot arms, grasped wooden block, loose blocks, tools, "
+    "cables, and clutter, while preserving the original camera perspective, wooden board geometry, "
+    "metal grooved table, lighting, shadows, reflections, and overall workspace layout. Do not make "
+    "a studio-clean generic tabletop; keep the scene-specific base environment natural and aligned."
+)
 
 
 def build_dynamic_mask(
@@ -48,6 +71,37 @@ def build_dynamic_mask(
         shadow = _shadow_mask(bbox, (height, width), shadow_expand_px)
         dynamic |= mask | shadow
     return dynamic
+
+
+def build_task_foreground_mask(
+    detections: dict[str, Any],
+    image_shape: tuple[int, int],
+    object_ids: list[str] | tuple[str, ...] | set[str] | None,
+    *,
+    foreground_expand_px: int = 2,
+) -> np.ndarray:
+    height, width = image_shape
+    target_ids = {str(object_id).strip() for object_id in (object_ids or []) if str(object_id).strip()}
+    if not target_ids:
+        return build_dynamic_mask(detections, image_shape, foreground_expand_px=foreground_expand_px)
+    foreground = np.zeros((height, width), dtype=bool)
+    for inst in detections.get("instances", []) or []:
+        inst_ids = {
+            str(inst.get(key) or "").strip()
+            for key in ("object_id", "track_id", "instance_id", "id")
+            if str(inst.get(key) or "").strip()
+        }
+        if target_ids.isdisjoint(inst_ids):
+            continue
+        mask = _decode_instance_mask(inst, (height, width))
+        if mask is None:
+            mask = _bbox_mask(inst.get("bbox"), (height, width))
+        if not mask.any():
+            continue
+        if foreground_expand_px > 0:
+            mask = _dilate(mask, int(foreground_expand_px))
+        foreground |= mask
+    return foreground
 
 
 def build_static_guard_mask(
@@ -199,6 +253,13 @@ def generate_target_frame_background_assets(
     semantic_road_estimator: Callable[..., Any] | None = None,
     grid_stride: int = 4,
     top_k: int = 5,
+    background_mode: str = "auto",
+    task_foreground_object_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    disable_road_semantics: bool = False,
+    background_cleaner: str = "temporal",
+    background_cleaner_config: dict[str, Any] | None = None,
+    background_cleaner_reference_frame_id: int | None = None,
+    background_image_cleaner: Callable[..., dict[str, Any] | None] | None = None,
 ) -> dict[str, str]:
     summary_path = Path(summary_path)
     output_dir = Path(output_dir)
@@ -214,11 +275,21 @@ def generate_target_frame_background_assets(
     target_det = _load_json(target_entry["detections"])
     target_rgb = _decode_image_b64(target_det["image_b64"])
     height, width = target_rgb.shape[:2]
-    object_index_masks = _load_object_index_masks(object_index_path, (height, width))
-    target_mask = build_dynamic_mask(target_det, (height, width))
-    target_mask |= object_index_masks.get(int(target_frame_id), np.zeros((height, width), dtype=bool))
-    target_road_visible_mask = build_road_visible_mask(target_det, (height, width))
-    target_road_visible_mask |= _load_sidecar_road_mask(target_entry, target_det, (height, width), summary_path=summary_path)
+    mode = str(background_mode or "auto").strip().lower()
+    task_ids = [str(object_id).strip() for object_id in (task_foreground_object_ids or []) if str(object_id).strip()]
+    tabletop_task_mode = mode in {"tabletop_task", "task", "manipulation", "robot_task"}
+    object_index_masks = {} if task_ids else _load_object_index_masks(object_index_path, (height, width))
+    target_mask = (
+        build_task_foreground_mask(target_det, (height, width), task_ids)
+        if tabletop_task_mode
+        else build_dynamic_mask(target_det, (height, width))
+    )
+    if not tabletop_task_mode:
+        target_mask |= object_index_masks.get(int(target_frame_id), np.zeros((height, width), dtype=bool))
+    target_road_visible_mask = np.zeros((height, width), dtype=bool)
+    if not tabletop_task_mode:
+        target_road_visible_mask = build_road_visible_mask(target_det, (height, width))
+        target_road_visible_mask |= _load_sidecar_road_mask(target_entry, target_det, (height, width), summary_path=summary_path)
     static_guard_mask = build_static_guard_mask(target_det, (height, width))
 
     source_rgbs: list[np.ndarray] = []
@@ -227,7 +298,15 @@ def generate_target_frame_background_assets(
     road_visible_votes = np.zeros((height, width), dtype=np.uint16)
     road_full_votes = np.zeros((height, width), dtype=np.uint16)
     road_frame_count = 0
-    limit_frames = frame_entries if top_k <= 0 else _rank_frames(frame_entries, target_frame_id)[: max(top_k, 1) * 8]
+    cleaner_name = str(background_cleaner or "temporal").strip().lower()
+    openai_image_cleaner_enabled = tabletop_task_mode and cleaner_name in {
+        "openai_image_edit",
+        "gpt_image_edit",
+        "gpt-image-edit",
+    }
+    limit_frames = [] if openai_image_cleaner_enabled else (
+        frame_entries if top_k <= 0 else _rank_frames(frame_entries, target_frame_id)[: max(top_k, 1) * 8]
+    )
     for entry in limit_frames:
         det = _load_json(entry["detections"])
         if not det.get("image_b64"):
@@ -236,21 +315,23 @@ def generate_target_frame_background_assets(
         if rgb.shape[:2] != (height, width):
             rgb = np.asarray(Image.fromarray(rgb).resize((width, height), Image.BILINEAR))
         frame_id = int(entry.get("frame_idx") or det.get("frame_idx") or target_frame_id)
-        mask = build_dynamic_mask(det, (height, width))
-        mask |= object_index_masks.get(frame_id, np.zeros((height, width), dtype=bool))
-        frame_static_guard = build_static_guard_mask(det, (height, width))
-        static_guard_mask |= frame_static_guard
-        frame_road_visible = build_road_visible_mask(det, (height, width))
-        frame_road_visible |= _load_sidecar_road_mask(entry, det, (height, width), summary_path=summary_path)
-        frame_road_full = build_road_full_mask_from_visible(
-            frame_road_visible,
-            mask,
-            static_guard_mask=frame_static_guard,
-        )
-        if _is_usable_semantic_road_mask(frame_road_full):
-            road_frame_count += 1
-            road_visible_votes += frame_road_visible.astype(np.uint16)
-            road_full_votes += frame_road_full.astype(np.uint16)
+        mask = build_task_foreground_mask(det, (height, width), task_ids) if tabletop_task_mode else build_dynamic_mask(det, (height, width))
+        if not tabletop_task_mode:
+            mask |= object_index_masks.get(frame_id, np.zeros((height, width), dtype=bool))
+        if not tabletop_task_mode:
+            frame_static_guard = build_static_guard_mask(det, (height, width))
+            static_guard_mask |= frame_static_guard
+            frame_road_visible = build_road_visible_mask(det, (height, width))
+            frame_road_visible |= _load_sidecar_road_mask(entry, det, (height, width), summary_path=summary_path)
+            frame_road_full = build_road_full_mask_from_visible(
+                frame_road_visible,
+                mask,
+                static_guard_mask=frame_static_guard,
+            )
+            if _is_usable_semantic_road_mask(frame_road_full):
+                road_frame_count += 1
+                road_visible_votes += frame_road_visible.astype(np.uint16)
+                road_full_votes += frame_road_full.astype(np.uint16)
         usable = ~mask
         if not usable.any():
             continue
@@ -273,6 +354,121 @@ def generate_target_frame_background_assets(
     fallback_mask = (source_count < 2) & (~target_mask)
     clean_rgb[fallback_mask] = target_rgb[fallback_mask]
     clean_rgb = _fill_low_candidate_dynamic_regions(clean_rgb, target_rgb, target_mask, source_count)
+
+    if tabletop_task_mode:
+        clean_rgb_path = output_dir / "clean_target_rgb.png"
+        dynamic_mask_path = output_dir / "dynamic_mask_target.png"
+        confidence_path = output_dir / "confidence_map.png"
+        source_count_path = output_dir / "source_count_map.png"
+        tabletop_mesh = mesh_dir / "tabletop_background.obj"
+        cleaner_assets: dict[str, str] = {}
+        cleaner_quality: dict[str, Any] = {"clean_rgb_source": "temporal"}
+        cleaner_config = dict(background_cleaner_config or {})
+        if openai_image_cleaner_enabled:
+            cleaner_config = _load_openai_image_edit_config(cleaner_config)
+            reference_frame_id = int(background_cleaner_reference_frame_id or target_frame_id)
+            reference_entry = _select_frame(frame_entries, reference_frame_id)
+            reference_det = _load_json(reference_entry["detections"])
+            reference_rgb = _decode_image_b64(reference_det["image_b64"])
+            if reference_rgb.shape[:2] != (height, width):
+                reference_rgb = np.asarray(Image.fromarray(reference_rgb).resize((width, height), Image.BILINEAR))
+            cleaner_mask_mode = str(cleaner_config.get("mask_mode") or cleaner_config.get("edit_mask_mode") or "target").strip().lower()
+            mask_frame_mode = str(cleaner_config.get("mask_frame_mode") or cleaner_config.get("temporal_mask_mode") or "reference_frame").strip().lower()
+            mask_frame_entries = frame_entries if mask_frame_mode in {"all", "all_frames", "temporal", "union"} else [reference_entry]
+            prompt_only_mode = cleaner_mask_mode in {"none", "no_mask", "prompt", "prompt_only", "image_prompt", "reference_only"}
+            full_image_output = _as_bool(
+                cleaner_config.get("use_full_image_output"),
+                default=prompt_only_mode or cleaner_mask_mode in {"full", "full_image", "whole_image", "all"},
+            )
+            if prompt_only_mode:
+                cleaner_mask = np.zeros((height, width), dtype=bool)
+            elif cleaner_mask_mode in {"full", "full_image", "whole_image", "all"}:
+                cleaner_mask = np.ones((height, width), dtype=bool)
+            elif cleaner_mask_mode in {"foreground", "foreground_objects", "all_objects", "detected_objects"}:
+                cleaner_mask = _build_foreground_instance_mask_for_frames(
+                    frame_entries=mask_frame_entries,
+                    image_shape=(height, width),
+                    expand_px=int(cleaner_config.get("mask_expand_px", 8) or 8),
+                )
+                if not cleaner_mask.any():
+                    cleaner_mask = target_mask
+            else:
+                cleaner_mask = _build_task_foreground_mask_for_frames(
+                    frame_entries=mask_frame_entries,
+                    image_shape=(height, width),
+                    object_ids=task_ids,
+                    expand_px=int(cleaner_config.get("mask_expand_px", 8) or 8),
+                )
+                if not cleaner_mask.any():
+                    cleaner_mask = target_mask
+            reference_path = output_dir / "openai_image_edit_reference.png"
+            cleaner_mask_path = output_dir / "openai_image_edit_mask.png"
+            raw_clean_path = output_dir / "openai_image_edit_raw.png"
+            Image.fromarray(reference_rgb).save(reference_path)
+            if prompt_only_mode:
+                Image.fromarray(np.zeros((height, width, 4), dtype=np.uint8), mode="RGBA").save(cleaner_mask_path)
+            else:
+                _write_openai_edit_mask_png(cleaner_mask_path, cleaner_mask)
+            cleaner = background_image_cleaner or run_openai_image_edit_background_cleaner
+            cleaner_result = cleaner(
+                image_path=reference_path,
+                mask_path=cleaner_mask_path,
+                output_path=raw_clean_path,
+                config=cleaner_config,
+                reference_frame_id=reference_frame_id,
+            )
+            raw_path = Path((cleaner_result or {}).get("raw_output_path") or (cleaner_result or {}).get("clean_rgb_path") or raw_clean_path)
+            edited_rgb = np.asarray(Image.open(raw_path).convert("RGB"))
+            if edited_rgb.shape[:2] != (height, width):
+                edited_rgb = np.asarray(Image.fromarray(edited_rgb).resize((width, height), Image.BILINEAR))
+            clean_rgb = edited_rgb if full_image_output else _blend_cleaner_output(reference_rgb, edited_rgb, cleaner_mask)
+            cleaner_assets = {
+                "openai_image_edit_reference": str(reference_path),
+                "openai_image_edit_mask": str(cleaner_mask_path),
+                "openai_image_edit_raw": str(raw_path),
+            }
+            cleaner_quality = {
+                "clean_rgb_source": "openai_image_edit",
+                "clean_rgb_reference_frame_id": int(reference_frame_id),
+                "clean_rgb_model": str((cleaner_result or {}).get("model") or cleaner_config.get("model") or "gpt-image-2"),
+                "clean_rgb_prompt": str((cleaner_result or {}).get("prompt") or cleaner_config.get("prompt") or DEFAULT_OPENAI_IMAGE_EDIT_PROMPT),
+                "clean_rgb_mask_fraction": float(np.mean(cleaner_mask)),
+                "clean_rgb_mask_mode": cleaner_mask_mode,
+                "clean_rgb_mask_frame_mode": mask_frame_mode,
+                "clean_rgb_full_image_output": bool(full_image_output),
+            }
+        Image.fromarray(clean_rgb).save(clean_rgb_path)
+        Image.fromarray((target_mask.astype(np.uint8) * 255)).save(dynamic_mask_path)
+        Image.fromarray(np.clip(confidence * 255.0, 0, 255).astype(np.uint8)).save(confidence_path)
+        Image.fromarray(np.clip(source_count, 0, 255).astype(np.uint8)).save(source_count_path)
+        _write_tabletop_background_obj(tabletop_mesh, output_dir, clean_rgb_path, width, height)
+        manifest_path = output_dir / "background_manifest.json"
+        manifest = {
+            "schema": "guanwu.target_frame_background_assets.tabletop.v1",
+            "target_frame_id": int(target_frame_id),
+            "image_size": [int(width), int(height)],
+            "assets": {
+                "clean_rgb": str(clean_rgb_path),
+                "dynamic_mask": str(dynamic_mask_path),
+                "confidence_map": str(confidence_path),
+                "source_count_map": str(source_count_path),
+                "tabletop_mesh": str(tabletop_mesh),
+                "task_background_mesh": str(tabletop_mesh),
+                **cleaner_assets,
+            },
+            "quality": {
+                "background_mode": "tabletop_task",
+                "source_frame_count": len(source_rgbs),
+                "target_dynamic_fraction": float(np.mean(target_mask)),
+                "target_foreground_object_ids": task_ids,
+                "mean_confidence": float(np.mean(confidence)),
+                "road_semantics_disabled": True,
+                **cleaner_quality,
+            },
+            "road_plane": None,
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"manifest_path": str(manifest_path), "mesh_dir": str(mesh_dir)}
 
     road_visible_mask = target_road_visible_mask
     road_full_mask = build_road_full_mask_from_visible(
@@ -301,7 +497,7 @@ def generate_target_frame_background_assets(
     Image.fromarray(clean_rgb).save(clean_rgb_path)
     semantic_road_mask_path: Path | None = None
     semantic_road_estimator_used = False
-    semantic_estimator_mask = _run_semantic_road_estimator(
+    semantic_estimator_mask = None if disable_road_semantics else _run_semantic_road_estimator(
         semantic_road_estimator,
         clean_rgb_path=clean_rgb_path,
         frame_id=int(target_frame_id),
@@ -401,6 +597,8 @@ def generate_target_frame_background_assets(
             ),
             "road_semantic_frame_count": int(road_frame_count),
             "mean_confidence": float(np.mean(confidence)),
+            "background_mode": "road_target_frame",
+            "road_semantics_disabled": bool(disable_road_semantics),
         },
         "road_plane": road_plane,
     }
@@ -470,6 +668,11 @@ def load_background_asset_meshes(
             if multiframe_assets:
                 return multiframe_assets
             return [("depth_background", path)]
+    tabletop_mesh = assets.get("tabletop_mesh") or assets.get("task_background_mesh")
+    if tabletop_mesh:
+        path = Path(tabletop_mesh)
+        if path.exists():
+            return [("tabletop", path)]
     ordered = [
         ("road", assets.get("road_mesh")),
         ("structures", assets.get("structures_mesh")),
@@ -680,6 +883,211 @@ def _run_semantic_road_estimator(
     if mask.shape != image_shape:
         mask = cv2.resize(mask.astype(np.uint8), (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask.astype(bool)
+
+
+def _build_task_foreground_mask_for_frames(
+    *,
+    frame_entries: list[dict[str, Any]],
+    image_shape: tuple[int, int],
+    object_ids: list[str] | tuple[str, ...] | set[str],
+    expand_px: int,
+) -> np.ndarray:
+    out = np.zeros(image_shape, dtype=bool)
+    for entry in frame_entries:
+        try:
+            det = _load_json(entry["detections"])
+        except Exception:
+            continue
+        mask = build_task_foreground_mask(det, image_shape, object_ids, foreground_expand_px=0)
+        if mask.any():
+            out |= mask
+    if expand_px > 0 and out.any():
+        out = _dilate(out, int(expand_px))
+    return out
+
+
+def _build_foreground_instance_mask_for_frames(
+    *,
+    frame_entries: list[dict[str, Any]],
+    image_shape: tuple[int, int],
+    expand_px: int,
+) -> np.ndarray:
+    out = np.zeros(image_shape, dtype=bool)
+    for entry in frame_entries:
+        try:
+            det = _load_json(entry["detections"])
+        except Exception:
+            continue
+        for inst in det.get("instances", []) or []:
+            label = str(inst.get("concept_label") or inst.get("label") or inst.get("class_name") or "").lower()
+            if any(token in label for token in TASK_BACKGROUND_LABELS):
+                continue
+            mask = _decode_instance_mask(inst, image_shape)
+            if mask is None:
+                mask = _bbox_mask(inst.get("bbox"), image_shape)
+            if mask.any():
+                out |= mask
+    if expand_px > 0 and out.any():
+        out = _dilate(out, int(expand_px))
+    return out
+
+
+def _write_openai_edit_mask_png(path: Path, mask: np.ndarray) -> None:
+    edit_mask = mask.astype(bool)
+    alpha = np.where(edit_mask, 0, 255).astype(np.uint8)
+    rgba = np.zeros((*alpha.shape, 4), dtype=np.uint8)
+    rgba[..., :3] = np.where(edit_mask[..., None], 255, 0).astype(np.uint8)
+    rgba[..., 3] = alpha
+    Image.fromarray(rgba, mode="RGBA").save(path)
+
+
+def _blend_cleaner_output(reference_rgb: np.ndarray, edited_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    clean = reference_rgb.copy()
+    edit_mask = mask.astype(bool)
+    if edit_mask.any():
+        clean[edit_mask] = edited_rgb[edit_mask]
+        try:
+            feather = cv2.GaussianBlur(edit_mask.astype(np.float32), (0, 0), sigmaX=1.2, sigmaY=1.2)
+            feather = np.clip(feather[..., None], 0.0, 1.0)
+            blended = reference_rgb.astype(np.float32) * (1.0 - feather) + clean.astype(np.float32) * feather
+            clean = np.clip(blended, 0, 255).astype(np.uint8)
+            clean[edit_mask] = edited_rgb[edit_mask]
+        except Exception:
+            pass
+    return clean
+
+
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _load_openai_image_edit_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "model": "gpt-image-2",
+        "prompt": DEFAULT_OPENAI_IMAGE_EDIT_PROMPT,
+        "size": "original",
+        "api_size": "1536x1024",
+        "mask_mode": "prompt_only",
+        "mask_frame_mode": "reference_frame",
+        "use_full_image_output": True,
+        "quality": "high",
+        "response_format": "b64_json",
+        "api_key_env": "OPENAI_API_KEY",
+        "timeout_sec": 180.0,
+    }
+    raw = dict(config or {})
+    config_path = raw.pop("config_path", None)
+    merged.update(raw)
+    if config_path:
+        file = Path(str(config_path)).expanduser()
+        if file.exists():
+            try:
+                import yaml
+
+                loaded = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                loaded = {}
+            if isinstance(loaded, dict):
+                openai_cfg = loaded.get("openai") if isinstance(loaded.get("openai"), dict) else {}
+                image_cfg = loaded.get("image_edit") if isinstance(loaded.get("image_edit"), dict) else {}
+                merged.update(openai_cfg)
+                merged.update(image_cfg)
+    return merged
+
+
+def _resolve_openai_image_edit_size(image_path: str | Path, configured_size: Any) -> str:
+    raw = str(configured_size or "original").strip()
+    if raw.lower() in {"", "original", "same", "source", "input", "input_image", "reference", "reference_image"}:
+        with Image.open(image_path) as image:
+            width, height = image.size
+        return f"{int(width)}x{int(height)}"
+    return raw
+
+
+def run_openai_image_edit_background_cleaner(
+    *,
+    image_path: str | Path,
+    mask_path: str | Path,
+    output_path: str | Path,
+    config: dict[str, Any] | None = None,
+    reference_frame_id: int | None = None,
+) -> dict[str, Any]:
+    cfg = _load_openai_image_edit_config(config)
+    api_key = cfg.get("api_key") or os.environ.get(str(cfg.get("api_key_env") or "OPENAI_API_KEY"))
+    if not api_key:
+        raise RuntimeError(
+            "OpenAI image cleaner requires an API key. Set api_key in the cleaner config "
+            "or export the configured api_key_env."
+        )
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        raise RuntimeError("OpenAI image cleaner requires the openai Python package.") from exc
+
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    if cfg.get("base_url"):
+        client_kwargs["base_url"] = str(cfg["base_url"])
+    if cfg.get("timeout_sec"):
+        client_kwargs["timeout"] = float(cfg["timeout_sec"])
+    client = OpenAI(**client_kwargs)
+
+    output_path = Path(output_path)
+    request_size = cfg.get("api_size") or cfg.get("request_size") or cfg.get("size")
+    mask_mode = str(cfg.get("mask_mode") or cfg.get("edit_mask_mode") or "").strip().lower()
+    prompt_only_mode = mask_mode in {"none", "no_mask", "prompt", "prompt_only", "image_prompt", "reference_only"}
+    request_kwargs: dict[str, Any] = {
+        "model": str(cfg.get("model") or "gpt-image-2"),
+        "prompt": str(cfg.get("prompt") or DEFAULT_OPENAI_IMAGE_EDIT_PROMPT),
+        "image": open(image_path, "rb"),
+        "size": _resolve_openai_image_edit_size(image_path, request_size),
+        "quality": str(cfg.get("quality") or "high"),
+        "response_format": "b64_json",
+    }
+    if not prompt_only_mode:
+        request_kwargs["mask"] = open(mask_path, "rb")
+    try:
+        response = client.images.edit(**request_kwargs)
+    finally:
+        try:
+            request_kwargs["image"].close()
+            mask_file = request_kwargs.get("mask")
+            if mask_file is not None:
+                mask_file.close()
+        except Exception:
+            pass
+
+    data = getattr(response, "data", None) or []
+    if not data:
+        raise RuntimeError("OpenAI image cleaner returned no image data.")
+    first = data[0]
+    b64 = getattr(first, "b64_json", None) or (first.get("b64_json") if isinstance(first, dict) else None)
+    if not b64:
+        url = getattr(first, "url", None) or (first.get("url") if isinstance(first, dict) else None)
+        raise RuntimeError(f"OpenAI image cleaner did not return b64_json data; got url={url!r}.")
+    image = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    with Image.open(image_path) as reference_image:
+        reference_size = reference_image.size
+    if image.size != reference_size:
+        image = image.resize(reference_size, Image.Resampling.LANCZOS)
+    image.save(output_path)
+    return {
+        "clean_rgb_path": str(output_path),
+        "raw_output_path": str(output_path),
+        "model": str(cfg.get("model") or "gpt-image-2"),
+        "prompt": str(cfg.get("prompt") or DEFAULT_OPENAI_IMAGE_EDIT_PROMPT),
+        "reference_frame_id": reference_frame_id,
+    }
 
 
 def _load_sidecar_road_mask(
@@ -2118,6 +2526,21 @@ def _write_textured_grid_obj(
 
 def _write_far_mesh(path: Path, output_dir: Path, texture_path: Path, width: int, height: int) -> None:
     vertices = [(-8.0, 4.0, -16.0), (8.0, 4.0, -16.0), (8.0, -1.0, -16.0), (-8.0, -1.0, -16.0)]
+    uvs = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
+    faces = [(1, 2, 3), (1, 3, 4)]
+    _write_obj_with_mtl(path, output_dir, texture_path, vertices, uvs, faces)
+
+
+def _write_tabletop_background_obj(path: Path, output_dir: Path, texture_path: Path, width: int, height: int) -> None:
+    aspect = float(width) / max(float(height), 1.0)
+    half_w = 4.0 * max(aspect, 1.0)
+    half_h = 4.0
+    vertices = [
+        (-half_w, half_h, -8.0),
+        (half_w, half_h, -8.0),
+        (half_w, -half_h, -8.0),
+        (-half_w, -half_h, -8.0),
+    ]
     uvs = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
     faces = [(1, 2, 3), (1, 3, 4)]
     _write_obj_with_mtl(path, output_dir, texture_path, vertices, uvs, faces)

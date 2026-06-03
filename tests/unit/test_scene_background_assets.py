@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import openai
 import trimesh
+from PIL import Image
 
 from guanwu.video.features.spatial.scene_background_assets import (
     _fill_low_candidate_dynamic_regions,
     _estimate_global_road_plane_from_semantic_depth,
+    _resolve_openai_image_edit_size,
     _road_surface_mask_for_static_gap,
     build_dynamic_mask,
     expand_road_mask_with_side_boundaries,
@@ -67,6 +72,96 @@ def _project_test_vertices(vertices: np.ndarray, camera: dict) -> tuple[np.ndarr
 
 def _road_plane_vertex_mask(vertices: np.ndarray, *, plane_z: float = 5.0) -> np.ndarray:
     return np.abs(vertices[:, 2] - float(plane_z)) < 1e-5
+
+
+def test_resolve_openai_image_edit_size_uses_original_image_dimensions(tmp_path: Path) -> None:
+    image_path = tmp_path / "reference.png"
+    Image.fromarray(np.zeros((36, 64, 3), dtype=np.uint8)).save(image_path)
+
+    assert _resolve_openai_image_edit_size(image_path, "original") == "64x36"
+    assert _resolve_openai_image_edit_size(image_path, "same") == "64x36"
+    assert _resolve_openai_image_edit_size(image_path, "1024x1024") == "1024x1024"
+
+
+def test_openai_image_cleaner_uses_api_size_and_saves_original_dimensions(tmp_path: Path) -> None:
+    from guanwu.video.features.spatial.scene_background_assets import run_openai_image_edit_background_cleaner
+
+    reference_path = tmp_path / "reference.png"
+    mask_path = tmp_path / "mask.png"
+    output_path = tmp_path / "clean.png"
+    Image.fromarray(np.zeros((36, 64, 3), dtype=np.uint8)).save(reference_path)
+    Image.fromarray(np.zeros((36, 64, 4), dtype=np.uint8)).save(mask_path)
+    captured: dict[str, str] = {}
+
+    class FakeImages:
+        def edit(self, **kwargs):
+            captured["size"] = kwargs["size"]
+            edited = Image.fromarray(np.full((1024, 1536, 3), 180, dtype=np.uint8))
+            buffer = io.BytesIO()
+            edited.save(buffer, format="PNG")
+            b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=b64)])
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.images = FakeImages()
+
+    original = openai.OpenAI
+    openai.OpenAI = FakeOpenAI
+    try:
+        run_openai_image_edit_background_cleaner(
+            image_path=reference_path,
+            mask_path=mask_path,
+            output_path=output_path,
+            config={"api_key": "test-key", "size": "original", "api_size": "1536x1024"},
+        )
+    finally:
+        openai.OpenAI = original
+
+    assert captured["size"] == "1536x1024"
+    with Image.open(output_path) as image:
+        assert image.size == (64, 36)
+
+
+def test_openai_image_cleaner_prompt_only_omits_mask(tmp_path: Path) -> None:
+    from guanwu.video.features.spatial.scene_background_assets import run_openai_image_edit_background_cleaner
+
+    reference_path = tmp_path / "reference.png"
+    mask_path = tmp_path / "mask.png"
+    output_path = tmp_path / "clean.png"
+    Image.fromarray(np.zeros((36, 64, 3), dtype=np.uint8)).save(reference_path)
+    Image.fromarray(np.zeros((36, 64, 4), dtype=np.uint8)).save(mask_path)
+    captured: dict[str, object] = {}
+
+    class FakeImages:
+        def edit(self, **kwargs):
+            captured.update(kwargs)
+            edited = Image.fromarray(np.full((1024, 1536, 3), 180, dtype=np.uint8))
+            buffer = io.BytesIO()
+            edited.save(buffer, format="PNG")
+            b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=b64)])
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.images = FakeImages()
+
+    original = openai.OpenAI
+    openai.OpenAI = FakeOpenAI
+    try:
+        run_openai_image_edit_background_cleaner(
+            image_path=reference_path,
+            mask_path=mask_path,
+            output_path=output_path,
+            config={"api_key": "test-key", "api_size": "1536x1024", "mask_mode": "none"},
+        )
+    finally:
+        openai.OpenAI = original
+
+    assert "mask" not in captured
+    assert captured["size"] == "1536x1024"
+    with Image.open(output_path) as image:
+        assert image.size == (64, 36)
 
 
 def test_build_dynamic_mask_uses_only_movable_categories_and_expands_shadow() -> None:
@@ -532,6 +627,510 @@ def test_generate_target_frame_background_assets_writes_split_meshes_and_manifes
     assert manifest["quality"]["target_dynamic_fraction"] > 0.0
 
 
+def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_path: Path) -> None:
+    frames = []
+    height, width = 36, 64
+    block_mask = np.zeros((height, width), dtype=bool)
+    block_mask[17:25, 27:39] = True
+    arm_mask = np.zeros((height, width), dtype=bool)
+    arm_mask[5:18, 8:22] = True
+    table_color = np.array([122, 112, 94], dtype=np.uint8)
+    block_color = np.array([188, 128, 62], dtype=np.uint8)
+    arm_color = np.array([42, 54, 68], dtype=np.uint8)
+    for frame_idx in [1, 2, 3, 4, 5]:
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:] = table_color
+        rgb[arm_mask] = arm_color
+        instances = [_mask_instance("obj_arm", "robot arm gripper", arm_mask, [8, 5, 22, 18])]
+        if frame_idx == 3:
+            rgb[block_mask] = block_color
+            instances.append(_mask_instance("obj_000009", "wooden block", block_mask, [27, 17, 39, 25]))
+        frames.append(
+            {
+                "frame_idx": frame_idx,
+                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, instances)),
+            }
+        )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("road estimator should not run for tabletop_task background mode")
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=3,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        semantic_road_estimator=fail_if_called,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["schema"] == "guanwu.target_frame_background_assets.tabletop.v1"
+    assert manifest["quality"]["background_mode"] == "tabletop_task"
+    assert manifest["quality"]["target_foreground_object_ids"] == ["obj_000009"]
+    assert "tabletop_mesh" in manifest["assets"]
+    assert "road_mesh" not in manifest["assets"]
+    assert "structures_mesh" not in manifest["assets"]
+    assert "far_mesh" not in manifest["assets"]
+
+    foreground = cv2.imread(manifest["assets"]["dynamic_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert foreground[20, 31]
+    assert not foreground[10, 12]
+
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[20, 31].astype(np.float32) - table_color.astype(np.float32)) < 10.0
+    assert np.linalg.norm(clean[10, 12].astype(np.float32) - arm_color.astype(np.float32)) < 10.0
+
+    meshes = load_background_asset_meshes(result["manifest_path"])
+    assert [(name, path.name) for name, path in meshes] == [("tabletop", "tabletop_background.obj")]
+
+
+def test_generate_tabletop_task_background_assets_uses_openai_image_cleaner_on_reference_frame(tmp_path: Path) -> None:
+    frames = []
+    height, width = 36, 64
+    block_mask_frame1 = np.zeros((height, width), dtype=bool)
+    block_mask_frame1[15:23, 22:34] = True
+    block_mask_frame3 = np.zeros((height, width), dtype=bool)
+    block_mask_frame3[17:25, 28:40] = True
+    arm_mask = np.zeros((height, width), dtype=bool)
+    arm_mask[5:18, 8:22] = True
+    table_color = np.array([122, 112, 94], dtype=np.uint8)
+    block_color = np.array([188, 128, 62], dtype=np.uint8)
+    arm_color = np.array([42, 54, 68], dtype=np.uint8)
+    for frame_idx in [1, 2, 3]:
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:] = table_color
+        rgb[arm_mask] = arm_color
+        instances = [_mask_instance("obj_arm", "robot arm gripper", arm_mask, [8, 5, 22, 18])]
+        if frame_idx == 1:
+            rgb[block_mask_frame1] = block_color
+            instances.append(_mask_instance("obj_000009", "wooden block", block_mask_frame1, [22, 15, 34, 23]))
+        if frame_idx == 3:
+            rgb[block_mask_frame3] = block_color
+            instances.append(_mask_instance("obj_000009", "wooden block", block_mask_frame3, [28, 17, 40, 25]))
+        frames.append(
+            {
+                "frame_idx": frame_idx,
+                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, instances)),
+            }
+        )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
+    calls: list[dict] = []
+
+    def fake_cleaner(**kwargs):
+        calls.append(kwargs)
+        reference = cv2.cvtColor(cv2.imread(str(kwargs["image_path"])), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(kwargs["mask_path"]), cv2.IMREAD_GRAYSCALE) > 0
+        edited = reference.copy()
+        edited[mask] = table_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"]["model"],
+            "prompt": kwargs["config"]["prompt"],
+        }
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=3,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "remove only the wooden block",
+            "mask_mode": "target",
+            "use_full_image_output": False,
+        },
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert len(calls) == 1
+    assert calls[0]["reference_frame_id"] == 1
+    assert calls[0]["config"]["model"] == "gpt-image-2"
+    assert manifest["quality"]["clean_rgb_source"] == "openai_image_edit"
+    assert manifest["quality"]["clean_rgb_reference_frame_id"] == 1
+    assert manifest["quality"]["clean_rgb_model"] == "gpt-image-2"
+    assert "openai_image_edit_mask" in manifest["assets"]
+    assert "openai_image_edit_raw" in manifest["assets"]
+
+    cleaner_mask = cv2.imread(manifest["assets"]["openai_image_edit_mask"], cv2.IMREAD_GRAYSCALE) > 0
+    assert cleaner_mask[18, 26]
+    assert cleaner_mask[21, 34]
+    assert not cleaner_mask[10, 12]
+
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[18, 26].astype(np.float32) - table_color.astype(np.float32)) < 10.0
+    assert np.linalg.norm(clean[10, 12].astype(np.float32) - arm_color.astype(np.float32)) < 10.0
+
+
+def test_generate_tabletop_task_background_assets_can_clean_full_image(tmp_path: Path) -> None:
+    frames = []
+    height, width = 36, 64
+    block_mask = np.zeros((height, width), dtype=bool)
+    block_mask[15:23, 22:34] = True
+    arm_mask = np.zeros((height, width), dtype=bool)
+    arm_mask[5:18, 8:22] = True
+    table_color = np.array([122, 112, 94], dtype=np.uint8)
+    block_color = np.array([188, 128, 62], dtype=np.uint8)
+    arm_color = np.array([42, 54, 68], dtype=np.uint8)
+    clean_background_color = np.array([150, 132, 96], dtype=np.uint8)
+    for frame_idx in [1, 2, 3]:
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:] = table_color
+        rgb[arm_mask] = arm_color
+        rgb[block_mask] = block_color
+        frames.append(
+            {
+                "frame_idx": frame_idx,
+                "detections": str(
+                    _write_frame(
+                        tmp_path / f"frame_{frame_idx:06d}",
+                        frame_idx,
+                        rgb,
+                        [
+                            _mask_instance("obj_arm", "robot arm gripper", arm_mask, [8, 5, 22, 18]),
+                            _mask_instance("obj_000009", "wooden block", block_mask, [22, 15, 34, 23]),
+                        ],
+                    )
+                ),
+            }
+        )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
+
+    def fake_cleaner(**kwargs):
+        mask_rgba = Image.open(kwargs["mask_path"]).convert("RGBA")
+        alpha = np.asarray(mask_rgba.getchannel("A"))
+        assert int(np.count_nonzero(alpha == 0)) == height * width
+        edited = np.zeros((height, width, 3), dtype=np.uint8)
+        edited[:] = clean_background_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"]["model"],
+            "prompt": kwargs["config"]["prompt"],
+        }
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "generate a clean empty tabletop background",
+            "mask_mode": "full_image",
+            "use_full_image_output": True,
+        },
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    cleaner_mask = Image.open(manifest["assets"]["openai_image_edit_mask"]).convert("RGBA")
+    alpha = np.asarray(cleaner_mask.getchannel("A"))
+    assert int(np.count_nonzero(alpha == 0)) == height * width
+    assert manifest["quality"]["clean_rgb_mask_mode"] == "full_image"
+    assert manifest["quality"]["clean_rgb_full_image_output"] is True
+
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[10, 12].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+    assert np.linalg.norm(clean[18, 26].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+
+
+def test_generate_tabletop_task_background_assets_can_clean_foreground_objects_only(tmp_path: Path) -> None:
+    frames = []
+    height, width = 36, 64
+    block_mask = np.zeros((height, width), dtype=bool)
+    block_mask[15:23, 22:34] = True
+    arm_mask = np.zeros((height, width), dtype=bool)
+    arm_mask[5:18, 8:22] = True
+    paper_mask = np.zeros((height, width), dtype=bool)
+    paper_mask[25:34, 45:60] = True
+    table_color = np.array([122, 112, 94], dtype=np.uint8)
+    block_color = np.array([188, 128, 62], dtype=np.uint8)
+    arm_color = np.array([42, 54, 68], dtype=np.uint8)
+    paper_color = np.array([220, 220, 210], dtype=np.uint8)
+    clean_background_color = np.array([150, 132, 96], dtype=np.uint8)
+    for frame_idx in [1, 2, 3]:
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:] = table_color
+        rgb[arm_mask] = arm_color
+        rgb[block_mask] = block_color
+        rgb[paper_mask] = paper_color
+        frames.append(
+            {
+                "frame_idx": frame_idx,
+                "detections": str(
+                    _write_frame(
+                        tmp_path / f"frame_{frame_idx:06d}",
+                        frame_idx,
+                        rgb,
+                        [
+                            _mask_instance("obj_arm", "robot arm gripper", arm_mask, [8, 5, 22, 18]),
+                            _mask_instance("obj_000009", "wooden block", block_mask, [22, 15, 34, 23]),
+                            _mask_instance("obj_paper", "paper sheet", paper_mask, [45, 25, 60, 34]),
+                        ],
+                    )
+                ),
+            }
+        )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
+
+    def fake_cleaner(**kwargs):
+        reference = cv2.cvtColor(cv2.imread(str(kwargs["image_path"])), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(kwargs["mask_path"]), cv2.IMREAD_UNCHANGED)
+        alpha = mask[:, :, 3]
+        edit_mask = alpha == 0
+        assert edit_mask[10, 12]
+        assert edit_mask[18, 26]
+        assert edit_mask[29, 50]
+        assert not edit_mask[2, 30]
+        edited = reference.copy()
+        edited[edit_mask] = clean_background_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"]["model"],
+            "prompt": kwargs["config"]["prompt"],
+        }
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "remove foreground objects and preserve visible background",
+            "mask_mode": "foreground_objects",
+            "use_full_image_output": False,
+            "mask_expand_px": 0,
+        },
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["quality"]["clean_rgb_mask_mode"] == "foreground_objects"
+    assert manifest["quality"]["clean_rgb_full_image_output"] is False
+
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[10, 12].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+    assert np.linalg.norm(clean[18, 26].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+    assert np.linalg.norm(clean[29, 50].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+    assert np.linalg.norm(clean[2, 30].astype(np.float32) - table_color.astype(np.float32)) < 4.0
+
+
+def test_generate_tabletop_task_background_assets_preserves_background_instances_in_foreground_mode(tmp_path: Path) -> None:
+    height, width = 36, 64
+    board_mask = np.zeros((height, width), dtype=bool)
+    board_mask[2:34, 18:44] = True
+    metal_mask = np.zeros((height, width), dtype=bool)
+    metal_mask[:, 44:64] = True
+    arm_mask = np.zeros((height, width), dtype=bool)
+    arm_mask[5:18, 8:22] = True
+    block_mask = np.zeros((height, width), dtype=bool)
+    block_mask[15:23, 28:36] = True
+    board_color = np.array([122, 112, 94], dtype=np.uint8)
+    metal_color = np.array([160, 170, 172], dtype=np.uint8)
+    clean_background_color = np.array([150, 132, 96], dtype=np.uint8)
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    rgb[:] = np.array([20, 30, 40], dtype=np.uint8)
+    rgb[board_mask] = board_color
+    rgb[metal_mask] = metal_color
+    rgb[arm_mask] = np.array([42, 54, 68], dtype=np.uint8)
+    rgb[block_mask] = np.array([188, 128, 62], dtype=np.uint8)
+    frame_path = _write_frame(
+        tmp_path / "frame_000001",
+        1,
+        rgb,
+        [
+            _mask_instance("obj_arm", "robotic arm", arm_mask, [8, 5, 22, 18]),
+            _mask_instance("obj_block", "wooden block", block_mask, [28, 15, 36, 23]),
+            _mask_instance("obj_board", "wooden board", board_mask, [18, 2, 44, 34]),
+            _mask_instance("obj_metal", "metal table", metal_mask, [44, 0, 64, 36]),
+        ],
+    )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": [{"frame_idx": 1, "detections": str(frame_path)}]}), encoding="utf-8")
+
+    def fake_cleaner(**kwargs):
+        reference = cv2.cvtColor(cv2.imread(str(kwargs["image_path"])), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(kwargs["mask_path"]), cv2.IMREAD_UNCHANGED)
+        edit_mask = mask[:, :, 3] == 0
+        assert edit_mask[10, 12]
+        assert edit_mask[18, 31]
+        assert not edit_mask[4, 30]
+        assert not edit_mask[10, 50]
+        edited = reference.copy()
+        edited[edit_mask] = clean_background_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {"raw_output_path": str(kwargs["output_path"]), "model": kwargs["config"]["model"], "prompt": kwargs["config"]["prompt"]}
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_block"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "remove foreground objects and preserve visible background",
+            "mask_mode": "foreground_objects",
+            "use_full_image_output": False,
+            "mask_expand_px": 0,
+        },
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["quality"]["clean_rgb_mask_mode"] == "foreground_objects"
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[4, 30].astype(np.float32) - board_color.astype(np.float32)) < 4.0
+    assert np.linalg.norm(clean[10, 50].astype(np.float32) - metal_color.astype(np.float32)) < 4.0
+
+
+def test_generate_tabletop_task_background_assets_uses_reference_frame_mask_by_default(tmp_path: Path) -> None:
+    height, width = 36, 64
+    table_color = np.array([122, 112, 94], dtype=np.uint8)
+    clean_background_color = np.array([150, 132, 96], dtype=np.uint8)
+    frame_entries = []
+    for frame_idx, x1 in [(1, 10), (2, 40)]:
+        obj_mask = np.zeros((height, width), dtype=bool)
+        obj_mask[12:22, x1 : x1 + 10] = True
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        rgb[:] = table_color
+        rgb[obj_mask] = np.array([42, 54, 68], dtype=np.uint8)
+        frame_entries.append(
+            {
+                "frame_idx": frame_idx,
+                "detections": str(
+                    _write_frame(
+                        tmp_path / f"frame_{frame_idx:06d}",
+                        frame_idx,
+                        rgb,
+                        [_mask_instance(f"obj_arm_{frame_idx}", "robotic arm", obj_mask, [x1, 12, x1 + 10, 22])],
+                    )
+                ),
+            }
+        )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": frame_entries}), encoding="utf-8")
+
+    def fake_cleaner(**kwargs):
+        reference = cv2.cvtColor(cv2.imread(str(kwargs["image_path"])), cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(str(kwargs["mask_path"]), cv2.IMREAD_UNCHANGED)
+        edit_mask = mask[:, :, 3] == 0
+        assert edit_mask[16, 15]
+        assert not edit_mask[16, 45]
+        edited = reference.copy()
+        edited[edit_mask] = clean_background_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {"raw_output_path": str(kwargs["output_path"]), "model": kwargs["config"]["model"], "prompt": kwargs["config"]["prompt"]}
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_arm_1"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "remove foreground objects and preserve visible background",
+            "mask_mode": "foreground_objects",
+            "use_full_image_output": False,
+            "mask_expand_px": 0,
+        },
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["quality"]["clean_rgb_mask_frame_mode"] == "reference_frame"
+    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
+    assert np.linalg.norm(clean[16, 15].astype(np.float32) - clean_background_color.astype(np.float32)) < 1.0
+    assert np.linalg.norm(clean[16, 45].astype(np.float32) - table_color.astype(np.float32)) < 4.0
+
+
+def test_generate_tabletop_task_background_assets_reads_full_image_mode_from_config_path(tmp_path: Path) -> None:
+    height, width = 18, 32
+    block_mask = np.zeros((height, width), dtype=bool)
+    block_mask[7:11, 12:18] = True
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    rgb[:] = np.array([122, 112, 94], dtype=np.uint8)
+    frame_path = _write_frame(
+        tmp_path / "frame_000001",
+        1,
+        rgb,
+        [_mask_instance("obj_000009", "wooden block", block_mask, [12, 7, 18, 11])],
+    )
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": [{"frame_idx": 1, "detections": str(frame_path)}]}), encoding="utf-8")
+    cleaner_config_path = tmp_path / "cleaner.yaml"
+    cleaner_config_path.write_text(
+        """
+openai:
+  api_key: test-key
+image_edit:
+  model: gpt-image-2
+  mask_mode: full_image
+  use_full_image_output: true
+  prompt: clean empty tabletop
+""".strip(),
+        encoding="utf-8",
+    )
+
+    def fake_cleaner(**kwargs):
+        mask_rgba = Image.open(kwargs["mask_path"]).convert("RGBA")
+        alpha = np.asarray(mask_rgba.getchannel("A"))
+        assert int(np.count_nonzero(alpha == 0)) == height * width
+        edited = np.full((height, width, 3), 140, dtype=np.uint8)
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {"raw_output_path": str(kwargs["output_path"]), "model": kwargs["config"]["model"], "prompt": kwargs["config"]["prompt"]}
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={"config_path": str(cleaner_config_path), "model": "gpt-image-2"},
+        background_cleaner_reference_frame_id=1,
+        background_image_cleaner=fake_cleaner,
+        grid_stride=8,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["quality"]["clean_rgb_mask_mode"] == "full_image"
+    assert manifest["quality"]["clean_rgb_full_image_output"] is True
+
+
 def test_generate_background_replaces_target_frame_vehicle_pixels_with_donor_road(tmp_path: Path) -> None:
     frames = []
     object_mask = np.zeros((36, 64), dtype=bool)
@@ -973,6 +1572,33 @@ def test_generate_depth_background_mesh_assets_writes_colored_glb_and_manifest(t
     assert manifest["quality"]["vertex_count"] > 0
     assert manifest["quality"]["face_count"] > 0
     meshes = load_background_asset_meshes(str(result["manifest_path"]))
+    assert [(name, path.name) for name, path in meshes] == [("depth_background", "depth_background.glb")]
+
+
+def test_load_background_asset_meshes_prefers_depth_background_over_tabletop_proxy(tmp_path: Path) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    tabletop = assets / "tabletop_background.obj"
+    tabletop.write_text("o tabletop\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+    depth_background = assets / "depth_background.glb"
+    depth_background.write_bytes(b"glb")
+    manifest = assets / "background_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.tabletop.v2",
+                "assets": {
+                    "tabletop_mesh": str(tabletop),
+                    "task_background_mesh": str(tabletop),
+                    "depth_background_glb": str(depth_background),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meshes = load_background_asset_meshes(str(manifest))
+
     assert [(name, path.name) for name, path in meshes] == [("depth_background", "depth_background.glb")]
 
 

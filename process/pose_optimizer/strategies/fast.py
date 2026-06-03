@@ -121,6 +121,12 @@ def read_image(path: Path, mode: str = "color") -> np.ndarray:
 
 
 def find_mesh_path(sample_dir: Path, task: dict[str, Any]) -> Path:
+    optimizer_mesh_path_value = task.get("optimizer_mesh_path")
+    if optimizer_mesh_path_value:
+        candidate = sample_dir / Path(optimizer_mesh_path_value).name
+        if candidate.exists():
+            return candidate
+
     mesh_path_value = task.get("mesh_path")
     if mesh_path_value:
         candidate = sample_dir / Path(mesh_path_value).name
@@ -3220,14 +3226,18 @@ def save_optimized_glb_projection_views(
     color_layer = np.zeros_like(image, dtype=np.uint8)
     color_layer[rendered_bool] = (255, 190, 0)
     projection_on_image = cv2.addWeighted(projection_on_image, 1.0, color_layer, 0.42, 0.0)
-    projection_on_image = draw_projected_wireframe(
-        projection_on_image, projected_uv, valid_z, faces, color=(0, 80, 255), max_faces=3500
-    )
     contours, _ = cv2.findContours(rendered_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(projection_on_image, contours, -1, (0, 255, 255), 2, lineType=cv2.LINE_AA)
     projection_on_image = draw_bbox(projection_on_image, json_bbox, (0, 255, 0), "json bbox")
     if projected_bbox is not None:
         projection_on_image = draw_bbox(projection_on_image, projected_bbox, (0, 0, 255), "projected")
+
+    wireframe_on_image = image.copy()
+    wireframe_on_image = draw_projected_wireframe(
+        wireframe_on_image, projected_uv, valid_z, faces, color=(0, 80, 255), max_faces=3500
+    )
+    if projected_bbox is not None:
+        wireframe_on_image = draw_bbox(wireframe_on_image, projected_bbox, (0, 0, 255), "projected")
 
     model_only = np.zeros_like(image, dtype=np.uint8)
     model_only[rendered_bool] = (185, 130, 45)
@@ -3237,11 +3247,14 @@ def save_optimized_glb_projection_views(
         model_only = draw_bbox(model_only, projected_bbox, (0, 0, 255), "projected bbox")
 
     projection_path = output_dir / "03_glb_optimized_pose_projection.png"
+    wireframe_path = output_dir / "03_glb_optimized_pose_wireframe.png"
     model_only_path = output_dir / "04_glb_optimized_pose_model_only.png"
     cv2.imwrite(str(projection_path), projection_on_image)
+    cv2.imwrite(str(wireframe_path), wireframe_on_image)
     cv2.imwrite(str(model_only_path), model_only)
     return {
         "glb_optimized_pose_projection": projection_path,
+        "glb_optimized_pose_wireframe": wireframe_path,
         "glb_optimized_pose_model_only": model_only_path,
     }
 

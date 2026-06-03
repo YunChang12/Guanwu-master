@@ -58,7 +58,11 @@ def _build_mesh_reconstruct_executor(tmp_path: Path) -> ProjectExecutor:
                 segment_kind="object",
             ).model_dump(mode="json")
         )
-        object_attrs[object_id] = {"is_movable": True, "is_rigid_body": True}
+        object_attrs[object_id] = {
+            "is_movable": object_id != "obj_000003",
+            "is_rigid_body": object_id != "obj_000002",
+            "is_bbox_moving": object_id in {"obj_000002", "obj_000003", "obj_000005"},
+        }
 
     detections_path.write_text(
         json.dumps(
@@ -195,7 +199,7 @@ def test_mesh_reconstruct_best_frame_prefers_complete_view_over_larger_border_fr
     assert best_frames["obj_000012"][0].frame_idx == 14
 
 
-def test_mesh_reconstruct_attempts_all_zaiwu_movable_rigid_candidates(tmp_path: Path, monkeypatch) -> None:
+def test_mesh_reconstruct_attempts_only_zaiwu_moving_rigid_candidates(tmp_path: Path, monkeypatch) -> None:
     executor = _build_mesh_reconstruct_executor(tmp_path)
     attempted_ids: list[str] = []
 
@@ -221,16 +225,156 @@ def test_mesh_reconstruct_attempts_all_zaiwu_movable_rigid_candidates(tmp_path: 
     result = executor._run_mesh_reconstruct()
     meshes_payload = json.loads(Path(result["outputs"]["sam3d_meshes"]).read_text(encoding="utf-8"))
 
-    assert attempted_ids == ["obj_000005", "obj_000004", "obj_000003", "obj_000002", "obj_000001"]
+    assert attempted_ids == ["obj_000005", "obj_000003"]
     assert result["summary"]["mesh_count"] == 1
-    assert result["summary"]["selected_count"] == 5
-    assert result["summary"]["attempted_count"] == 5
-    assert result["summary"]["failed_count"] == 4
+    assert result["summary"]["selected_count"] == 2
+    assert result["summary"]["attempted_count"] == 2
+    assert result["summary"]["failed_count"] == 1
+    assert result["summary"]["bbox_moving_candidate_count"] == 2
+    assert result["summary"]["rigid_moving_selected_count"] == 2
     assert result["summary"]["skipped_count"] == 0
     assert set(meshes_payload) == {"obj_000005"}
     assert meshes_payload["obj_000005"]["mesh_frame_selection"]["frame_idx"] == 1
     assert meshes_payload["obj_000005"]["mesh_frame_selection"]["truncated"] is False
     assert meshes_payload["obj_000005"]["mesh_frame_selection"]["area_px"] == 500.0
+
+
+def test_mesh_reconstruct_limits_candidates_to_configured_object_id_whitelist(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    executor.context.config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000003"]
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            object_id = objects[0].object_id
+            attempted_ids.append(object_id)
+            return {
+                object_id: {
+                    "instance_id": object_id,
+                    "segment_kind": "object",
+                    "mesh_path": f"/tmp/{object_id}.ply",
+                    "files": [],
+                }
+            }
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+    meshes_payload = json.loads(Path(result["outputs"]["sam3d_meshes"]).read_text(encoding="utf-8"))
+
+    assert attempted_ids == ["obj_000003"]
+    assert result["summary"]["selected_count"] == 1
+    assert result["summary"]["mesh_reconstruct_object_ids"] == ["obj_000003"]
+    assert set(meshes_payload) == {"obj_000003"}
+
+
+def test_mesh_reconstruct_whitelist_can_debug_static_rigid_candidate(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    executor.context.config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000004"]
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            object_id = objects[0].object_id
+            attempted_ids.append(object_id)
+            return {
+                object_id: {
+                    "instance_id": object_id,
+                    "segment_kind": "object",
+                    "mesh_path": f"/tmp/{object_id}.ply",
+                    "files": [],
+                }
+            }
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+
+    assert attempted_ids == ["obj_000004"]
+    assert result["summary"]["selected_count"] == 1
+    assert result["summary"]["bbox_moving_candidate_count"] == 2
+    assert result["summary"]["rigid_moving_selected_count"] == 1
+
+
+def test_mesh_reconstruct_excludes_robotic_arm_named_candidates(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    geometry = executor.context.artifacts.get("geometry.lift")
+    attr_artifact = executor.context.artifacts.get("object.attr")
+    assert geometry is not None
+    assert attr_artifact is not None
+
+    summary_path = Path(geometry.outputs["summary"])
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    payload["latest_objects"] = [
+        {
+            **obj,
+            "label": "robotic arm clamp" if obj["object_id"] == "obj_000005" else obj["label"],
+        }
+        for obj in payload["latest_objects"]
+    ]
+    summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    attrs_path = Path(attr_artifact.outputs["object_attrs"])
+    attrs = json.loads(attrs_path.read_text(encoding="utf-8"))
+    attrs["obj_000005"]["class_name"] = "robotic arm clamp"
+    attrs_path.write_text(json.dumps(attrs, indent=2), encoding="utf-8")
+
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            object_id = objects[0].object_id
+            attempted_ids.append(object_id)
+            return {
+                object_id: {
+                    "instance_id": object_id,
+                    "segment_kind": "object",
+                    "mesh_path": f"/tmp/{object_id}.ply",
+                    "files": [],
+                }
+            }
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+
+    assert attempted_ids == ["obj_000003"]
+    assert result["summary"]["robotic_arm_excluded_count"] == 1
+    assert result["summary"]["selected_count"] == 1
+
+
+def test_mesh_reconstruct_robotic_arm_exclusion_applies_to_whitelist(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    executor.context.config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000005"]
+    attr_artifact = executor.context.artifacts.get("object.attr")
+    assert attr_artifact is not None
+
+    attrs_path = Path(attr_artifact.outputs["object_attrs"])
+    attrs = json.loads(attrs_path.read_text(encoding="utf-8"))
+    attrs["obj_000005"]["class_name"] = "robotic arm"
+    attrs_path.write_text(json.dumps(attrs, indent=2), encoding="utf-8")
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            attempted_ids.append(objects[0].object_id)
+            return {}
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+
+    assert attempted_ids == []
+    assert result["summary"]["robotic_arm_excluded_count"] == 1
+    assert result["summary"]["selected_count"] == 0
 
 
 def test_mesh_reconstruct_uses_extended_sam3d_per_object_timeout(tmp_path: Path, monkeypatch) -> None:

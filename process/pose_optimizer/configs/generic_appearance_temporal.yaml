@@ -50,7 +50,7 @@ generic_mask_weight: 1.00
 generic_bbox_weight: 0.15
 generic_contour_weight: 0.35
 generic_edge_weight: 0.20
-generic_depth_weight: 0.35
+generic_depth_weight: 0.0
 generic_appearance_weight: 0.25
 generic_temporal_weight: 0.55
 generic_scale_prior_weight: 0.30
@@ -72,7 +72,7 @@ appearance_precision_weight: 0.35
 appearance_recall_weight: 0.20
 appearance_leakage_weight: 0.25
 
-depth_enabled: true
+depth_enabled: false
 observed_depth_map_path: ""
 depth_min_valid_ratio: 0.25
 depth_sigma: 0.50
@@ -204,8 +204,8 @@ generic_acceptance_projection_temporal_exempt_enabled: true
 generic_acceptance_projection_exempt_min_mask_iou: 0.90
 generic_acceptance_projection_exempt_min_bbox_iou: 0.60
 generic_acceptance_projection_exempt_min_temporal_score: 0.50
-generic_acceptance_depth_confidence_high: 0.70
-generic_acceptance_depth_min_threshold: 0.25
+generic_acceptance_depth_confidence_high: 999.0
+generic_acceptance_depth_min_threshold: 0.0
 generic_truncated_temporal_early_stop_enabled: true
 generic_truncated_temporal_early_stop_min_score: 2.0
 generic_truncated_temporal_early_stop_min_mask_iou: 0.90

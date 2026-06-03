@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from guanwu.video.core.config import SPWMSettings, VLMConfig
+from guanwu.core.config import WorkspaceConfig
+from guanwu.video.executor import VideoProjectExecutor
 from guanwu.video.project.config import (
     ProjectConfig,
     ProjectMetadata,
@@ -62,6 +64,88 @@ def test_save_project_config_omits_system_managed_vlm_fields(tmp_path: Path) -> 
 
     assert "vlm =" not in saved
     assert "api_key" not in saved
+
+
+def test_project_config_persists_mesh_reconstruct_object_id_whitelist(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    config = ProjectConfig(
+        project=ProjectMetadata(
+            project_id="demo",
+            name="demo",
+            input_video="/tmp/demo.mp4",
+            root_dir="/tmp/project",
+        ),
+    )
+    config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000007"]
+
+    save_project_config(config, config_path)
+    saved = config_path.read_text(encoding="utf-8")
+    loaded = load_project_config(config_path)
+
+    assert "mesh_reconstruct_object_ids" in saved
+    assert loaded.settings.zaiwu.mesh_reconstruct_object_ids == ["obj_000007"]
+
+
+def test_project_config_persists_tabletop_task_background_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    config = ProjectConfig(
+        project=ProjectMetadata(
+            project_id="demo",
+            name="demo",
+            input_video="/tmp/demo.mp4",
+            root_dir="/tmp/project",
+        ),
+    )
+    config.settings.zaiwu.background_mode = "tabletop_task"
+    config.settings.zaiwu.background_disable_road_semantics = True
+    config.settings.zaiwu.task_foreground_object_ids = ["obj_000009"]
+    config.settings.zaiwu.background_cleaner = "openai_image_edit"
+    config.settings.zaiwu.background_cleaner_config_path = "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
+    config.settings.zaiwu.background_cleaner_model = "gpt-image-2"
+    config.settings.zaiwu.background_cleaner_reference_frame_id = 1
+
+    save_project_config(config, config_path)
+    saved = config_path.read_text(encoding="utf-8")
+    loaded = load_project_config(config_path)
+
+    assert "background_mode" in saved
+    assert "task_foreground_object_ids" in saved
+    assert loaded.settings.zaiwu.background_mode == "tabletop_task"
+    assert loaded.settings.zaiwu.background_disable_road_semantics is True
+    assert loaded.settings.zaiwu.task_foreground_object_ids == ["obj_000009"]
+    assert loaded.settings.zaiwu.background_cleaner == "openai_image_edit"
+    assert loaded.settings.zaiwu.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
+    assert loaded.settings.zaiwu.background_cleaner_model == "gpt-image-2"
+    assert loaded.settings.zaiwu.background_cleaner_reference_frame_id == 1
+
+
+def test_init_project_applies_workspace_tabletop_task_background_settings(tmp_path: Path) -> None:
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"demo")
+    workspace = WorkspaceConfig(workspace_root=str(tmp_path / "workspace"))
+    workspace.video_pipeline.provider_mode = "zaiwu"
+    workspace.video_pipeline.mesh_reconstruct_object_ids = ["obj_000009"]
+    workspace.video_pipeline.background_mode = "tabletop_task"
+    workspace.video_pipeline.background_disable_road_semantics = True
+    workspace.video_pipeline.task_foreground_object_ids = ["obj_000009"]
+    workspace.video_pipeline.background_cleaner = "openai_image_edit"
+    workspace.video_pipeline.background_cleaner_config_path = "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
+    workspace.video_pipeline.background_cleaner_model = "gpt-image-2"
+    workspace.video_pipeline.background_cleaner_reference_frame_id = 1
+
+    context = VideoProjectExecutor.init_project(
+        video=str(video_path),
+        out_dir=tmp_path / "project",
+        workspace=workspace,
+    )
+
+    assert context.config.settings.zaiwu.background_mode == "tabletop_task"
+    assert context.config.settings.zaiwu.background_disable_road_semantics is True
+    assert context.config.settings.zaiwu.task_foreground_object_ids == ["obj_000009"]
+    assert context.config.settings.zaiwu.background_cleaner == "openai_image_edit"
+    assert context.config.settings.zaiwu.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
+    assert context.config.settings.zaiwu.background_cleaner_model == "gpt-image-2"
+    assert context.config.settings.zaiwu.background_cleaner_reference_frame_id == 1
 
 
 def test_load_project_config_overlays_vlm_settings_from_system(tmp_path: Path, monkeypatch) -> None:

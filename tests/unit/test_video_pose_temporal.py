@@ -2816,6 +2816,25 @@ def test_find_depth_map_for_task_skips_inaccessible_candidates(tmp_path: Path, m
     assert find_depth_map_for_task(sample_dir, 3) is None
 
 
+def test_pose_optimizer_find_mesh_path_prefers_optimizer_proxy_mesh(tmp_path: Path) -> None:
+    from process.pose_optimizer.strategies.fast import find_mesh_path
+
+    sample_dir = tmp_path / "sample"
+    sample_dir.mkdir()
+    original = sample_dir / "object.glb"
+    proxy = sample_dir / "optimizer_object.glb"
+    original.write_bytes(b"original")
+    proxy.write_bytes(b"proxy")
+
+    assert find_mesh_path(
+        sample_dir,
+        {
+            "mesh_path": "object.glb",
+            "optimizer_mesh_path": "optimizer_object.glb",
+        },
+    ) == proxy
+
+
 def test_find_depth_map_for_task_uses_task_frame_minus_one(tmp_path: Path) -> None:
     outputs_dir = tmp_path / "outputs"
     sample_dir = outputs_dir / "08_pose_optimize" / "tasks" / "obj_000002@000001"

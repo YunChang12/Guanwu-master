@@ -85,6 +85,34 @@ class VideoProjectExecutor:
         context.config.settings.zaiwu.object_detection_backend = workspace.video_pipeline.object_detection_backend
         context.config.settings.zaiwu.pose_optimizer_timeout_sec = workspace.video_pipeline.pose_optimizer_timeout_sec
         context.config.settings.zaiwu.pose_optimize_min_bbox_area_px = workspace.video_pipeline.pose_optimize_min_bbox_area_px
+        context.config.settings.zaiwu.mesh_proxy_mode = workspace.video_pipeline.mesh_proxy_mode
+        context.config.settings.zaiwu.mesh_proxy_target_faces = workspace.video_pipeline.mesh_proxy_target_faces
+        context.config.settings.zaiwu.mesh_proxy_use_for_pose = workspace.video_pipeline.mesh_proxy_use_for_pose
+        context.config.settings.zaiwu.mesh_proxy_keep_original_for_export = (
+            workspace.video_pipeline.mesh_proxy_keep_original_for_export
+        )
+        context.config.settings.zaiwu.mesh_reconstruct_object_ids = [
+            str(object_id).strip()
+            for object_id in workspace.video_pipeline.mesh_reconstruct_object_ids
+            if str(object_id).strip()
+        ]
+        context.config.settings.zaiwu.background_mode = workspace.video_pipeline.background_mode
+        context.config.settings.zaiwu.background_disable_road_semantics = (
+            workspace.video_pipeline.background_disable_road_semantics
+        )
+        context.config.settings.zaiwu.task_foreground_object_ids = [
+            str(object_id).strip()
+            for object_id in workspace.video_pipeline.task_foreground_object_ids
+            if str(object_id).strip()
+        ]
+        context.config.settings.zaiwu.background_cleaner = workspace.video_pipeline.background_cleaner
+        context.config.settings.zaiwu.background_cleaner_config_path = (
+            workspace.video_pipeline.background_cleaner_config_path
+        )
+        context.config.settings.zaiwu.background_cleaner_model = workspace.video_pipeline.background_cleaner_model
+        context.config.settings.zaiwu.background_cleaner_reference_frame_id = (
+            workspace.video_pipeline.background_cleaner_reference_frame_id
+        )
         save_project_config(context.config, context.paths.config)
         return ProjectContext(context.paths.root)
 

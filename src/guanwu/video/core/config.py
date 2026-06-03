@@ -30,6 +30,7 @@ class VLMDiscoveryConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     occluded_ttl_frames: int = 5
     removal_ttl_frames: int = 20
+    bbox_motion_threshold: float = 0.03
     vlm_discovery: VLMDiscoveryConfig = Field(default_factory=VLMDiscoveryConfig)
     video_source: str | None = None
     session_output_root: str | None = None
@@ -142,8 +143,20 @@ class ZaiwuConfig(BaseModel):
     grounded_sam2_service: str = "services.grounding_dino_sam2"
     seg2track_sam2_service: str = "services.seg2track_sam2"
     sam3d_service: str = "services.sam3d"
+    mesh_reconstruct_object_ids: list[str] = Field(default_factory=list)
     pose_optimizer_timeout_sec: float = 1800.0
     pose_optimize_min_bbox_area_px: float = 5000.0
+    mesh_proxy_mode: str = "auto"
+    mesh_proxy_target_faces: int = 1500
+    mesh_proxy_use_for_pose: bool = True
+    mesh_proxy_keep_original_for_export: bool = True
+    background_mode: str = "auto"
+    background_disable_road_semantics: bool = False
+    task_foreground_object_ids: list[str] = Field(default_factory=list)
+    background_cleaner: str = "temporal"
+    background_cleaner_config_path: str | None = None
+    background_cleaner_model: str = "gpt-image-2"
+    background_cleaner_reference_frame_id: int = 1
     depth_service: str = "services.depth_anything3"
     wildgs_slam_service: str = "services.wildgs_slam"
     gotrack_service: str = "services.gotrack"

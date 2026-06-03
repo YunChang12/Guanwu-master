@@ -10,6 +10,7 @@ from guanwu.video.core.config import SPWMSettings, load_settings, save_settings
 def test_spwm_settings_default_detector_backend_is_seg2track() -> None:
     settings = SPWMSettings()
     assert settings.zaiwu.object_detection_backend == "seg2track_sam2"
+    assert settings.runtime.bbox_motion_threshold == 0.03
 
 
 def test_load_settings_migrates_vlm_from_legacy_model_backend_config(tmp_path: Path) -> None:

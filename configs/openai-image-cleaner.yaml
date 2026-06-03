@@ -1,0 +1,24 @@
+openai:
+  api_key_env: OPENAI_API_KEY
+  api_key: ""
+  base_url: "https://api.v3.cm/v1"
+  timeout_sec: 180
+
+image_edit:
+  model: gpt-image-2
+  size: original
+  api_size: 1536x1024
+  quality: high
+  response_format: b64_json
+  mask_mode: prompt_only
+  mask_frame_mode: reference_frame
+  use_full_image_output: true
+  mask_expand_px: 8
+  prompt: >-
+    Using the input image as a visual reference, generate a clean foundational
+    background for this robotic manipulation scene. Remove the robot arms,
+    grasped wooden block, loose blocks, tools, cables, and clutter, while
+    preserving the original camera perspective, wooden board geometry, metal
+    grooved table, lighting, shadows, reflections, and overall workspace layout.
+    Do not make a studio-clean generic tabletop; keep the scene-specific base
+    environment natural and aligned.

@@ -14,6 +14,18 @@ def test_default_config():
     assert cfg.random_seed == 42
     assert cfg.runtime.workers == 8
     assert cfg.video_pipeline.object_detection_backend == "seg2track_sam2"
+    assert cfg.video_pipeline.mesh_reconstruct_object_ids == []
+    assert cfg.video_pipeline.mesh_proxy_mode == "auto"
+    assert cfg.video_pipeline.mesh_proxy_target_faces == 1500
+    assert cfg.video_pipeline.mesh_proxy_use_for_pose is True
+    assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
+    assert cfg.video_pipeline.background_mode == "auto"
+    assert cfg.video_pipeline.background_disable_road_semantics is False
+    assert cfg.video_pipeline.task_foreground_object_ids == []
+    assert cfg.video_pipeline.background_cleaner == "temporal"
+    assert cfg.video_pipeline.background_cleaner_config_path is None
+    assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"
+    assert cfg.video_pipeline.background_cleaner_reference_frame_id == 1
 
 
 def test_resolve_paths():
@@ -33,6 +45,22 @@ storage:
 runtime:
   workers: 4
   fail_fast: true
+video_pipeline:
+  mesh_reconstruct_object_ids:
+    - obj_000007
+    - obj_000012
+  mesh_proxy_mode: simplify
+  mesh_proxy_target_faces: 2400
+  mesh_proxy_use_for_pose: false
+  mesh_proxy_keep_original_for_export: true
+  background_mode: tabletop_task
+  background_disable_road_semantics: true
+  task_foreground_object_ids:
+    - obj_000009
+  background_cleaner: openai_image_edit
+  background_cleaner_config_path: /root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml
+  background_cleaner_model: gpt-image-2
+  background_cleaner_reference_frame_id: 1
 datasets:
   scannetpp:
     enabled: true
@@ -48,6 +76,18 @@ datasets:
     assert cfg.random_seed == 123
     assert cfg.runtime.workers == 4
     assert cfg.runtime.fail_fast is True
+    assert cfg.video_pipeline.mesh_reconstruct_object_ids == ["obj_000007", "obj_000012"]
+    assert cfg.video_pipeline.mesh_proxy_mode == "simplify"
+    assert cfg.video_pipeline.mesh_proxy_target_faces == 2400
+    assert cfg.video_pipeline.mesh_proxy_use_for_pose is False
+    assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
+    assert cfg.video_pipeline.background_mode == "tabletop_task"
+    assert cfg.video_pipeline.background_disable_road_semantics is True
+    assert cfg.video_pipeline.task_foreground_object_ids == ["obj_000009"]
+    assert cfg.video_pipeline.background_cleaner == "openai_image_edit"
+    assert cfg.video_pipeline.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
+    assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"
+    assert cfg.video_pipeline.background_cleaner_reference_frame_id == 1
     assert "scannetpp" in cfg.datasets
     assert cfg.datasets["scannetpp"].source.path == "/data/scannetpp"
 

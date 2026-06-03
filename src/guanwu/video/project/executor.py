@@ -507,6 +507,118 @@ class ProjectExecutor:
         except (TypeError, ValueError):
             return None, None
 
+    def _bbox_motion_threshold(self) -> float:
+        threshold = getattr(self.context.config.settings.runtime, "bbox_motion_threshold", 0.03)
+        try:
+            value = float(threshold)
+        except (TypeError, ValueError):
+            return 0.03
+        if not math.isfinite(value) or value < 0.0:
+            return 0.03
+        return value
+
+    def _video_image_size(self) -> tuple[float | None, float | None]:
+        inspect = self.context.artifacts.get("video.inspect")
+        if inspect is None:
+            return None, None
+        metadata_path = inspect.outputs.get("video_metadata")
+        if not metadata_path or not Path(metadata_path).exists():
+            return None, None
+        try:
+            metadata = self._json_load(metadata_path)
+        except Exception:
+            return None, None
+        if not isinstance(metadata, dict):
+            return None, None
+        width = metadata.get("image_width") or metadata.get("width")
+        height = metadata.get("image_height") or metadata.get("height")
+        try:
+            width_f = float(width)
+            height_f = float(height)
+        except (TypeError, ValueError):
+            return None, None
+        if width_f <= 0.0 or height_f <= 0.0:
+            return None, None
+        return width_f, height_f
+
+    @staticmethod
+    def _bbox_motion_summary(
+        frames: list[dict],
+        *,
+        image_width: float | int | None,
+        image_height: float | int | None,
+        threshold: float,
+    ) -> dict[str, Any]:
+        centers: list[tuple[float, float]] = []
+        for frame in frames or []:
+            if not isinstance(frame, dict):
+                continue
+            bbox = frame.get("bbox_xyxy") or frame.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            centers.append((0.5 * (x1 + x2), 0.5 * (y1 + y2)))
+
+        try:
+            width_f = float(image_width) if image_width is not None else 0.0
+            height_f = float(image_height) if image_height is not None else 0.0
+        except (TypeError, ValueError):
+            width_f = height_f = 0.0
+        diag = math.hypot(width_f, height_f)
+        if not math.isfinite(diag) or diag <= 0.0:
+            diag = 1.0
+
+        frame_count = len(centers)
+        center_span_norm = 0.0
+        max_step_norm = 0.0
+        if frame_count >= 2:
+            center_span_norm = max(
+                math.hypot(centers[right][0] - centers[left][0], centers[right][1] - centers[left][1]) / diag
+                for left in range(frame_count)
+                for right in range(left + 1, frame_count)
+            )
+            max_step_norm = max(
+                math.hypot(centers[idx][0] - centers[idx - 1][0], centers[idx][1] - centers[idx - 1][1]) / diag
+                for idx in range(1, frame_count)
+            )
+
+        return {
+            "is_bbox_moving": bool(frame_count >= 2 and center_span_norm >= float(threshold)),
+            "center_span_norm": float(center_span_norm),
+            "max_step_norm": float(max_step_norm),
+            "frame_count": int(frame_count),
+            "threshold": float(threshold),
+        }
+
+    def _object_index_entries(self) -> dict[str, dict]:
+        index = self.context.artifacts.get("object.index")
+        if index is None:
+            return {}
+        objects_path = index.outputs.get("objects")
+        if not objects_path or not Path(objects_path).exists():
+            return {}
+        try:
+            payload = self._json_load(objects_path)
+        except Exception:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        entries: dict[str, dict] = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            object_id = str(item.get("object_id") or "").strip()
+            if object_id:
+                entries[object_id] = item
+        return entries
+
     @staticmethod
     def _mesh_frame_selection_score(inst: DetectedInstance | dict) -> dict[str, float | bool]:
         def get_value(key: str) -> object:
@@ -639,6 +751,23 @@ class ProjectExecutor:
         _ = obj
         _, inst = frame_data
         return float(self._mesh_frame_selection_score(inst)["score"])
+
+    @staticmethod
+    def _is_robotic_arm_mesh_excluded(obj: ObjectNode, attrs: dict) -> bool:
+        names = [
+            getattr(obj, "label", None),
+            attrs.get("class_name") if isinstance(attrs, dict) else None,
+            attrs.get("label") if isinstance(attrs, dict) else None,
+            attrs.get("concept_label") if isinstance(attrs, dict) else None,
+        ]
+        for name in names:
+            if not name:
+                continue
+            normalized = str(name).strip().lower().replace("_", " ").replace("-", " ")
+            normalized = " ".join(normalized.split())
+            if "robotic arm" in normalized:
+                return True
+        return False
 
     def _select_zaiwu_mesh_candidates(
         self,
@@ -1185,15 +1314,54 @@ class ProjectExecutor:
         self._json_dump(summary_path, summary_payload)
         background_assets: dict = {}
         try:
+            zaiwu_settings = self.context.config.settings.zaiwu
+            background_mode = str(getattr(zaiwu_settings, "background_mode", "auto") or "auto").strip().lower()
+            task_foreground_ids = [
+                str(object_id).strip()
+                for object_id in (getattr(zaiwu_settings, "task_foreground_object_ids", []) or [])
+                if str(object_id).strip()
+            ]
+            if not task_foreground_ids:
+                task_foreground_ids = [
+                    str(object_id).strip()
+                    for object_id in (getattr(zaiwu_settings, "mesh_reconstruct_object_ids", []) or [])
+                    if str(object_id).strip()
+                ]
+            disable_road_semantics = bool(getattr(zaiwu_settings, "background_disable_road_semantics", False))
+            tabletop_task_mode = background_mode in {"tabletop_task", "task", "manipulation", "robot_task"}
+            if tabletop_task_mode:
+                disable_road_semantics = True
+            background_cleaner_config = {
+                "config_path": getattr(zaiwu_settings, "background_cleaner_config_path", None),
+                "model": getattr(zaiwu_settings, "background_cleaner_model", "gpt-image-2"),
+            }
             background_assets = generate_target_frame_background_assets(
                 summary_path=summary_path,
                 output_dir=out_dir / "background_assets",
                 target_frame_id=3,
                 depth_maps_dir=wildgs_outputs.get("depth_maps_dir"),
                 camera_trajectory_path=camera_path,
-                clean_depth_estimator=self._build_clean_background_depth_estimator(out_dir / "background_assets"),
-                semantic_road_estimator=self._build_semantic_road_estimator(out_dir / "background_assets"),
+                clean_depth_estimator=(
+                    None
+                    if tabletop_task_mode
+                    else self._build_clean_background_depth_estimator(out_dir / "background_assets")
+                ),
+                semantic_road_estimator=(
+                    None
+                    if disable_road_semantics
+                    else self._build_semantic_road_estimator(out_dir / "background_assets")
+                ),
                 grid_stride=4,
+                background_mode=background_mode,
+                task_foreground_object_ids=task_foreground_ids,
+                disable_road_semantics=disable_road_semantics,
+                background_cleaner=getattr(zaiwu_settings, "background_cleaner", "temporal"),
+                background_cleaner_config=background_cleaner_config,
+                background_cleaner_reference_frame_id=getattr(
+                    zaiwu_settings,
+                    "background_cleaner_reference_frame_id",
+                    1,
+                ),
             )
             _logger.info(
                 "[geometry.lift] Generated target-frame background assets: %s",
@@ -1231,6 +1399,7 @@ class ProjectExecutor:
             "camera_provider": latest_snapshot.get("camera_provider", pit_cfg.camera_provider),
             "wildgs_slam_quality": wildgs_outputs.get("slam_quality"),
             "background_assets_available": bool(background_assets.get("manifest_path")),
+            "background_mode": background_mode if "background_mode" in locals() else "auto",
         }
         return self._base_result("geometry.lift", result_summary, outputs)
 
@@ -1482,15 +1651,38 @@ class ProjectExecutor:
         out_dir = self.context.stage_output_dir("mesh.reconstruct")
         objects = self._all_objects()
         object_attrs: dict = self._json_load(attr_artifact.outputs["object_attrs"])
-        # Only reconstruct objects that are movable rigid bodies
-        objects_to_reconstruct = [
+        # Automatically reconstruct rigid objects with observed bbox motion.
+        rigid_objects = [
             obj for obj in objects
-            if object_attrs.get(obj.object_id, {}).get("is_movable") is True
-            and object_attrs.get(obj.object_id, {}).get("is_rigid_body") is True
+            if object_attrs.get(obj.object_id, {}).get("is_rigid_body") is True
         ]
+        bbox_moving_candidates = [
+            obj for obj in rigid_objects
+            if object_attrs.get(obj.object_id, {}).get("is_bbox_moving") is True
+        ]
+        mesh_object_id_whitelist = {
+            str(object_id).strip()
+            for object_id in getattr(self.context.config.settings.zaiwu, "mesh_reconstruct_object_ids", [])
+            if str(object_id).strip()
+        }
+        if mesh_object_id_whitelist:
+            objects_to_reconstruct = [
+                obj for obj in objects if obj.object_id in mesh_object_id_whitelist
+            ]
+        else:
+            objects_to_reconstruct = bbox_moving_candidates
+        objects_after_robotic_arm_filter: list[ObjectNode] = []
+        robotic_arm_excluded_count = 0
+        for obj in objects_to_reconstruct:
+            attrs = object_attrs.get(obj.object_id, {})
+            if self._is_robotic_arm_mesh_excluded(obj, attrs):
+                robotic_arm_excluded_count += 1
+                continue
+            objects_after_robotic_arm_filter.append(obj)
+        objects_to_reconstruct = objects_after_robotic_arm_filter
         _logger.info(
             f"mesh.reconstruct: {len(objects_to_reconstruct)}/{len(objects)} objects "
-            f"selected (is_movable=True, is_rigid_body=True)"
+            f"selected (is_rigid_body=True, is_bbox_moving=True)"
         )
         object_ids = {obj.object_id for obj in objects_to_reconstruct}
         best_frames = self._find_best_frame_per_object(object_ids)
@@ -1548,6 +1740,10 @@ class ProjectExecutor:
             "mesh_count": len(meshes),
             "object_count": len(objects),
             "reconstructed_count": len(objects_to_reconstruct),
+            "mesh_reconstruct_object_ids": sorted(mesh_object_id_whitelist),
+            "bbox_moving_candidate_count": len(bbox_moving_candidates),
+            "rigid_moving_selected_count": len(objects_to_reconstruct),
+            "robotic_arm_excluded_count": robotic_arm_excluded_count,
             **mesh_stats,
         }
         return self._base_result("mesh.reconstruct", summary, outputs)
@@ -6498,6 +6694,7 @@ class ProjectExecutor:
     ) -> Path:
         import numpy as np
 
+        full_mask = np.where(np.asarray(full_mask) > 0, 255, 0).astype(np.uint8)
         bbox = inst.get("bbox_xyxy") or inst.get("bbox")
         if bbox and len(bbox) >= 4:
             bbox_xyxy = [float(v) for v in bbox[:4]]
@@ -6510,8 +6707,14 @@ class ProjectExecutor:
         crop_mask = self._crop_to_bbox(full_mask, bbox_xyxy)
         cv2.imwrite(str(task_dir / "image.jpg"), frame_image)
         cv2.imwrite(str(task_dir / "crop.jpg"), crop_image)
-        cv2.imwrite(str(task_dir / "mask.png"), crop_mask)
+        cv2.imwrite(str(task_dir / "mask.png"), full_mask)
+        cv2.imwrite(str(task_dir / "crop_mask.png"), crop_mask)
         shutil.copy2(glb_path, task_dir / "object.glb")
+        proxy_info = self._write_pose_optimizer_proxy_mesh(
+            source_mesh_path=glb_path,
+            task_dir=task_dir,
+            label=str(inst.get("concept_label") or (object_node.label if object_node else "object")),
+        )
 
         translation = None
         scale = None
@@ -6564,6 +6767,9 @@ class ProjectExecutor:
                 "scale": [float(v) for v in scale],
             },
         }
+        if proxy_info is not None:
+            task["optimizer_mesh_path"] = proxy_info["optimizer_mesh_path"]
+            task["mesh_proxy"] = proxy_info
         if vehicle_pose_context:
             task["vehicle_pose_context"] = vehicle_pose_context
         if temporal_prior_pose:
@@ -6571,6 +6777,102 @@ class ProjectExecutor:
         task_path = task_dir / "task.json"
         self._json_dump(task_path, task)
         return task_path
+
+    def _write_pose_optimizer_proxy_mesh(
+        self,
+        *,
+        source_mesh_path: Path,
+        task_dir: Path,
+        label: str,
+    ) -> dict[str, Any] | None:
+        settings = self.context.config.settings.zaiwu
+        if not bool(getattr(settings, "mesh_proxy_use_for_pose", True)):
+            return None
+        mode = str(getattr(settings, "mesh_proxy_mode", "auto") or "auto").strip().lower()
+        if mode in {"", "none", "off", "disabled", "original"}:
+            return None
+        target_faces = max(12, int(getattr(settings, "mesh_proxy_target_faces", 1500) or 1500))
+        try:
+            source_mesh = self._load_trimesh(source_mesh_path)
+        except Exception as exc:
+            _logger.warning("[pose.optimize] failed to load mesh for optimizer proxy %s: %s", source_mesh_path, exc)
+            return None
+        if source_mesh is None or len(source_mesh.vertices) == 0 or len(source_mesh.faces) == 0:
+            return None
+
+        proxy_mesh = None
+        proxy_mode = mode
+        label_key = str(label or "").strip().lower()
+        box_like = any(token in label_key for token in ("box", "block", "cube", "brick", "cuboid"))
+        if mode == "auto":
+            proxy_mode = "cuboid" if box_like else ("simplify" if len(source_mesh.faces) > target_faces else "original")
+        if proxy_mode == "original":
+            return None
+
+        try:
+            if proxy_mode in {"cuboid", "obb"}:
+                proxy_mesh = self._pose_optimizer_cuboid_proxy(source_mesh)
+                proxy_mode = "cuboid"
+            elif proxy_mode in {"simplify", "lightweight", "decimate"}:
+                proxy_mesh = self._pose_optimizer_simplified_proxy(source_mesh, target_faces=target_faces)
+                proxy_mode = "simplify"
+            elif proxy_mode in {"convex_hull", "hull"}:
+                proxy_mesh = source_mesh.convex_hull
+                proxy_mode = "convex_hull"
+        except Exception as exc:
+            _logger.warning("[pose.optimize] failed to build %s optimizer proxy: %s", proxy_mode, exc)
+            proxy_mesh = None
+
+        if proxy_mesh is None or len(proxy_mesh.vertices) == 0 or len(proxy_mesh.faces) == 0:
+            return None
+        proxy_path = task_dir / "optimizer_object.glb"
+        try:
+            proxy_mesh.export(str(proxy_path))
+        except Exception as exc:
+            _logger.warning("[pose.optimize] failed to export optimizer proxy %s: %s", proxy_path, exc)
+            return None
+        return {
+            "mode": proxy_mode,
+            "optimizer_mesh_path": proxy_path.name,
+            "source_mesh_path": "object.glb",
+            "source_face_count": int(len(source_mesh.faces)),
+            "proxy_face_count": int(len(proxy_mesh.faces)),
+            "target_faces": int(target_faces),
+            "label": str(label or ""),
+        }
+
+    @staticmethod
+    def _pose_optimizer_cuboid_proxy(source_mesh):
+        import trimesh
+
+        box = source_mesh.bounding_box_oriented
+        transform = np.asarray(box.primitive.transform, dtype=np.float64)
+        extents = np.asarray(box.primitive.extents, dtype=np.float64)
+        proxy = trimesh.creation.box(extents=extents)
+        proxy.apply_transform(transform)
+        return proxy
+
+    @staticmethod
+    def _pose_optimizer_simplified_proxy(source_mesh, *, target_faces: int):
+        mesh = source_mesh.copy()
+        if len(mesh.faces) <= int(target_faces):
+            return mesh
+        for method_name in ("simplify_quadric_decimation", "simplify_quadratic_decimation"):
+            method = getattr(mesh, method_name, None)
+            if method is None:
+                continue
+            try:
+                simplified = method(int(target_faces))
+            except TypeError:
+                simplified = method(face_count=int(target_faces))
+            if simplified is not None and len(simplified.faces) > 0:
+                return simplified
+        hull = mesh.convex_hull
+        if len(hull.faces) > int(target_faces):
+            stride = max(1, int(math.ceil(len(hull.faces) / float(target_faces))))
+            hull.update_faces(np.arange(len(hull.faces)) % stride == 0)
+            hull.remove_unreferenced_vertices()
+        return hull
 
     @staticmethod
     def _camera_dict_to_transform(camera: dict):
@@ -8945,6 +9247,31 @@ class ProjectExecutor:
                 if prev is None or score > prev[0]:
                     best_per_obj[inst.object_id] = (score, detections, inst)
 
+        image_width, image_height = self._video_image_size()
+        motion_threshold = self._bbox_motion_threshold()
+        object_index = self._object_index_entries()
+        motion_attrs: dict[str, dict] = {}
+        for obj_id, obj_entry in object_index.items():
+            frames = obj_entry.get("frames")
+            if not isinstance(frames, list):
+                frames = []
+            motion_summary = self._bbox_motion_summary(
+                frames,
+                image_width=image_width,
+                image_height=image_height,
+                threshold=motion_threshold,
+            )
+            motion_attrs[obj_id] = {
+                "is_bbox_moving": motion_summary["is_bbox_moving"],
+                "bbox_motion_score": motion_summary["center_span_norm"],
+                "bbox_motion_summary": {
+                    "center_span_norm": motion_summary["center_span_norm"],
+                    "max_step_norm": motion_summary["max_step_norm"],
+                    "frame_count": motion_summary["frame_count"],
+                    "threshold": motion_summary["threshold"],
+                },
+            }
+
         # Infer attrs per object using its best frame
         all_attrs: dict = {}
         for obj_id, (_, det, inst) in best_per_obj.items():
@@ -8959,10 +9286,41 @@ class ProjectExecutor:
             except Exception as exc:
                 _logger.warning("[object.attr] Failed for %s: %s", obj_id, exc)
 
+        for obj_id, motion in motion_attrs.items():
+            all_attrs.setdefault(obj_id, {}).update(motion)
+        for obj_id in best_per_obj:
+            if obj_id not in motion_attrs:
+                motion_summary = self._bbox_motion_summary(
+                    [],
+                    image_width=image_width,
+                    image_height=image_height,
+                    threshold=motion_threshold,
+                )
+                all_attrs.setdefault(obj_id, {}).update(
+                    {
+                        "is_bbox_moving": motion_summary["is_bbox_moving"],
+                        "bbox_motion_score": motion_summary["center_span_norm"],
+                        "bbox_motion_summary": {
+                            "center_span_norm": motion_summary["center_span_norm"],
+                            "max_step_norm": motion_summary["max_step_norm"],
+                            "frame_count": motion_summary["frame_count"],
+                            "threshold": motion_summary["threshold"],
+                        },
+                    }
+                )
+
         attrs_path = out_dir / "object_attrs.json"
         self._json_dump(attrs_path, all_attrs)
         outputs = {"object_attrs": str(attrs_path)}
-        summary = {"attr_count": len(all_attrs), "object_count": len(best_per_obj)}
+        summary = {
+            "attr_count": len(all_attrs),
+            "object_count": len(best_per_obj),
+            "bbox_motion_threshold": motion_threshold,
+            "bbox_moving_object_count": sum(
+                1 for attrs in all_attrs.values()
+                if isinstance(attrs, dict) and attrs.get("is_bbox_moving") is True
+            ),
+        }
         return self._base_result("object.attr", summary, outputs)
 
     def _run_physics_dynamics(self) -> dict:

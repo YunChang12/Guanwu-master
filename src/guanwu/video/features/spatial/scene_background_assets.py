@@ -35,11 +35,15 @@ TASK_BACKGROUND_LABELS = (
     "wall",
 )
 DEFAULT_OPENAI_IMAGE_EDIT_PROMPT = (
-    "Using the input image as a visual reference, generate a clean foundational background for this "
-    "robotic manipulation scene. Remove the robot arms, grasped wooden block, loose blocks, tools, "
-    "cables, and clutter, while preserving the original camera perspective, wooden board geometry, "
-    "metal grooved table, lighting, shadows, reflections, and overall workspace layout. Do not make "
-    "a studio-clean generic tabletop; keep the scene-specific base environment natural and aligned."
+    "Edit the input image minimally. Keep the scene as close as possible to the original frame.\n\n"
+    "Remove only the active manipulation objects on the central wooden board: the target wooden block, "
+    "loose small blocks, and robot parts that directly occlude the board. Preserve everything else "
+    "unless it clearly covers the central board surface.\n\n"
+    "Maintain the exact camera perspective, wood board boundaries, metal grooved table, edge context, "
+    "lighting, reflections, shadows, stains, scratches, seams, and natural texture. The result should "
+    "still feel like the same robotic workbench scene, only with the active objects gently removed.\n\n"
+    "Avoid over-cleaning, avoid replacing the environment, avoid making the tabletop pristine, and avoid "
+    "changing geometry or style."
 )
 
 

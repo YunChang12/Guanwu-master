@@ -73,7 +73,7 @@ from guanwu.video.registry import NATURAL_VIDEO_DATASET_ID
 
 _ZAIWU_SAM3D_PER_OBJECT_TIMEOUT_SEC = 300.0
 _POSE_OPTIMIZE_MIN_BBOX_AREA_PX = 800.0
-_POSE_MATCH_MIN_BBOX_AREA_PX = 800.0
+_POSE_MATCH_MIN_BBOX_AREA_PX = 500.0
 _POSE_TRACK_SCALE_PRIOR_MIN_FRAMES = 2
 _EDGE_POSE_HEADING_METRIC_KEYS = (
     "heading_prior_score",
@@ -927,6 +927,38 @@ class ProjectExecutor:
 
         # Fallback: use summary's latest_objects (legacy / already aggregated)
         return [ObjectNode.model_validate(obj) for obj in summary.get("latest_objects", [])]
+
+    def _object_visibility_frames_from_index(self) -> dict[str, list[int]]:
+        index = self.context.artifacts.get("object.index")
+        if index is None:
+            return {}
+        objects_path = (index.outputs or {}).get("objects")
+        if not objects_path:
+            return {}
+        try:
+            objects = self._json_load(objects_path)
+        except Exception:
+            return {}
+        out: dict[str, list[int]] = {}
+        for obj in objects if isinstance(objects, list) else []:
+            if not isinstance(obj, dict):
+                continue
+            obj_id = str(obj.get("object_id") or "").strip()
+            if not obj_id:
+                continue
+            frames: list[int] = []
+            for rec in obj.get("frames", []) or []:
+                if not isinstance(rec, dict):
+                    continue
+                try:
+                    frame_id = int(rec.get("frame_idx") or rec.get("frame_id") or 0)
+                except Exception:
+                    continue
+                if frame_id > 0:
+                    frames.append(frame_id)
+            if frames:
+                out[obj_id] = sorted(set(frames))
+        return out
 
     def _run_video_inspect(self) -> dict:
         out_dir = self.context.stage_output_dir("video.inspect")
@@ -8793,6 +8825,7 @@ class ProjectExecutor:
         conversion_report_path=None,
         fixed_camera_reference_frame_id=None,
         fixed_camera_road_plane=None,
+        object_visibility_frames=None,
     ):
         import numpy as np
         from pxr import Usd, UsdGeom, Gf, Sdf, Vt
@@ -8928,6 +8961,17 @@ class ProjectExecutor:
             out_trans = correction[:3, :3] @ trans_world + correction[:3, 3]
             return out_rot, out_trans
 
+        def _is_pose_optimizer_record(rec: dict) -> bool:
+            source = str(rec.get("source") or rec.get("pose_source") or rec.get("geometry_status") or "").strip().lower()
+            if source in {
+                "generic_appearance_temporal",
+                "edge_contour_fast_temporal",
+                "edge_contour_fast",
+                "pose_optimize",
+            }:
+                return True
+            return isinstance(rec.get("pose_optimizer"), dict)
+
 
         stage = Usd.Stage.CreateNew(str(usdc_path))
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
@@ -8950,8 +8994,21 @@ class ProjectExecutor:
         else:
             fps = 30.0
         stage.SetTimeCodesPerSecond(fps)
-        max_frame = max((f.get("frame_id", 0) for f in all_frames), default=1)
-        stage.SetStartTimeCode(1)
+        frame_numbers = [
+            int(float(f.get("frame_id", 0)))
+            for f in all_frames
+            if int(float(f.get("frame_id", 0))) > 0
+        ]
+        visibility_frame_numbers = [
+            int(float(frame_id))
+            for frames in (object_visibility_frames or {}).values()
+            for frame_id in (frames or [])
+            if int(float(frame_id)) > 0
+        ]
+        frame_numbers.extend(visibility_frame_numbers)
+        min_frame = min(frame_numbers, default=1)
+        max_frame = max(frame_numbers, default=min_frame)
+        stage.SetStartTimeCode(min_frame)
         stage.SetEndTimeCode(max_frame)
 
         UsdGeom.Xform.Define(stage, "/World")
@@ -9168,10 +9225,17 @@ class ProjectExecutor:
             vis_xf = UsdGeom.Xformable(visual.GetPrim())
             vis_orient = vis_xf.AddOrientOp()
             vis_scale = vis_xf.AddScaleOp()
+            visibility_frames = [
+                int(float(frame_id))
+                for frame_id in ((object_visibility_frames or {}).get(obj_id) or [])
+                if int(float(frame_id)) > 0
+            ]
+            if not visibility_frames:
+                visibility_frames = [int(float(rec.get("frame_id", 0))) for rec in frames]
             self._apply_trajectory_visibility_samples(
                 imageable,
-                [int(float(rec.get("frame_id", 0))) for rec in frames],
-                stage_start_frame=1,
+                visibility_frames,
+                stage_start_frame=int(min_frame),
                 stage_end_frame=int(max_frame),
             )
             for rec in frames:
@@ -9179,13 +9243,20 @@ class ProjectExecutor:
                 cx, cy, cz = rec["centroid_world"]
                 scale = np.asarray(rec.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64).reshape(3)
 
-                rot_world, trans_world = _fixed_camera_grounded_pose(
-                    int(frame_num),
-                    rec.get("rotation_matrix"),
-                    [cx, cy, cz],
-                    verts,
-                    scale,
-                )
+                if _is_pose_optimizer_record(rec):
+                    rot_world, trans_world = _fixed_camera_world_pose(
+                        int(frame_num),
+                        rec.get("rotation_matrix"),
+                        [cx, cy, cz],
+                    )
+                else:
+                    rot_world, trans_world = _fixed_camera_grounded_pose(
+                        int(frame_num),
+                        rec.get("rotation_matrix"),
+                        [cx, cy, cz],
+                        verts,
+                        scale,
+                    )
                 rot_usd, trans_usd = convert_world_pose_to_usd(
                     rot_world,
                     trans_world,
@@ -9574,6 +9645,7 @@ class ProjectExecutor:
                 bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
             cam_traj = self._json_load(geometry.outputs["camera_trajectory"]) if geometry else []
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
+            object_visibility_frames = self._object_visibility_frames_from_index()
 
             fixed_camera_reference_frame_id = None
             fixed_camera_road_plane = None
@@ -9601,6 +9673,7 @@ class ProjectExecutor:
                 conversion_report_path=conversion_report_path,
                 fixed_camera_reference_frame_id=fixed_camera_reference_frame_id,
                 fixed_camera_road_plane=fixed_camera_road_plane,
+                object_visibility_frames=object_visibility_frames,
             )
 
             outputs = {"usdc": str(usdc_path), "conversion_report": str(conversion_report_path)}

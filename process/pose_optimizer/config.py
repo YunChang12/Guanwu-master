@@ -62,6 +62,7 @@ NEGATED_BOOLEAN_OPTIONS = {
     "save_fg_bg_samples",
     "save_candidate_appearance_overlay",
     "save_score_breakdown",
+    "support_aligned_seed_enabled",
 }
 
 

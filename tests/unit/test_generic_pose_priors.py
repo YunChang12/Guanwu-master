@@ -1000,22 +1000,23 @@ def test_generic_config_keeps_full_scoring_after_proxy_coarse_mode() -> None:
     assert cfg["generic_coarse_scoring"] is False
 
 
-def test_generic_config_uses_moderate_support_contact_defaults() -> None:
+def test_generic_config_disables_depth_support_defaults() -> None:
     from process.pose_optimizer.config import load_config
     from process.pose_optimizer.variants import VARIANTS
 
     cfg = load_config(VARIANTS["generic_appearance_temporal"].config_path)
 
-    assert cfg["support_plane_weight"] == 0.30
-    assert cfg["support_penalty_weight"] == 0.25
+    assert cfg["support_plane_enabled"] == "disabled"
+    assert cfg["support_plane_weight"] == 0.0
+    assert cfg["support_penalty_weight"] == 0.0
     assert cfg["support_contact_sigma_m"] == 0.08
     assert cfg["support_contact_tolerance_m"] == 0.06
     assert cfg["support_floating_tolerance_m"] == 0.15
     assert cfg["support_penetration_tolerance_m"] == 0.07
-    assert cfg["support_orientation_penalty_weight"] == 0.35
+    assert cfg["support_orientation_penalty_weight"] == 0.0
     assert cfg["support_orientation_sigma_deg"] == 8.0
     assert cfg["support_orientation_tolerance_deg"] == 2.0
-    assert cfg["support_aligned_seed_enabled"] is True
+    assert cfg["support_aligned_seed_enabled"] is False
     assert cfg["support_alignment_trigger_deg"] == 6.0
     assert cfg["support_aligned_seed_score_margin"] == 0.20
     assert cfg["support_aligned_seed_source_top_k"] == 2

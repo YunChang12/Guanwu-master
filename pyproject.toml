@@ -53,6 +53,13 @@ pose-optimize = [
     "torch>=2.0",
     "pyrender>=0.1.45",
 ]
+robotpose = [
+    "opencv-python>=4.8",
+    "trimesh>=4.0",
+    "yourdfpy>=0.0.56",
+    "pyrender>=0.1.45",
+    "pycocotools>=2.0.8",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
@@ -66,7 +73,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/guanwu"]
+packages = ["src/guanwu", "robotpose"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

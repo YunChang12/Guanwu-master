@@ -147,7 +147,7 @@ non_truncated_visual_ground_rescue_enabled: false
 truncated_final_visual_selection_enabled: false
 severe_truncation_final_gate_enabled: false
 
-support_plane_enabled: auto
+support_plane_enabled: disabled
 support_plane_min_confidence: 0.70
 support_plane_min_points: 120
 support_plane_ransac_iters: 96
@@ -161,8 +161,8 @@ support_near_mask_inner_kernel: 9
 support_near_mask_outer_kernel: 31
 support_bbox_expand_ratio: 0.20
 support_exclude_target_mask_dilate_kernel: 9
-support_plane_weight: 0.30
-support_penalty_weight: 0.25
+support_plane_weight: 0.0
+support_penalty_weight: 0.0
 support_bottom_percentile: 3.0
 support_bottom_selection_mode: local_axis
 support_contact_sigma_m: 0.08
@@ -173,10 +173,10 @@ support_contact_distance_score_weight: 0.70
 support_contact_coverage_score_weight: 0.30
 support_floating_penalty_weight: 0.60
 support_penetration_penalty_weight: 1.00
-support_orientation_penalty_weight: 0.35
+support_orientation_penalty_weight: 0.0
 support_orientation_sigma_deg: 8.0
 support_orientation_tolerance_deg: 2.0
-support_aligned_seed_enabled: true
+support_aligned_seed_enabled: false
 support_alignment_trigger_deg: 6.0
 support_aligned_seed_score_margin: 0.20
 support_aligned_seed_source_top_k: 2

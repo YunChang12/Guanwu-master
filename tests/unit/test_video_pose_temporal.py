@@ -812,6 +812,164 @@ def test_fixed_camera_usd_export_writes_static_main_camera(tmp_path: Path) -> No
     assert np.allclose(obj_translate.Get(Usd.TimeCode(1.0)), obj_translate.Get(Usd.TimeCode(5.0)), atol=1e-5)
 
 
+def test_fixed_camera_usd_export_preserves_pose_optimizer_translation(tmp_path: Path) -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD camera checks")
+    from pxr import Usd
+
+    trimesh = pytest.importorskip("trimesh")
+    usdc_path = tmp_path / "scene.usdc"
+    mesh_path = tmp_path / "object.glb"
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(mesh_path))
+    wildgs_poses = [
+        {
+            "frame": 0,
+            "T_world_from_cam": np.eye(4, dtype=np.float64).tolist(),
+            "intrinsics": {"fx": 100.0, "fy": 100.0, "cx": 50.0, "cy": 40.0},
+        }
+    ]
+    corrected = {
+        "obj_000009": {
+            "frames": [
+                {
+                    "frame_id": 1,
+                    "timestamp_sec": 0.0,
+                    "centroid_world": [0.15, -0.06, 1.06],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [0.05, 0.05, 0.05],
+                    "source": "generic_appearance_temporal",
+                }
+            ]
+        }
+    }
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = type("Context", (), {"artifacts": {}})()
+    ProjectExecutor._export_usdc(
+        executor,
+        usdc_path,
+        {"obj_000009": {"files": [{"format": "glb", "path": str(mesh_path)}]}},
+        corrected,
+        None,
+        wildgs_poses,
+        [],
+        fixed_camera_reference_frame_id=1,
+        fixed_camera_road_plane={
+            "normal_world": [-0.14249085542751558, -0.5425622231757682, -0.8278421287311384],
+            "offset": 0.49227104921823917,
+        },
+    )
+
+    stage = Usd.Stage.Open(str(usdc_path))
+    obj_translate = stage.GetPrimAtPath("/World/Objects/obj_000009").GetAttribute("xformOp:translate")
+
+    np.testing.assert_allclose(
+        obj_translate.Get(Usd.TimeCode(1.0)),
+        [0.15, 0.06, -1.06],
+        atol=1e-6,
+    )
+
+
+def test_usd_export_starts_at_first_object_pose_frame(tmp_path: Path) -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD timeline checks")
+    from pxr import Usd, UsdGeom
+
+    trimesh = pytest.importorskip("trimesh")
+    usdc_path = tmp_path / "scene.usdc"
+    mesh_path = tmp_path / "object.glb"
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(mesh_path))
+    corrected = {
+        "obj_000009": {
+            "frames": [
+                {
+                    "frame_id": 19,
+                    "timestamp_sec": 0.0,
+                    "centroid_world": [0.0, 0.0, 4.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+                {
+                    "frame_id": 23,
+                    "timestamp_sec": 1.0,
+                    "centroid_world": [0.1, 0.0, 4.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+            ]
+        }
+    }
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = type("Context", (), {"artifacts": {}})()
+    ProjectExecutor._export_usdc(
+        executor,
+        usdc_path,
+        {"obj_000009": {"files": [{"format": "glb", "path": str(mesh_path)}]}},
+        corrected,
+        None,
+        [],
+        [],
+    )
+
+    stage = Usd.Stage.Open(str(usdc_path))
+    obj = UsdGeom.Imageable(stage.GetPrimAtPath("/World/Objects/obj_000009"))
+
+    assert stage.GetStartTimeCode() == 19.0
+    assert stage.GetEndTimeCode() == 23.0
+    assert obj.ComputeVisibility(Usd.TimeCode(stage.GetStartTimeCode())) == UsdGeom.Tokens.inherited
+
+
+def test_usd_export_uses_object_visibility_frames_when_available(tmp_path: Path) -> None:
+    pytest.importorskip("pxr", reason="usd-core required for USD timeline checks")
+    from pxr import Usd, UsdGeom
+
+    trimesh = pytest.importorskip("trimesh")
+    usdc_path = tmp_path / "scene.usdc"
+    mesh_path = tmp_path / "object.glb"
+    trimesh.creation.box(extents=(1.0, 1.0, 1.0)).export(str(mesh_path))
+    corrected = {
+        "obj_000009": {
+            "frames": [
+                {
+                    "frame_id": 19,
+                    "timestamp_sec": 0.0,
+                    "centroid_world": [0.0, 0.0, 4.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+                {
+                    "frame_id": 23,
+                    "timestamp_sec": 1.0,
+                    "centroid_world": [0.1, 0.0, 4.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+            ]
+        }
+    }
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = type("Context", (), {"artifacts": {}})()
+    ProjectExecutor._export_usdc(
+        executor,
+        usdc_path,
+        {"obj_000009": {"files": [{"format": "glb", "path": str(mesh_path)}]}},
+        corrected,
+        None,
+        [],
+        [],
+        object_visibility_frames={"obj_000009": list(range(1, 33))},
+    )
+
+    stage = Usd.Stage.Open(str(usdc_path))
+    obj = UsdGeom.Imageable(stage.GetPrimAtPath("/World/Objects/obj_000009"))
+
+    assert stage.GetStartTimeCode() == 1.0
+    assert stage.GetEndTimeCode() == 32.0
+    assert obj.GetVisibilityAttr().GetTimeSamples() == [1.0]
+    assert obj.ComputeVisibility(Usd.TimeCode(1.0)) == UsdGeom.Tokens.inherited
+    assert obj.ComputeVisibility(Usd.TimeCode(32.0)) == UsdGeom.Tokens.inherited
+
+
 def test_temporal_candidate_trajectory_prefers_smooth_pose_over_visual_outlier() -> None:
     frame_candidates = {
         1: [_pose_record(frame_id=1, x=0.0, yaw_deg=0.0, score=0.80)],
@@ -2788,8 +2946,32 @@ def test_usd_export_preserves_pose_optimizer_mesh_local_origin() -> None:
     np.testing.assert_allclose(prepared, verts)
 
 
-def test_pose_match_bbox_area_threshold_is_800_px() -> None:
-    assert project_executor._POSE_MATCH_MIN_BBOX_AREA_PX == 800.0
+def test_pose_match_bbox_area_threshold_is_500_px() -> None:
+    assert project_executor._POSE_MATCH_MIN_BBOX_AREA_PX == 500.0
+
+
+def test_pose_all_frame_candidate_frame_ids_keep_small_generic_frames_at_500_px() -> None:
+    detection_frames = [
+        {
+            "frame_idx": 22,
+            "instances": [
+                {
+                    "object_id": "obj_000009",
+                    "concept_label": "wooden block",
+                    "bbox_xyxy": [10.0, 20.0, 41.0, 42.0],
+                }
+            ],
+        }
+    ]
+
+    frame_ids = ProjectExecutor._pose_all_frame_candidate_frame_ids(
+        obj_id="obj_000009",
+        detection_frames=detection_frames,
+        min_bbox_area_px=project_executor._POSE_MATCH_MIN_BBOX_AREA_PX,
+        generic_mode=True,
+    )
+
+    assert frame_ids == [22]
 
 
 def test_pose_target_frame_mode_reads_all_frames_env(monkeypatch) -> None:

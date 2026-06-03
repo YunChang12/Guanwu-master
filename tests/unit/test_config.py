@@ -106,3 +106,7 @@ def test_dataset_config_defaults():
 
 def test_pose_optimizer_config_to_argv_keeps_negative_axis_values() -> None:
     assert config_to_argv({"world_up_axis": "-y"}) == ["--world_up_axis=-y"]
+
+
+def test_pose_optimizer_config_to_argv_can_disable_support_aligned_seed() -> None:
+    assert config_to_argv({"support_aligned_seed_enabled": False}) == ["--no-support_aligned_seed_enabled"]

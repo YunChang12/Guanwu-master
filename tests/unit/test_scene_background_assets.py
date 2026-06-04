@@ -688,6 +688,87 @@ def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_p
     assert [(name, path.name) for name, path in meshes] == [("tabletop", "tabletop_background.obj")]
 
 
+def test_generate_tabletop_task_background_assets_writes_tabletop_reference_from_clean_depth(tmp_path: Path) -> None:
+    height, width = 24, 32
+    rgb = np.full((height, width, 3), (122, 112, 94), dtype=np.uint8)
+    mask = np.zeros((height, width), dtype=bool)
+    mask[10:16, 13:20] = True
+    rgb[mask] = (188, 128, 62)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "detections": str(
+                            _write_frame(
+                                tmp_path / "frame_000001",
+                                1,
+                                rgb,
+                                [_mask_instance("obj_000009", "wooden block", mask, [13, 10, 20, 16])],
+                            )
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    yy, xx = np.mgrid[0:height, 0:width]
+    external_depth = tmp_path / "external_depth.npy"
+    np.save(external_depth, (4.0 + 0.01 * xx + 0.02 * yy).astype(np.float32))
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary_path,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="tabletop_task",
+        task_foreground_object_ids=["obj_000009"],
+        camera_trajectory_path=camera_trajectory,
+        clean_depth_estimator=lambda _path: {
+            "depth_path": external_depth,
+            "source": "depth_anything3_clean_rgb",
+        },
+        grid_stride=4,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    reference_path = Path(manifest["assets"]["tabletop_reference"])
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    geometry_reference_path = Path(manifest["assets"]["background_geometry_reference"])
+    geometry_reference = json.loads(geometry_reference_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "guanwu.target_frame_background_assets.tabletop_depth.v2"
+    assert reference["source"] == "clean_depth_background"
+    assert len(reference["normal_world"]) == 3
+    assert np.isclose(np.linalg.norm(reference["normal_world"]), 1.0)
+    assert np.isfinite(float(reference["offset"]))
+    assert manifest["tabletop_reference"]["path"] == str(reference_path)
+    assert manifest["background_geometry_reference"]["path"] == str(geometry_reference_path)
+    assert geometry_reference["schema"] == "guanwu.background_geometry_reference.v1"
+    assert geometry_reference["reference_type"] == "support_surface"
+    assert geometry_reference["source"] == "clean_background_depth"
+    assert geometry_reference["support_surfaces"][0]["type"] == "plane"
+    assert geometry_reference["support_surfaces"][0]["normal_world"] == reference["normal_world"]
+    assert geometry_reference["support_surfaces"][0]["offset"] == reference["offset"]
+    assert Path(geometry_reference["exclusion"]["foreground_mask_path"]).exists()
+    assert load_background_asset_meshes(result["manifest_path"])[0][0] == "depth_background"
+
+
 def test_generate_tabletop_task_background_assets_uses_openai_image_cleaner_on_reference_frame(tmp_path: Path) -> None:
     frames = []
     height, width = 36, 64

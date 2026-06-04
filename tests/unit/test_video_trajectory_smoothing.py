@@ -140,3 +140,82 @@ def test_smoothing_does_not_cross_track_gaps() -> None:
     assert out[2]["centroid_world"] == frames[2]["centroid_world"]
     assert report["objects"]["obj_000001"]["segment_count"] == 2
     assert report["objects"]["obj_000001"]["corrected_translation_outliers"] == 0
+
+
+def test_smoothing_snaps_contact_frames_to_tabletop_reference() -> None:
+    frames = [
+        _frame(1, 0.00),
+        _frame(2, 0.02),
+        _frame(3, 0.04),
+    ]
+    for frame in frames:
+        frame["centroid_world"] = [frame["centroid_world"][0], -0.050, 0.64]
+        frame["quality"]["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+            }
+        )
+    trajectories = {
+        "obj_000009": {
+            "frames": frames,
+            "tabletop_contact": {
+                "bottom_offset_m": -0.035,
+            },
+        }
+    }
+
+    smoothed, report = smooth_object_trajectories(
+        trajectories,
+        tabletop_reference={"normal_world": [0.0, -1.0, 0.0], "offset": 0.0},
+    )
+
+    out = smoothed["obj_000009"]["frames"]
+    assert np.isclose(out[0]["centroid_world"][1], -0.035)
+    assert np.isclose(out[1]["centroid_world"][1], -0.035)
+    assert np.isclose(out[2]["centroid_world"][1], -0.035)
+    assert out[0]["tabletop_contact"]["snapped"] is True
+    assert report["objects"]["obj_000009"]["tabletop_contact_snapped_frames"] == 3
+
+
+def test_smoothing_prefers_frame_tabletop_contact_offset_over_track_default() -> None:
+    frames = [
+        _frame(1, 0.00),
+        _frame(2, 0.02),
+        _frame(3, 0.04),
+    ]
+    for idx, frame in enumerate(frames):
+        frame["centroid_world"] = [frame["centroid_world"][0], -0.120, 0.64]
+        frame["T_world_from_object"] = [
+            [1.0, 0.0, 0.0, frame["centroid_world"][0]],
+            [0.0, 1.0, 0.0, frame["centroid_world"][1]],
+            [0.0, 0.0, 1.0, frame["centroid_world"][2]],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        frame["quality"]["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+            }
+        )
+        frame["tabletop_contact"] = {"bottom_offset_m": -0.020 - idx * 0.010}
+    trajectories = {
+        "obj_000009": {
+            "frames": frames,
+            "tabletop_contact": {
+                "bottom_offset_m": -0.080,
+            },
+        }
+    }
+
+    smoothed, report = smooth_object_trajectories(
+        trajectories,
+        tabletop_reference={"normal_world": [0.0, -1.0, 0.0], "offset": 0.0},
+    )
+
+    out = smoothed["obj_000009"]["frames"]
+    assert np.isclose(out[0]["centroid_world"][1], -0.020)
+    assert np.isclose(out[1]["centroid_world"][1], -0.030)
+    assert np.isclose(out[2]["centroid_world"][1], -0.040)
+    assert np.isclose(out[0]["T_world_from_object"][1][3], -0.020)
+    assert report["objects"]["obj_000009"]["tabletop_contact_snapped_frames"] == 3

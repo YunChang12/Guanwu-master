@@ -63,6 +63,10 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "temporal_score",
     "generic_temporal_loss",
     "scale_prior_score",
+    "scale_prior_delta_log",
+    "scale_lock_applied",
+    "generic_track_scale_prior_scale",
+    "generic_pose_motion_phase",
     "optional_prior_score",
     "support_plane_confidence",
     "support_plane_enabled",
@@ -98,6 +102,12 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "support_penetration_penalty",
     "support_penalty",
     "support_contact_penalty_eff",
+    "contact_snap_rescue_applied",
+    "contact_snap_rescue_delta_m",
+    "contact_snap_rescue_source_score",
+    "contact_snap_rescue_source_support_separation_m",
+    "contact_scale_depth_rescue_applied",
+    "contact_scale_depth_rescue_factor",
     "upright_confidence",
     "heading_confidence",
     "observation_score",
@@ -115,6 +125,93 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "reject_reasons",
     "projected_bbox",
 ]
+
+
+def _normalize_generic_motion_phase(value: Any) -> str:
+    phase = str(value or "auto").strip().lower().replace("-", "_")
+    if phase in {"contact", "table", "tabletop", "supported", "support", "contact_calibration"}:
+        return "contact_calibration"
+    if phase in {"free", "free_motion", "lift", "lifted", "grasp", "grasped", "manipulated"}:
+        return "free_motion"
+    return "auto"
+
+
+def _uniform_scale_scalar_from_prior(prior: Any) -> float | None:
+    if not isinstance(prior, dict):
+        return None
+    value = prior.get("scale")
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return None
+    scalar = float(np.median(arr))
+    if not math.isfinite(scalar) or scalar <= 1e-8:
+        return None
+    return scalar
+
+
+def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[str, Any]) -> dict[str, Any]:
+    context = task.get("vehicle_pose_context") if isinstance(task.get("vehicle_pose_context"), dict) else {}
+    phase = _normalize_generic_motion_phase(
+        context.get("generic_pose_motion_phase")
+        or context.get("pose_motion_phase")
+        or getattr(args, "generic_pose_motion_phase", "auto")
+    )
+    args.generic_pose_motion_phase = phase
+
+    report: dict[str, Any] = {
+        "schema": "guanwu.generic_pose_motion_constraints.v1",
+        "phase": phase,
+        "scale_lock_applied": False,
+        "track_scale_prior": None,
+    }
+
+    track_prior = context.get("track_scale_prior") if isinstance(context, dict) else None
+    prior_scalar = _uniform_scale_scalar_from_prior(track_prior)
+    if prior_scalar is not None:
+        args.generic_track_scale_prior = {
+            "scale": prior_scalar,
+            "source": str((track_prior or {}).get("source") or "task_context"),
+            "sample_count": int((track_prior or {}).get("sample_count") or 0),
+            "frame_ids": list((track_prior or {}).get("frame_ids") or []),
+        }
+        report["track_scale_prior"] = dict(args.generic_track_scale_prior)
+
+    if phase == "contact_calibration":
+        args.depth_enabled = True
+        if str(getattr(args, "support_plane_enabled", "auto")).strip().lower() in {"0", "false", "off", "disabled", "none"}:
+            args.support_plane_enabled = "auto"
+        args.generic_acceptance_depth_confidence_high = min(
+            float(getattr(args, "generic_acceptance_depth_confidence_high", 0.70)),
+            0.70,
+        )
+        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.35)), 0.45)
+        args.support_plane_weight = max(float(getattr(args, "support_plane_weight", 0.20)), 0.35)
+        args.support_penalty_weight = max(float(getattr(args, "support_penalty_weight", 0.15)), 0.60)
+    elif phase == "free_motion":
+        args.depth_enabled = False
+        args.generic_depth_weight = 0.0
+        args.support_plane_enabled = "disabled"
+        args.support_plane_weight = 0.0
+        args.support_penalty_weight = 0.0
+        args.support_orientation_penalty_weight = 0.0
+        args.support_aligned_seed_enabled = False
+        if prior_scalar is not None:
+            task.setdefault("corrected_pose", {})["scale"] = [prior_scalar, prior_scalar, prior_scalar]
+            args.init_scale_factors = str(getattr(args, "generic_locked_scale_init_factors", "0.95,1.0,1.05"))
+            args.scale_min_factor = max(float(getattr(args, "scale_min_factor", 0.5)), 0.92)
+            args.scale_max_factor = min(float(getattr(args, "scale_max_factor", 2.2)), 1.08)
+            args.generic_scale_prior_weight = max(float(getattr(args, "generic_scale_prior_weight", 0.30)), 1.20)
+            args.generic_scale_prior_sigma_log = min(float(getattr(args, "generic_scale_prior_sigma_log", 0.20)), 0.06)
+            args.generic_scale_lock_applied = True
+            report["scale_lock_applied"] = True
+    if not hasattr(args, "generic_scale_lock_applied"):
+        args.generic_scale_lock_applied = False
+    return report
 
 
 def clamp01(value: float) -> float:
@@ -667,6 +764,83 @@ def estimate_support_plane_from_observed_depth(
     return plane
 
 
+def _background_geometry_reference_from_task(task: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("generic_pose_context", "vehicle_pose_context"):
+        context = task.get(key)
+        if isinstance(context, dict) and isinstance(context.get("background_geometry_reference"), dict):
+            return context["background_geometry_reference"]
+    return None
+
+
+def _select_background_support_surface(reference: dict[str, Any]) -> dict[str, Any]:
+    if reference.get("normal_world") is not None and reference.get("offset") is not None:
+        return reference
+    surfaces = reference.get("support_surfaces")
+    if isinstance(surfaces, list):
+        for surface in surfaces:
+            if not isinstance(surface, dict):
+                continue
+            if str(surface.get("type") or "plane").strip().lower() not in {"plane", "support_plane"}:
+                continue
+            if surface.get("normal_world") is not None and surface.get("offset") is not None:
+                return surface
+    return {}
+
+
+def support_plane_from_background_geometry_reference(
+    task: dict[str, Any],
+    t_world_from_cam: np.ndarray,
+) -> dict[str, Any]:
+    reference = _background_geometry_reference_from_task(task)
+    if not isinstance(reference, dict):
+        return {"available": False, "support_plane_confidence": 0.0, "reason": "background_geometry_reference_unavailable"}
+    surface = _select_background_support_surface(reference)
+    try:
+        normal_world = np.asarray(surface.get("normal_world"), dtype=np.float64).reshape(3)
+        offset_world = float(surface.get("offset"))
+    except Exception:
+        return {"available": False, "support_plane_confidence": 0.0, "reason": "background_geometry_reference_invalid_plane"}
+    world_norm = float(np.linalg.norm(normal_world))
+    if not math.isfinite(world_norm) or world_norm <= 1e-8 or not math.isfinite(offset_world):
+        return {"available": False, "support_plane_confidence": 0.0, "reason": "background_geometry_reference_invalid_plane"}
+    normal_world = normal_world / world_norm
+    offset_world = offset_world / world_norm
+    try:
+        t_world_from_cam = np.asarray(t_world_from_cam, dtype=np.float64).reshape(4, 4)
+        rotation_world_from_cam = t_world_from_cam[:3, :3]
+        translation_world_from_cam = t_world_from_cam[:3, 3]
+    except Exception:
+        return {"available": False, "support_plane_confidence": 0.0, "reason": "background_geometry_reference_invalid_camera"}
+    normal_cam = rotation_world_from_cam.T @ normal_world
+    offset_cam = float(offset_world + normal_world @ translation_world_from_cam)
+    cam_norm = float(np.linalg.norm(normal_cam))
+    if not math.isfinite(cam_norm) or cam_norm <= 1e-8:
+        return {"available": False, "support_plane_confidence": 0.0, "reason": "background_geometry_reference_invalid_camera_plane"}
+    normal_cam = normal_cam / cam_norm
+    offset_cam = offset_cam / cam_norm
+    confidence = surface.get("confidence", reference.get("support_plane_confidence", reference.get("confidence", 1.0)))
+    try:
+        confidence_value = float(confidence)
+    except Exception:
+        confidence_value = 1.0
+    confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
+    return {
+        "available": confidence_value > 0.0,
+        "source": "background_geometry_reference",
+        "reference_source": str(reference.get("source") or surface.get("source") or ""),
+        "reference_type": str(reference.get("reference_type") or "support_surface"),
+        "support_surface_id": surface.get("id") or reference.get("support_surface_id"),
+        "normal": normal_cam,
+        "offset": float(offset_cam),
+        "normal_world": [float(v) for v in normal_world.tolist()],
+        "offset_world": float(offset_world),
+        "support_plane_confidence": confidence_value,
+        "support_plane_inlier_ratio": surface.get("inlier_ratio"),
+        "support_plane_residual_m": (surface.get("quality") or {}).get("rmse_m") if isinstance(surface.get("quality"), dict) else None,
+        "num_points": (surface.get("quality") or {}).get("point_count") if isinstance(surface.get("quality"), dict) else None,
+    }
+
+
 def support_plane_report_payload(support_plane: dict[str, Any]) -> dict[str, Any]:
     payload = {
         key: value
@@ -968,6 +1142,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
 
     def _acceptance(self, result: dict[str, Any]) -> dict[str, Any]:
         reject_reasons: list[str] = []
+        motion_phase = _normalize_generic_motion_phase(getattr(self.generic_args, "generic_pose_motion_phase", "auto"))
         visible_iou = float(result.get("visible_mask_iou") or result.get("soft_mask_iou") or result.get("mask_iou") or 0.0)
         mask_iou = float(result.get("mask_iou") or visible_iou)
         bbox_iou = float(result.get("bbox_iou") or 0.0)
@@ -1004,11 +1179,51 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             reject_reasons.append("bbox_center_error_above_threshold")
         if projection_ratio < projection_threshold and not projection_exempt:
             reject_reasons.append("projection_valid_ratio_below_threshold")
+        depth_confidence = float(result.get("depth_confidence") or 0.0)
+        depth_score = float(result.get("depth_score") or 0.0)
+        if motion_phase != "free_motion":
+            depth_threshold = float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.25))
+            if motion_phase == "contact_calibration":
+                depth_threshold = max(depth_threshold, float(getattr(self.generic_args, "generic_contact_depth_min_score", 0.70)))
+            if (
+                depth_confidence >= float(getattr(self.generic_args, "generic_acceptance_depth_confidence_high", 0.70))
+                and depth_score < depth_threshold
+            ):
+                reject_reasons.append(
+                    "contact_depth_score_below_threshold" if motion_phase == "contact_calibration" else "depth_score_below_threshold"
+                )
+        try:
+            support_enabled = bool(result.get("support_plane_enabled"))
+            support_confidence = float(result.get("support_plane_confidence") or 0.0)
+            support_floating = abs(float(result.get("support_floating_distance_m") or 0.0))
+            support_penetration = abs(float(result.get("support_penetration_distance_m") or 0.0))
+        except Exception:
+            support_enabled = False
+            support_confidence = 0.0
+            support_floating = 0.0
+            support_penetration = 0.0
+        support_separation = max(support_floating, support_penetration)
         if (
-            float(result.get("depth_confidence") or 0.0) >= float(getattr(self.generic_args, "generic_acceptance_depth_confidence_high", 0.70))
-            and float(result.get("depth_score") or 0.0) < float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.25))
+            motion_phase != "free_motion"
+            and support_enabled
+            and support_confidence >= float(getattr(self.generic_args, "support_acceptance_min_confidence", 0.70))
+            and support_separation
+            > (
+                float(getattr(self.generic_args, "generic_contact_support_max_separation_m", 0.05))
+                if motion_phase == "contact_calibration"
+                else float(getattr(self.generic_args, "support_acceptance_max_separation_m", 0.15))
+            )
         ):
-            reject_reasons.append("depth_score_below_threshold")
+            reject_reasons.append(
+                "contact_support_separation_above_threshold"
+                if motion_phase == "contact_calibration"
+                else "support_separation_above_threshold"
+            )
+        if (
+            motion_phase == "contact_calibration"
+            and (not support_enabled or support_confidence < float(getattr(self.generic_args, "support_acceptance_min_confidence", 0.70)))
+        ):
+            reject_reasons.append("contact_support_plane_low_confidence")
         return {
             "acceptance_status": "accepted" if not reject_reasons else "rejected",
             "reject_reasons": reject_reasons,
@@ -1178,6 +1393,17 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
 
         scale_prior = self._scale_prior_score(np.asarray(result["scale"], dtype=np.float64))
         result.update(scale_prior)
+        motion_phase = _normalize_generic_motion_phase(getattr(self.generic_args, "generic_pose_motion_phase", "auto"))
+        result["generic_pose_motion_phase"] = motion_phase
+        result["scale_lock_applied"] = bool(getattr(self.generic_args, "generic_scale_lock_applied", False))
+        track_prior = getattr(self.generic_args, "generic_track_scale_prior", None)
+        if isinstance(track_prior, dict) and track_prior.get("scale") is not None:
+            try:
+                result["generic_track_scale_prior_scale"] = float(track_prior["scale"])
+            except Exception:
+                result["generic_track_scale_prior_scale"] = None
+        else:
+            result["generic_track_scale_prior_scale"] = None
 
         support = (
             {
@@ -1461,6 +1687,7 @@ def refine_candidate_stages(
     initializer_metadata = dict(coarse_result.get("initializer_metadata") or {})
     history: list[dict[str, Any]] = []
     lightweight_search = bool(getattr(args, "generic_lightweight_search_scoring", True))
+    motion_phase = _normalize_generic_motion_phase(getattr(args, "generic_pose_motion_phase", "auto"))
     original_full_coarse_scoring = bool(getattr(full_evaluator.generic_args, "generic_coarse_scoring", False))
     result = coarse_result
     for stage_name, evaluator, max_iters in (
@@ -1469,8 +1696,13 @@ def refine_candidate_stages(
         ("fine", full_evaluator, args.stage3_iters),
     ):
         original_stage_coarse_scoring = bool(getattr(evaluator.generic_args, "generic_coarse_scoring", False))
-        if lightweight_search:
+        stage_uses_lightweight = lightweight_search and not (
+            motion_phase == "contact_calibration" and stage_name == "fine"
+        )
+        if stage_uses_lightweight:
             evaluator.generic_args.generic_coarse_scoring = True
+        elif stage_name == "fine":
+            evaluator.generic_args.generic_coarse_scoring = False
         try:
             result, stage_history = generic_local_search_stage(
                 evaluator=evaluator,
@@ -1497,14 +1729,220 @@ def refine_candidate_stages(
     full_evaluator.generic_args.generic_coarse_scoring = False
     try:
         final = full_evaluator.evaluate_absolute(translation_cam, rotation_cam, scale, keep_mask=True)
+        final["initializer_metadata"] = initializer_metadata
+        if "params" in result:
+            final["params"] = np.asarray(result["params"], dtype=np.float64).copy()
+        if not args.save_full_history:
+            history.append(generic_optimization_history_row("full_rescore", 0, "final", 0, final, 0.0))
+
+        rescue = make_contact_snap_rescue_candidate(final, full_evaluator, args)
+        if rescue is not None:
+            rescue_history: list[dict[str, Any]] = []
+            rescue_iters = max(0, int(getattr(args, "generic_contact_snap_rescue_iters", 0)))
+            if rescue_iters > 0:
+                rescue, rescue_history = generic_local_search_stage(
+                    evaluator=full_evaluator,
+                    base_translation_cam=np.asarray(rescue["translation_cam"], dtype=np.float64),
+                    base_rotation_cam=np.asarray(rescue["rotation_cam"], dtype=np.float64),
+                    base_scale=np.asarray(rescue["scale"], dtype=np.float64),
+                    stage_name="fine",
+                    max_iters=rescue_iters,
+                    step_decay=args.step_decay,
+                    max_translation_delta=args.max_translation_delta,
+                    max_rotation_delta_deg=args.max_rotation_delta_deg,
+                    scale_min_factor=args.scale_min_factor,
+                    scale_max_factor=args.scale_max_factor,
+                    save_full_history=args.save_full_history,
+                    initializer_metadata=rescue.get("initializer_metadata"),
+                )
+                for row in rescue_history:
+                    row["phase"] = f"contact_snap_rescue_{row.get('phase', 'fine')}"
+                rescue["contact_snap_rescue_applied"] = True
+            if not args.save_full_history:
+                history.append(generic_optimization_history_row("contact_snap_rescue", 0, "final", 0, rescue, 0.0))
+            history.extend(rescue_history)
+            final = select_contact_snap_rescue_result(final, rescue)
     finally:
         full_evaluator.generic_args.generic_coarse_scoring = original_full_coarse_scoring
-    final["initializer_metadata"] = initializer_metadata
-    if "params" in result:
-        final["params"] = np.asarray(result["params"], dtype=np.float64).copy()
-    if not args.save_full_history:
-        history.append(generic_optimization_history_row("full_rescore", 0, "final", 0, final, 0.0))
     return final, history
+
+
+def _support_separation_m(result: dict[str, Any]) -> float:
+    try:
+        return max(
+            abs(float(result.get("support_floating_distance_m") or 0.0)),
+            abs(float(result.get("support_penetration_distance_m") or 0.0)),
+            abs(float(result.get("support_bottom_signed_m") or 0.0)),
+        )
+    except Exception:
+        return 0.0
+
+
+def _evaluate_absolute_keep_mask(
+    evaluator: GenericPoseEvaluator,
+    translation: np.ndarray,
+    rotation: np.ndarray,
+    scale: np.ndarray,
+) -> dict[str, Any]:
+    try:
+        return evaluator.evaluate_absolute(translation, rotation, scale, keep_mask=True)
+    except TypeError:
+        return evaluator.evaluate_absolute(translation, rotation, scale)
+
+
+def _contact_rescue_visual_passes(
+    rescued: dict[str, Any],
+    args: argparse.Namespace,
+) -> bool:
+    if rescued.get("projected_bbox") is None:
+        return False
+    min_mask_iou = float(getattr(args, "generic_contact_snap_rescue_min_mask_iou", 0.12))
+    min_bbox_iou = float(getattr(args, "generic_contact_snap_rescue_min_bbox_iou", 0.10))
+    rescued_mask_iou = float(rescued.get("visible_mask_iou") or rescued.get("soft_mask_iou") or rescued.get("mask_iou") or 0.0)
+    rescued_bbox_iou = float(rescued.get("bbox_iou") or 0.0)
+    return rescued_mask_iou >= min_mask_iou and rescued_bbox_iou >= min_bbox_iou
+
+
+def _annotate_contact_rescue_candidate(
+    rescued: dict[str, Any],
+    base_candidate: dict[str, Any],
+    *,
+    source: str,
+    bottom_signed_value: float,
+    source_separation_m: float,
+    scale_depth_factor: float | None = None,
+) -> dict[str, Any]:
+    base_meta = dict(base_candidate.get("initializer_metadata") or {})
+    annotation = {
+        "contact_snap_rescue_applied": True,
+        "contact_snap_rescue_delta_m": float(bottom_signed_value),
+        "contact_snap_rescue_source_score": float(base_candidate.get("score") or 0.0),
+        "contact_snap_rescue_source_support_separation_m": float(source_separation_m),
+        "contact_scale_depth_rescue_applied": source == "contact_scale_depth_rescue",
+        "contact_scale_depth_rescue_factor": float(scale_depth_factor) if scale_depth_factor is not None else None,
+    }
+    rescued.update(annotation)
+    rescued["initializer_metadata"] = {
+        **base_meta,
+        "source": source,
+        "base_source": base_meta.get("source", "unknown"),
+        "contact_snap_rescue_delta_m": float(bottom_signed_value),
+        "contact_snap_rescue_source_support_separation_m": float(source_separation_m),
+        "contact_scale_depth_rescue_factor": float(scale_depth_factor) if scale_depth_factor is not None else None,
+    }
+    return rescued
+
+
+def make_contact_snap_rescue_candidate(
+    base_candidate: dict[str, Any] | None,
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Snap a visually plausible contact-phase candidate onto the support plane."""
+
+    if base_candidate is None:
+        return None
+    if _normalize_generic_motion_phase(getattr(args, "generic_pose_motion_phase", "auto")) != "contact_calibration":
+        return None
+    if not bool(getattr(args, "support_contact_snap_enabled", True)):
+        return None
+    if not bool(getattr(args, "generic_contact_snap_rescue_enabled", True)):
+        return None
+
+    support_plane = getattr(evaluator, "support_plane", None) or {}
+    support_confidence = float(support_plane.get("support_plane_confidence") or 0.0)
+    if support_confidence < float(getattr(args, "support_acceptance_min_confidence", 0.70)):
+        return None
+
+    bottom_signed = base_candidate.get("support_bottom_signed_m")
+    if bottom_signed is None and hasattr(evaluator, "_support_contact"):
+        try:
+            support = evaluator._support_contact(base_candidate)
+            bottom_signed = support.get("support_bottom_signed_m")
+        except Exception:
+            bottom_signed = None
+    if bottom_signed is None:
+        return None
+    try:
+        bottom_signed_value = float(bottom_signed)
+    except Exception:
+        return None
+    if not math.isfinite(bottom_signed_value):
+        return None
+
+    separation = _support_separation_m(base_candidate)
+    support_threshold = float(getattr(args, "generic_contact_support_max_separation_m", 0.05))
+    if separation <= support_threshold:
+        return None
+
+    normal = _normalize(np.asarray(support_plane.get("normal"), dtype=np.float64))
+    if normal.shape != (3,) or not np.all(np.isfinite(normal)) or float(np.linalg.norm(normal)) <= 1e-8:
+        return None
+
+    translation = np.asarray(base_candidate["translation_cam"], dtype=np.float64).reshape(3)
+    rotation = np.asarray(base_candidate["rotation_cam"], dtype=np.float64).reshape(3, 3)
+    scale = np.asarray(base_candidate["scale"], dtype=np.float64).reshape(3)
+    rescue_candidates: list[dict[str, Any]] = []
+
+    if bool(getattr(args, "generic_contact_scale_depth_rescue_enabled", True)):
+        try:
+            plane_offset = float(support_plane.get("offset", 0.0))
+            plane_component = bottom_signed_value - plane_offset
+            if abs(plane_component) > 1e-8:
+                factor = -plane_offset / plane_component
+                min_factor = float(getattr(args, "generic_contact_scale_depth_rescue_min_factor", 0.25))
+                max_factor = float(getattr(args, "generic_contact_scale_depth_rescue_max_factor", 2.50))
+                if math.isfinite(factor) and min_factor <= factor <= max_factor:
+                    scaled = _evaluate_absolute_keep_mask(evaluator, translation * factor, rotation, scale * factor)
+                    if _contact_rescue_visual_passes(scaled, args):
+                        rescue_candidates.append(
+                            _annotate_contact_rescue_candidate(
+                                scaled,
+                                base_candidate,
+                                source="contact_scale_depth_rescue",
+                                bottom_signed_value=bottom_signed_value,
+                                source_separation_m=separation,
+                                scale_depth_factor=factor,
+                            )
+                        )
+        except Exception:
+            pass
+
+    snapped_translation = translation - bottom_signed_value * normal
+    rescued = _evaluate_absolute_keep_mask(evaluator, snapped_translation, rotation, scale)
+    if _contact_rescue_visual_passes(rescued, args):
+        rescue_candidates.append(
+            _annotate_contact_rescue_candidate(
+                rescued,
+                base_candidate,
+                source="contact_snap_rescue",
+                bottom_signed_value=bottom_signed_value,
+                source_separation_m=separation,
+            )
+        )
+    if not rescue_candidates:
+        return None
+    accepted = [item for item in rescue_candidates if item.get("acceptance_status") == "accepted"]
+    if accepted:
+        return max(accepted, key=lambda item: float(item.get("score", -1e9)))
+    return max(rescue_candidates, key=lambda item: float(item.get("score", -1e9)))
+
+
+def select_contact_snap_rescue_result(
+    original: dict[str, Any],
+    rescue: dict[str, Any],
+) -> dict[str, Any]:
+    original_accepted = original.get("acceptance_status") == "accepted"
+    rescue_accepted = rescue.get("acceptance_status") == "accepted"
+    if rescue_accepted and not original_accepted:
+        return rescue
+    if rescue_accepted and original_accepted:
+        if float(rescue.get("score") or -1e9) >= float(original.get("score") or -1e9):
+            return rescue
+        return original
+    if not original_accepted and float(rescue.get("score") or -1e9) > float(original.get("score") or -1e9):
+        return rescue
+    return original
 
 
 def generic_early_stop_reached(
@@ -1590,11 +2028,32 @@ def make_support_aligned_seed(
     if after_angle is None or float(after_angle) >= float(before_angle_value) - 1e-6:
         return None
 
+    translation = np.asarray(base_candidate["translation_cam"], dtype=np.float64)
+    scale = np.asarray(base_candidate["scale"], dtype=np.float64)
     result = evaluator.evaluate_absolute(
-        np.asarray(base_candidate["translation_cam"], dtype=np.float64),
+        translation,
         aligned_rotation,
-        np.asarray(base_candidate["scale"], dtype=np.float64),
+        scale,
     )
+    snap_applied = False
+    snap_delta_m = 0.0
+    if bool(getattr(args, "support_contact_snap_enabled", True)):
+        try:
+            bottom_signed = result.get("support_bottom_signed_m")
+            if bottom_signed is None and hasattr(evaluator, "_support_contact"):
+                support = evaluator._support_contact(result)
+                bottom_signed = support.get("support_bottom_signed_m")
+            if bottom_signed is not None:
+                normal = _normalize(np.asarray(support_plane.get("normal"), dtype=np.float64))
+                snap_delta_m = float(bottom_signed)
+                snapped_translation = translation - snap_delta_m * normal
+                snapped = evaluator.evaluate_absolute(snapped_translation, aligned_rotation, scale)
+                if snapped.get("projected_bbox") is not None:
+                    result = snapped
+                    snap_applied = True
+        except Exception:
+            snap_applied = False
+            snap_delta_m = 0.0
     if result.get("projected_bbox") is None:
         return None
     base_meta = dict(base_candidate.get("initializer_metadata") or {})
@@ -1610,6 +2069,8 @@ def make_support_aligned_seed(
         "base_source": base_meta.get("source", "unknown"),
         "support_normal_angle_deg_before_alignment": align_meta.get("support_normal_angle_deg_before_alignment"),
         "support_normal_angle_deg_after_alignment": align_meta.get("support_normal_angle_deg_after_alignment"),
+        "support_contact_snap_applied": snap_applied,
+        "support_contact_snap_delta_m": snap_delta_m,
     }
     return result
 
@@ -2017,6 +2478,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         fast.resolve_torch_device(args.device, allow_auto_fallback=False)
 
     task = fast.read_json(sample_dir / "task.json")
+    motion_constraints_report = apply_generic_task_motion_constraints(args, task)
     image = fast.read_image(sample_dir / "image.jpg", mode="color")
     crop_mask = fast.read_image(sample_dir / "mask.png", mode="gray")
     crop_image_path = sample_dir / "crop.jpg"
@@ -2095,13 +2557,15 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             depth_info = {"available": False, "reason": str(exc)}
 
-    support_plane = estimate_support_plane_from_observed_depth(
-        observed_depth,
-        full_mask,
-        json_bbox,
-        intrinsics,
-        args,
-    )
+    support_plane = support_plane_from_background_geometry_reference(task, t_world_from_cam)
+    if not support_plane.get("available"):
+        support_plane = estimate_support_plane_from_observed_depth(
+            observed_depth,
+            full_mask,
+            json_bbox,
+            intrinsics,
+            args,
+        )
     support_debug_outputs = save_support_plane_debug(output_dir, support_plane, full_mask)
 
     temporal_prior, temporal_report = _load_temporal_prior(sample_dir, output_dir, task, t_world_from_cam, args)
@@ -2434,6 +2898,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         "appearance": appearance_report,
         "depth": depth_report,
         "temporal": temporal_report,
+        "motion_constraints": motion_constraints_report,
         "optional_priors": {
             "road_plane_enabled": bool(getattr(args, "road_constraint_enabled", False)),
             "heading_enabled": bool(getattr(args, "heading_prior_enabled", False)),
@@ -2549,6 +3014,10 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_scale_prior_weight", type=float, default=0.30)
     parser.add_argument("--generic_scale_prior_sigma_log", type=float, default=0.20)
     parser.add_argument("--generic_contour_sigma_px", type=float, default=4.0)
+    parser.add_argument("--generic_pose_motion_phase", default="auto")
+    parser.add_argument("--generic_contact_depth_min_score", type=float, default=0.70)
+    parser.add_argument("--generic_contact_support_max_separation_m", type=float, default=0.05)
+    parser.add_argument("--generic_locked_scale_init_factors", default="0.95,1.0,1.05")
 
     parser.add_argument("--generic_temporal_translation_sigma", type=float, default=1.00)
     parser.add_argument("--generic_temporal_depth_sigma", type=float, default=0.80)
@@ -2598,6 +3067,16 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--support_alignment_trigger_deg", type=float, default=6.0)
     parser.add_argument("--support_aligned_seed_score_margin", type=float, default=0.20)
     parser.add_argument("--support_aligned_seed_source_top_k", type=int, default=2)
+    parser.add_argument("--support_contact_snap_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_contact_snap_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_contact_snap_rescue_iters", type=int, default=0)
+    parser.add_argument("--generic_contact_snap_rescue_min_mask_iou", type=float, default=0.12)
+    parser.add_argument("--generic_contact_snap_rescue_min_bbox_iou", type=float, default=0.10)
+    parser.add_argument("--generic_contact_scale_depth_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_contact_scale_depth_rescue_min_factor", type=float, default=0.25)
+    parser.add_argument("--generic_contact_scale_depth_rescue_max_factor", type=float, default=2.50)
+    parser.add_argument("--support_acceptance_min_confidence", type=float, default=0.70)
+    parser.add_argument("--support_acceptance_max_separation_m", type=float, default=0.15)
     parser.add_argument("--optional_prior_gate_start", type=float, default=0.35)
     parser.add_argument("--optional_prior_gate_range", type=float, default=0.45)
     parser.add_argument("--generic_upright_enabled", default="auto")

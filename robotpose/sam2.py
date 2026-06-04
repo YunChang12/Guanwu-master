@@ -55,10 +55,84 @@ def decode_uncompressed_rle(rle: dict[str, Any], shape: tuple[int, int]) -> np.n
     return mask
 
 
+def decode_compressed_rle(rle: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
+    counts_raw = rle.get("counts")
+    size = rle.get("size")
+    if not isinstance(counts_raw, str):
+        return None
+    if not (isinstance(size, list) and len(size) >= 2):
+        return None
+    height, width = int(size[0]), int(size[1])
+    counts = _decode_coco_compressed_counts(counts_raw)
+    if counts is None:
+        return None
+    return _mask_from_counts(counts, (height, width), shape)
+
+
+def _decode_coco_compressed_counts(value: str) -> list[int] | None:
+    counts: list[int] = []
+    index = 0
+    text = str(value)
+    while index < len(text):
+        shift = 0
+        count = 0
+        more = True
+        while more:
+            if index >= len(text):
+                return None
+            char_value = ord(text[index]) - 48
+            index += 1
+            count |= (char_value & 0x1F) << shift
+            more = bool(char_value & 0x20)
+            shift += 5
+            if not more and (char_value & 0x10):
+                count |= -1 << shift
+        if len(counts) > 2:
+            count += counts[-2]
+        if count < 0:
+            return None
+        counts.append(int(count))
+    return counts
+
+
+def _mask_from_counts(counts: list[int], source_shape: tuple[int, int], target_shape: tuple[int, int]) -> np.ndarray | None:
+    height, width = [int(v) for v in source_shape]
+    total = height * width
+    flat = np.zeros(total, dtype=np.uint8)
+    index = 0
+    value = 0
+    for raw_count in counts:
+        count = int(raw_count)
+        if count < 0:
+            return None
+        end = min(total, index + count)
+        if value == 1 and end > index:
+            flat[index:end] = 1
+        index = end
+        value = 1 - value
+        if index >= total:
+            break
+    mask = flat.reshape((width, height)).T.astype(bool)
+    if mask.shape != tuple(target_shape):
+        mask_img = Image.fromarray(mask.astype(np.uint8) * 255)
+        mask = np.asarray(mask_img.resize((target_shape[1], target_shape[0]), Image.Resampling.NEAREST)) > 0
+    return mask
+
+
 def decode_instance_mask(inst: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
     raw = inst.get("mask_rle") or inst.get("mask")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            raw = parsed
     if isinstance(raw, dict):
         decoded = decode_uncompressed_rle(raw, shape)
+        if decoded is not None:
+            return decoded
+        decoded = decode_compressed_rle(raw, shape)
         if decoded is not None:
             return decoded
         try:

@@ -132,8 +132,51 @@ _GENERIC_POSE_METRIC_KEYS = (
     "temporal_score",
     "generic_temporal_loss",
     "scale_prior_score",
+    "scale_prior_delta_log",
+    "scale_lock_applied",
+    "generic_track_scale_prior_scale",
+    "generic_pose_motion_phase",
     "optional_prior_score",
+    "support_plane_enabled",
+    "support_plane_disable_reason",
     "support_plane_confidence",
+    "support_plane_inlier_ratio",
+    "support_plane_residual_m",
+    "support_contact_score",
+    "support_contact_distance_score",
+    "support_contact_coverage",
+    "support_contact_mean_abs_m",
+    "support_contact_max_abs_m",
+    "support_bottom_selection_mode",
+    "support_axis_index",
+    "support_axis_sign",
+    "support_normal_alignment",
+    "support_normal_angle_deg",
+    "support_orientation_score",
+    "support_orientation_penalty",
+    "support_orientation_penalty_eff",
+    "support_aligned_candidate_used",
+    "support_normal_angle_deg_before_alignment",
+    "support_normal_angle_deg_after_alignment",
+    "support_alignment_axis_index",
+    "support_alignment_axis_sign",
+    "support_alignment_delta_deg",
+    "support_bottom_point_count",
+    "support_bottom_mean_abs_m",
+    "support_bottom_max_abs_m",
+    "support_bottom_signed_m",
+    "support_floating_distance_m",
+    "support_penetration_distance_m",
+    "support_floating_penalty",
+    "support_penetration_penalty",
+    "support_penalty",
+    "support_contact_penalty_eff",
+    "contact_snap_rescue_applied",
+    "contact_snap_rescue_delta_m",
+    "contact_snap_rescue_source_score",
+    "contact_snap_rescue_source_support_separation_m",
+    "contact_scale_depth_rescue_applied",
+    "contact_scale_depth_rescue_factor",
     "observation_score",
     "optional_prior_gate",
     "projection_valid_ratio",
@@ -1808,6 +1851,7 @@ class ProjectExecutor:
         road_geometry = self._road_geometry_with_background_fallback(road_geometry, geometry)
         road_geometry_path = out_dir / "road_geometry.json"
         self._json_dump(road_geometry_path, road_geometry)
+        background_geometry_reference = self._tabletop_reference_from_geometry(geometry)
 
         scene_up = self._pose_track_scene_up(road_geometry)
         target_frame_id = self._pose_target_frame_id()
@@ -1825,6 +1869,7 @@ class ProjectExecutor:
                 wildgs_K=wildgs_K,
                 road_geometry=road_geometry,
                 road_geometry_path=road_geometry_path,
+                background_geometry_reference=background_geometry_reference,
                 scene_up=scene_up,
                 target_frame_id=target_frame_id,
                 target_window_radius=target_window_radius,
@@ -2217,6 +2262,7 @@ class ProjectExecutor:
         wildgs_K: dict | None,
         road_geometry: dict | None,
         road_geometry_path: Path,
+        background_geometry_reference: dict | None,
         scene_up,
         target_frame_id: int | None,
         target_window_radius: int,
@@ -2440,6 +2486,7 @@ class ProjectExecutor:
             # initializers only; scale priors are promoted later from accepted
             # high-quality pose optimizer results.
             track_scale_prior = None
+            generic_contact_records: list[dict] = []
             mesh_basis = seed_meta.get("mesh_basis")
             if mesh_basis is None:
                 mesh_basis = np.eye(3, dtype=np.float64).tolist()
@@ -2561,15 +2608,26 @@ class ProjectExecutor:
                     target_window_radius=target_window_radius,
                 )
                 if generic_mode:
+                    generic_phase = self._generic_pose_phase_for_frame(
+                        frame_id=int(frame_id),
+                        track_scale_prior=track_scale_prior,
+                        previous_records=all_frame_prior_records if all_frames_mode else accepted_records,
+                        inst=inst,
+                    )
                     vehicle_pose_context = {
                         "schema": "generic_pose_context.v1",
                         "object_id": obj_id,
                         "frame_id": int(frame_id),
                         "support_plane": "auto",
+                        "generic_pose_motion_phase": generic_phase,
                     }
                     depth_map_path = self._resolve_depth_map_for_frame(depth_maps_dir, int(frame_id))
                     if depth_map_path:
                         vehicle_pose_context["depth_map_path"] = str(depth_map_path)
+                    vehicle_pose_context = self._generic_pose_context_with_background_geometry_reference(
+                        vehicle_pose_context,
+                        background_geometry_reference,
+                    )
                 vehicle_pose_context["temporal_window"] = {
                     "mode": target_frame_mode,
                     "base_radius": int(target_window_radius),
@@ -2765,31 +2823,49 @@ class ProjectExecutor:
                         else:
                             stable_temporal_streak = 0
                         all_frame_prior_records.append(pose_record)
-                        updated_scale_prior = self._pose_track_scale_prior(
-                            all_frame_prior_records,
-                            source="accepted_track_median_scale",
-                            require_high_quality=True,
-                            max_frame_id=int(frame_id),
-                        )
-                        if updated_scale_prior:
-                            track_scale_prior = updated_scale_prior
+                        if generic_mode:
+                            if self._generic_pose_motion_phase_from_metrics(pose_record.get("metrics", {})) == "contact_calibration":
+                                generic_contact_records.append(pose_record)
+                                updated_scale_prior = self._generic_contact_scale_prior(generic_contact_records)
+                                if updated_scale_prior:
+                                    track_scale_prior = updated_scale_prior
+                        else:
+                            updated_scale_prior = self._pose_track_scale_prior(
+                                all_frame_prior_records,
+                                source="accepted_track_median_scale",
+                                require_high_quality=True,
+                                max_frame_id=int(frame_id),
+                            )
+                            if updated_scale_prior:
+                                track_scale_prior = updated_scale_prior
                     else:
                         accepted_frames += 1
                         accepted_records.append(pose_record)
                         previous_accepted = pose_record
-                        updated_scale_prior = self._pose_track_scale_prior(
-                            accepted_records,
-                            source="accepted_track_median_scale",
-                            require_high_quality=True,
-                            max_frame_id=int(frame_id),
-                        )
-                        if updated_scale_prior:
-                            track_scale_prior = updated_scale_prior
+                        if generic_mode:
+                            if self._generic_pose_motion_phase_from_metrics(pose_record.get("metrics", {})) == "contact_calibration":
+                                generic_contact_records.append(pose_record)
+                                updated_scale_prior = self._generic_contact_scale_prior(generic_contact_records)
+                                if updated_scale_prior:
+                                    track_scale_prior = updated_scale_prior
+                        else:
+                            updated_scale_prior = self._pose_track_scale_prior(
+                                accepted_records,
+                                source="accepted_track_median_scale",
+                                require_high_quality=True,
+                                max_frame_id=int(frame_id),
+                            )
+                            if updated_scale_prior:
+                                track_scale_prior = updated_scale_prior
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
                 else:
                     rejected_frames += 1
                     object_rejected += 1
                     if generic_mode:
+                        phase = self._generic_pose_motion_phase_from_metrics(pose_record.get("metrics", {}))
+                        if phase == "contact_calibration" and not track_scale_prior:
+                            frame_records[f"frame_{int(frame_id):06d}"] = pose_record
+                            continue
                         self._abandon_generic_rejected_pose_frame(
                             pose_record,
                             frame_ids=frame_ids,
@@ -4199,6 +4275,7 @@ class ProjectExecutor:
             scene_up = self._estimate_scene_up(np.asarray(bg.vertices, dtype=np.float64))
             _logger.info("[scene.compose] Background: %d verts", len(bg.vertices))
 
+        tabletop_reference = self._tabletop_reference_from_geometry(geometry)
         pose_tracks = self._load_pose_track_outputs()
         if pose_tracks:
             selected_frame_id = self._pose_target_frame_id()
@@ -4212,6 +4289,7 @@ class ProjectExecutor:
                 sam3d_meshes=sam3d_meshes,
                 pose_tracks=pose_tracks,
                 selected_frame_id=selected_frame_id,
+                tabletop_reference=tabletop_reference,
             )
             corrected_trajectories = scene_manifest["corrected_trajectories"]
             manifest = scene_manifest["manifest"]
@@ -4221,6 +4299,7 @@ class ProjectExecutor:
                 raw_traj_path=raw_traj_path,
                 smoothed_traj_path=traj_path,
                 smoothing_report_path=smoothing_report_path,
+                tabletop_reference=tabletop_reference,
             )
             self._json_dump(manifest_path, manifest)
             self._json_dump(frame_scene_manifest_path, scene_manifest["frame_manifest"])
@@ -4336,6 +4415,11 @@ class ProjectExecutor:
                     "axis_roles": self._infer_source_axis_roles(verts),
                     "pose_source": "edge_contour_fast",
                 }
+                self._annotate_tabletop_contact_offsets(
+                    corrected_trajectories[obj_id],
+                    vertices=verts,
+                    tabletop_reference=tabletop_reference,
+                )
                 verts_world = (rotation @ (verts * np.asarray(scale, dtype=np.float64)[None, :]).T).T + np.asarray(center, dtype=np.float64)
                 obj_mesh.vertices = verts_world.astype(np.float32)
                 scene.add_geometry(obj_mesh, node_name=obj_id)
@@ -4566,6 +4650,7 @@ class ProjectExecutor:
             raw_traj_path=raw_traj_path,
             smoothed_traj_path=traj_path,
             smoothing_report_path=smoothing_report_path,
+            tabletop_reference=tabletop_reference,
         )
 
         self._json_dump(manifest_path, manifest)
@@ -4600,9 +4685,13 @@ class ProjectExecutor:
         raw_traj_path: Path,
         smoothed_traj_path: Path,
         smoothing_report_path: Path,
+        tabletop_reference: dict | None = None,
     ) -> tuple[dict, dict]:
         self._json_dump(raw_traj_path, corrected_trajectories)
-        smoothed, report = smooth_object_trajectories(corrected_trajectories)
+        smoothed, report = smooth_object_trajectories(
+            corrected_trajectories,
+            tabletop_reference=tabletop_reference,
+        )
         self._json_dump(smoothed_traj_path, smoothed)
         self._json_dump(smoothing_report_path, report)
         _logger.info(
@@ -4704,7 +4793,15 @@ class ProjectExecutor:
                             return str(frame["source"])
         return "depth_icp_temporal"
 
-    def _compose_scene_from_pose_tracks(self, *, scene, sam3d_meshes: dict, pose_tracks: dict, selected_frame_id: int) -> dict:
+    def _compose_scene_from_pose_tracks(
+        self,
+        *,
+        scene,
+        sam3d_meshes: dict,
+        pose_tracks: dict,
+        selected_frame_id: int,
+        tabletop_reference: dict | None = None,
+    ) -> dict:
         import numpy as np
 
         object_tracks: dict = pose_tracks.get("object_tracks", {})
@@ -4766,6 +4863,11 @@ class ProjectExecutor:
                 "axis_roles": track.get("axis_roles", {}),
                 "pose_source": track.get("pose_source", pose_source),
             }
+            self._annotate_tabletop_contact_offsets(
+                corrected_trajectories[obj_id],
+                vertices=np.asarray(obj_mesh.vertices, dtype=np.float64),
+                tabletop_reference=tabletop_reference,
+            )
 
             frame_pose = frame_poses.get(obj_id)
             if not isinstance(frame_pose, dict):
@@ -5056,6 +5158,7 @@ class ProjectExecutor:
             "mask_iou": metrics.get("mask_iou"),
             "bbox_iou": metrics.get("bbox_iou"),
             "bbox_center_error_px": metrics.get("bbox_center_error_px"),
+            "detection_bbox": report.get("json_bbox"),
             "ground_contact_max_abs_m": metrics.get("ground_contact_max_abs_m"),
             "top_distance_mean_m": metrics.get("top_distance_mean_m"),
             "top_distance_min_m": metrics.get("top_distance_min_m"),
@@ -5124,6 +5227,7 @@ class ProjectExecutor:
                 "mask_iou": metrics.get("mask_iou"),
                 "bbox_iou": metrics.get("bbox_iou"),
                 "bbox_center_error_px": metrics.get("bbox_center_error_px"),
+                "detection_bbox": report.get("json_bbox"),
                 "ground_contact_max_abs_m": metrics.get("ground_contact_max_abs_m"),
                 "ground_contact_mean_abs_m": metrics.get("ground_contact_mean_abs_m"),
                 "top_distance_mean_m": metrics.get("top_distance_mean_m"),
@@ -5830,6 +5934,163 @@ class ProjectExecutor:
         }
 
     @staticmethod
+    def _generic_pose_motion_phase_from_metrics(metrics: dict | None) -> str:
+        value = (metrics or {}).get("generic_pose_motion_phase") or (metrics or {}).get("pose_motion_phase") or "auto"
+        phase = str(value or "auto").strip().lower().replace("-", "_")
+        if phase in {"contact", "table", "tabletop", "supported", "support", "contact_calibration"}:
+            return "contact_calibration"
+        if phase in {"free", "free_motion", "lift", "lifted", "grasp", "grasped", "manipulated"}:
+            return "free_motion"
+        return "auto"
+
+    @staticmethod
+    def _generic_pose_phase_for_frame(
+        *,
+        frame_id: int,
+        track_scale_prior: dict | None,
+        previous_records: list[dict] | None,
+        inst: dict | None = None,
+        min_contact_frames: int = 10,
+        lift_bbox_center_delta_px: float = 18.0,
+        bbox_area_shrink_ratio: float = 0.70,
+        bbox_area_shrink_min_contact_frames: int = 3,
+    ) -> str:
+        if not track_scale_prior:
+            return "contact_calibration"
+        records = [record for record in (previous_records or []) if isinstance(record, dict)]
+        if any(
+            ProjectExecutor._generic_pose_motion_phase_from_metrics(record.get("metrics", {})) == "free_motion"
+            for record in records
+        ):
+            return "free_motion"
+        contact_records = [
+            record
+            for record in records
+            if ProjectExecutor._generic_pose_motion_phase_from_metrics(record.get("metrics", {})) == "contact_calibration"
+        ]
+        if int(frame_id) <= int(min_contact_frames):
+            return "contact_calibration"
+        current_bbox = None if inst is None else inst.get("bbox_xyxy") or inst.get("bbox")
+        current_center_y = ProjectExecutor._bbox_center_y(current_bbox)
+        current_area = ProjectExecutor._bbox_area_px(current_bbox)
+        contact_ref_area = ProjectExecutor._generic_contact_bbox_area_reference(
+            contact_records,
+            min_samples=bbox_area_shrink_min_contact_frames,
+        )
+        if (
+            contact_ref_area is not None
+            and current_area > 0.0
+            and current_area / max(contact_ref_area, 1e-6) <= float(bbox_area_shrink_ratio)
+        ):
+            return "free_motion"
+        anchor_center_y = None
+        for record in contact_records:
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            bbox = metrics.get("detection_bbox") or metrics.get("bbox_xyxy") or metrics.get("bbox")
+            anchor_center_y = ProjectExecutor._bbox_center_y(bbox)
+            if anchor_center_y is not None:
+                break
+        if current_center_y is not None and anchor_center_y is not None:
+            if anchor_center_y - current_center_y >= float(lift_bbox_center_delta_px):
+                return "free_motion"
+        return "contact_calibration"
+
+    @staticmethod
+    def _bbox_center_y(bbox: object) -> float | None:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return None
+        try:
+            return 0.5 * (float(bbox[1]) + float(bbox[3]))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _generic_contact_bbox_area_reference(
+        contact_records: list[dict],
+        *,
+        min_samples: int = 3,
+    ) -> float | None:
+        areas: list[float] = []
+        for record in contact_records or []:
+            if not isinstance(record, dict):
+                continue
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            bbox = metrics.get("detection_bbox") or metrics.get("bbox_xyxy") or metrics.get("bbox")
+            area = ProjectExecutor._bbox_area_px(bbox)
+            if area > 0.0 and math.isfinite(area):
+                areas.append(float(area))
+        if len(areas) < int(min_samples):
+            return None
+        return float(np.median(np.asarray(areas, dtype=np.float64)))
+
+    @staticmethod
+    def _generic_contact_scale_prior(
+        records: list[dict],
+        *,
+        min_frames: int = _POSE_TRACK_SCALE_PRIOR_MIN_FRAMES,
+        support_max_separation_m: float = 0.05,
+        depth_min_score: float = 0.70,
+        support_min_confidence: float = 0.70,
+    ) -> dict | None:
+        import numpy as np
+
+        valid = []
+        frame_ids = []
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") not in {None, "accepted"}:
+                continue
+            if not ProjectExecutor._pose_scale_prior_record_is_high_quality(record):
+                continue
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            try:
+                support_enabled = bool(metrics.get("support_plane_enabled"))
+                support_confidence = float(metrics.get("support_plane_confidence") or 0.0)
+                support_separation = max(
+                    abs(float(metrics.get("support_floating_distance_m") or 0.0)),
+                    abs(float(metrics.get("support_penetration_distance_m") or 0.0)),
+                )
+                depth_confidence = float(metrics.get("depth_confidence") or 0.0)
+                depth_score = float(metrics.get("depth_score") or 0.0)
+            except Exception:
+                continue
+            if not support_enabled or support_confidence < support_min_confidence:
+                continue
+            if support_separation > support_max_separation_m:
+                continue
+            if depth_confidence >= 0.70 and depth_score < depth_min_score:
+                continue
+            scale = record.get("scale")
+            if scale is None and isinstance(record.get("pose"), dict):
+                scale = record["pose"].get("scale")
+            if not ProjectExecutor._valid_vec3_like(scale):
+                continue
+            arr = np.asarray(scale, dtype=np.float64).reshape(3)
+            scalar = float(np.median(arr))
+            if not math.isfinite(scalar) or scalar <= 1e-8:
+                continue
+            valid.append(scalar)
+            try:
+                frame_ids.append(int(record.get("frame_id") or 0))
+            except Exception:
+                pass
+        if len(valid) < max(1, int(min_frames)):
+            return None
+        value = float(np.median(np.asarray(valid, dtype=np.float64)))
+        if not math.isfinite(value) or value <= 1e-8:
+            return None
+        return {
+            "available": True,
+            "source": "contact_supported_scale",
+            "scale": [value, value, value],
+            "sample_count": len(valid),
+            "frame_ids": sorted({fid for fid in frame_ids if fid > 0}),
+            "support_max_separation_m": float(support_max_separation_m),
+            "depth_min_score": float(depth_min_score),
+        }
+
+    @staticmethod
     def _pose_scale_prior_record_is_high_quality(record: dict) -> bool:
         if record.get("status") not in {None, "accepted"}:
             return False
@@ -6086,6 +6347,12 @@ class ProjectExecutor:
         if len(records) < 2:
             return records, {"enabled": True, "applied": False, "reason": "fewer_than_two_frames"}
         stabilized = copy.deepcopy(records)
+        if any(ProjectExecutor._pose_record_is_generic(record) for record in stabilized):
+            return stabilized, {
+                "enabled": True,
+                "applied": False,
+                "reason": "generic_pose_optimizer_preserves_scored_scale",
+            }
         scales = []
         for record in stabilized:
             pose = record.get("pose") if isinstance(record.get("pose"), dict) else {}
@@ -6834,18 +7101,15 @@ class ProjectExecutor:
 
         proxy_mesh = None
         proxy_mode = mode
-        label_key = str(label or "").strip().lower()
-        box_like = any(token in label_key for token in ("box", "block", "cube", "brick", "cuboid"))
         if mode == "auto":
-            proxy_mode = "cuboid" if box_like else ("simplify" if len(source_mesh.faces) > target_faces else "original")
+            proxy_mode = "simplify" if len(source_mesh.faces) > target_faces else "original"
+        elif mode in {"cuboid", "obb"}:
+            proxy_mode = "simplify"
         if proxy_mode == "original":
             return None
 
         try:
-            if proxy_mode in {"cuboid", "obb"}:
-                proxy_mesh = self._pose_optimizer_cuboid_proxy(source_mesh)
-                proxy_mode = "cuboid"
-            elif proxy_mode in {"simplify", "lightweight", "decimate"}:
+            if proxy_mode in {"simplify", "lightweight", "decimate"}:
                 proxy_mesh = self._pose_optimizer_simplified_proxy(source_mesh, target_faces=target_faces)
                 proxy_mode = "simplify"
             elif proxy_mode in {"convex_hull", "hull"}:
@@ -6896,15 +7160,81 @@ class ProjectExecutor:
             try:
                 simplified = method(int(target_faces))
             except TypeError:
-                simplified = method(face_count=int(target_faces))
+                try:
+                    simplified = method(face_count=int(target_faces))
+                except Exception:
+                    continue
+            except Exception:
+                continue
             if simplified is not None and len(simplified.faces) > 0:
                 return simplified
-        hull = mesh.convex_hull
-        if len(hull.faces) > int(target_faces):
-            stride = max(1, int(math.ceil(len(hull.faces) / float(target_faces))))
-            hull.update_faces(np.arange(len(hull.faces)) % stride == 0)
-            hull.remove_unreferenced_vertices()
-        return hull
+        clustered = ProjectExecutor._pose_optimizer_vertex_cluster_proxy(mesh, target_faces=int(target_faces))
+        if clustered is not None and len(clustered.faces) > 0:
+            return clustered
+        return mesh
+
+    @staticmethod
+    def _pose_optimizer_vertex_cluster_proxy(source_mesh, *, target_faces: int):
+        import trimesh
+
+        vertices = np.asarray(source_mesh.vertices, dtype=np.float64)
+        faces = np.asarray(source_mesh.faces, dtype=np.int64)
+        if len(vertices) == 0 or len(faces) == 0:
+            return None
+        target = max(12, int(target_faces))
+        min_faces = max(12, int(round(target * 0.35)))
+        max_faces = max(target, int(round(target * 2.0)))
+        bounds = np.asarray(source_mesh.bounds, dtype=np.float64)
+        extents = bounds[1] - bounds[0]
+        extents = np.where(extents > 1e-12, extents, 1.0)
+        estimated_resolution = max(2, int(round((target * 0.5) ** (1.0 / 3.0))))
+        resolution_candidates = sorted(
+            {
+                max(2, estimated_resolution + delta)
+                for delta in range(-4, 9)
+            }
+            | {
+                max(2, int(round(estimated_resolution * factor)))
+                for factor in (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+            }
+        )
+        best_mesh = None
+        best_key = None
+        for resolution in resolution_candidates:
+            coords = np.floor((vertices - bounds[0]) / extents * float(resolution)).astype(np.int64)
+            coords = np.clip(coords, 0, resolution - 1)
+            unique_coords, inverse = np.unique(coords, axis=0, return_inverse=True)
+            sums = np.zeros((len(unique_coords), 3), dtype=np.float64)
+            counts = np.bincount(inverse, minlength=len(unique_coords)).astype(np.float64)
+            np.add.at(sums, inverse, vertices)
+            clustered_vertices = sums / np.maximum(counts[:, None], 1.0)
+            clustered_faces = inverse[faces]
+            valid = (
+                (clustered_faces[:, 0] != clustered_faces[:, 1])
+                & (clustered_faces[:, 1] != clustered_faces[:, 2])
+                & (clustered_faces[:, 0] != clustered_faces[:, 2])
+            )
+            clustered_faces = clustered_faces[valid]
+            if len(clustered_faces) == 0:
+                continue
+            canonical = np.sort(clustered_faces, axis=1)
+            _, unique_face_indices = np.unique(canonical, axis=0, return_index=True)
+            clustered_faces = clustered_faces[np.sort(unique_face_indices)]
+            candidate = trimesh.Trimesh(vertices=clustered_vertices, faces=clustered_faces, process=True)
+            if len(candidate.faces) == 0:
+                continue
+            face_count = len(candidate.faces)
+            within_quality_band = min_faces <= face_count <= max_faces
+            if within_quality_band:
+                key = (2, int(face_count >= target), -abs(face_count - target), face_count)
+            elif face_count < min_faces:
+                key = (1, face_count, 0)
+            else:
+                key = (0, -face_count, 0)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_mesh = candidate
+        return best_mesh
 
     @staticmethod
     def _camera_dict_to_transform(camera: dict):
@@ -7063,6 +7393,7 @@ class ProjectExecutor:
     @staticmethod
     def _generic_pose_optimizer_acceptance(report: dict) -> dict:
         metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
+        motion_phase = ProjectExecutor._generic_pose_motion_phase_from_metrics(metrics)
         if metrics.get("acceptance_status") == "rejected":
             reasons = metrics.get("reject_reasons")
             if isinstance(reasons, list) and reasons:
@@ -7101,8 +7432,33 @@ class ProjectExecutor:
         except Exception:
             depth_confidence = 0.0
             depth_score = 0.0
-        if depth_confidence >= 0.70 and depth_score < 0.25:
-            return {"accepted": False, "reason": f"depth_score_below_threshold:{depth_score:.3f}"}
+        if motion_phase != "free_motion":
+            depth_threshold = 0.70 if motion_phase == "contact_calibration" else 0.25
+            if depth_confidence >= 0.70 and depth_score < depth_threshold:
+                reason = "contact_depth_score_below_threshold" if motion_phase == "contact_calibration" else "depth_score_below_threshold"
+                return {"accepted": False, "reason": f"{reason}:{depth_score:.3f}"}
+        try:
+            support_enabled = bool(metrics.get("support_plane_enabled"))
+            support_confidence = float(metrics.get("support_plane_confidence") or 0.0)
+            support_floating = abs(float(metrics.get("support_floating_distance_m") or 0.0))
+            support_penetration = abs(float(metrics.get("support_penetration_distance_m") or 0.0))
+        except Exception:
+            support_enabled = False
+            support_confidence = 0.0
+            support_floating = 0.0
+            support_penetration = 0.0
+        support_separation = max(support_floating, support_penetration)
+        if motion_phase != "free_motion":
+            support_threshold = 0.05 if motion_phase == "contact_calibration" else 0.15
+            if support_enabled and support_confidence >= 0.70 and support_separation > support_threshold:
+                reason = (
+                    "contact_support_separation_above_threshold"
+                    if motion_phase == "contact_calibration"
+                    else "support_separation_above_threshold"
+                )
+                return {"accepted": False, "reason": f"{reason}:{support_separation:.3f}"}
+            if motion_phase == "contact_calibration" and (not support_enabled or support_confidence < 0.70):
+                return {"accepted": False, "reason": "contact_support_plane_low_confidence"}
         pose = report.get("optimized_corrected_pose_world", {})
         if not ProjectExecutor._valid_vec3_like(pose.get("translation_world")):
             return {"accepted": False, "reason": "invalid_translation"}
@@ -7371,6 +7727,323 @@ class ProjectExecutor:
             return int(value) if value is not None else None
         except Exception:
             return None
+
+    @staticmethod
+    def _tabletop_reference_from_geometry(geometry) -> dict | None:
+        manifest = None if geometry is None else geometry.outputs.get("background_assets_manifest")
+        if not manifest:
+            return None
+        path = Path(manifest)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        assets = data.get("assets") if isinstance(data.get("assets"), dict) else {}
+        reference_raw = assets.get("background_geometry_reference")
+        if not reference_raw and isinstance(data.get("background_geometry_reference"), dict):
+            reference_raw = data["background_geometry_reference"].get("path")
+        if not reference_raw:
+            reference_raw = assets.get("tabletop_reference")
+        if not reference_raw and isinstance(data.get("tabletop_reference"), dict):
+            reference_raw = data["tabletop_reference"].get("path")
+        if reference_raw:
+            reference_path = Path(reference_raw)
+            if not reference_path.is_absolute():
+                reference_path = path.parent / reference_path
+            if not reference_path.exists():
+                return None
+            try:
+                reference = json.loads(reference_path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+        else:
+            reference = ProjectExecutor._tabletop_reference_from_clean_depth_manifest(data, geometry)
+            if reference is None:
+                return None
+            reference_path = None
+        try:
+            reference = ProjectExecutor._normalize_background_geometry_reference_payload(reference)
+            normal = np.asarray(reference.get("normal_world"), dtype=np.float64).reshape(3)
+            norm = float(np.linalg.norm(normal))
+            offset = float(reference.get("offset"))
+        except Exception:
+            return None
+        if norm < 1e-8 or not math.isfinite(norm) or not math.isfinite(offset):
+            return None
+        reference = dict(reference)
+        reference["normal_world"] = [float(v) for v in (normal / norm).tolist()]
+        reference["offset"] = float(offset)
+        if reference_path is not None:
+            reference.setdefault("path", str(reference_path))
+        return reference
+
+    @staticmethod
+    def _normalize_background_geometry_reference_payload(reference: dict) -> dict:
+        if not isinstance(reference, dict):
+            return {}
+        normalized = dict(reference)
+        normal_raw = normalized.get("normal_world")
+        offset_raw = normalized.get("offset")
+        surfaces = normalized.get("support_surfaces")
+        selected_surface = None
+        if (normal_raw is None or offset_raw is None) and isinstance(surfaces, list):
+            for surface in surfaces:
+                if not isinstance(surface, dict):
+                    continue
+                if str(surface.get("type") or "plane").strip().lower() not in {"plane", "support_plane"}:
+                    continue
+                if surface.get("normal_world") is None or surface.get("offset") is None:
+                    continue
+                selected_surface = surface
+                normal_raw = surface.get("normal_world")
+                offset_raw = surface.get("offset")
+                break
+        if normal_raw is not None:
+            normalized["normal_world"] = normal_raw
+        if offset_raw is not None:
+            normalized["offset"] = offset_raw
+        if selected_surface is not None:
+            normalized.setdefault("support_surface_id", selected_surface.get("id"))
+            if selected_surface.get("confidence") is not None:
+                normalized.setdefault("support_plane_confidence", selected_surface.get("confidence"))
+            if isinstance(selected_surface.get("quality"), dict):
+                normalized.setdefault("quality", selected_surface.get("quality"))
+        return normalized
+
+    @staticmethod
+    def _generic_pose_context_with_background_geometry_reference(
+        context: dict,
+        reference: dict | None,
+    ) -> dict:
+        if not isinstance(context, dict):
+            context = {}
+        updated = dict(context)
+        if not isinstance(reference, dict):
+            return updated
+        normalized = ProjectExecutor._normalize_background_geometry_reference_payload(reference)
+        if normalized.get("normal_world") is None or normalized.get("offset") is None:
+            return updated
+        try:
+            # Keep the task payload JSON-safe and independent from the manifest object.
+            payload = json.loads(json.dumps(normalized))
+        except Exception:
+            payload = dict(normalized)
+        updated["background_geometry_reference"] = payload
+        return updated
+
+    @staticmethod
+    def _tabletop_reference_from_clean_depth_manifest(manifest: dict, geometry) -> dict | None:
+        assets = manifest.get("assets") if isinstance(manifest.get("assets"), dict) else {}
+        quality = manifest.get("quality") if isinstance(manifest.get("quality"), dict) else {}
+        depth_source = str(quality.get("depth_background_source") or quality.get("source") or "").strip()
+        if depth_source == "wildgs_depth_map_aligned_to_clean_rgb":
+            return None
+        clean_depth_raw = assets.get("clean_depth")
+        camera_path = None if geometry is None else geometry.outputs.get("camera_trajectory")
+        if not clean_depth_raw or not camera_path:
+            return None
+        manifest_path = None if geometry is None else geometry.outputs.get("background_assets_manifest")
+        manifest_dir = Path(manifest_path).parent if manifest_path else None
+        clean_depth_path = Path(clean_depth_raw)
+        if not clean_depth_path.is_absolute() and manifest_dir is not None:
+            clean_depth_path = manifest_dir / clean_depth_path
+        try:
+            depth = np.load(str(clean_depth_path)).astype(np.float64)
+        except Exception:
+            return None
+        if depth.ndim == 3:
+            depth = depth[0]
+        if depth.ndim != 2:
+            return None
+        camera = ProjectExecutor._camera_for_tabletop_reference(camera_path, int(manifest.get("target_frame_id") or 1))
+        if camera is None:
+            return None
+        mask = np.isfinite(depth) & (depth > 1e-6)
+        dynamic_mask_raw = assets.get("dynamic_mask")
+        dynamic_mask_path = Path(dynamic_mask_raw) if dynamic_mask_raw else None
+        if dynamic_mask_path is not None and not dynamic_mask_path.is_absolute() and manifest_dir is not None:
+            dynamic_mask_path = manifest_dir / dynamic_mask_path
+        if dynamic_mask_path is not None and dynamic_mask_path.exists():
+            dyn = cv2.imread(str(dynamic_mask_path), cv2.IMREAD_GRAYSCALE)
+            if dyn is not None:
+                if dyn.shape != depth.shape:
+                    dyn = cv2.resize(dyn, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST)
+                support = cv2.dilate((dyn > 0).astype(np.uint8), np.ones((17, 17), dtype=np.uint8), iterations=1) > 0
+                candidate = mask & support
+                if int(np.count_nonzero(candidate)) >= min(32, max(8, int(depth.size // 128))):
+                    mask = candidate
+        points = ProjectExecutor._depth_world_points_for_tabletop_reference(depth, mask, camera)
+        if points is None or len(points) < 8:
+            return None
+        if len(points) > 30000:
+            indices = np.linspace(0, len(points) - 1, 30000, dtype=np.int64)
+            points = points[indices]
+        plane = ProjectExecutor._fit_tabletop_reference_plane(points)
+        if plane is None:
+            return None
+        normal, offset, distances = plane
+        return {
+            "schema": "guanwu.tabletop_reference.v1",
+            "source": "clean_depth_background_fallback",
+            "target_frame_id": int(manifest.get("target_frame_id") or 1),
+            "normal_world": [float(v) for v in normal.tolist()],
+            "offset": float(offset),
+            "quality": {
+                "point_count": int(len(points)),
+                "rmse_m": float(np.sqrt(np.mean(distances * distances))),
+                "median_abs_m": float(np.median(np.abs(distances))),
+            },
+        }
+
+    @staticmethod
+    def _camera_for_tabletop_reference(camera_trajectory_path: str | Path, frame_id: int) -> dict | None:
+        path = Path(camera_trajectory_path)
+        if not path.exists():
+            return None
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(records, list) or not records:
+            return None
+        target = min(records, key=lambda item: abs(int(item.get("frame_id", 0) or 0) - int(frame_id)))
+        k = target.get("K") or [[512.0, 0.0, 320.0], [0.0, 512.0, 180.0], [0.0, 0.0, 1.0]]
+        try:
+            return {
+                "fx": float(k[0][0]),
+                "fy": float(k[1][1]),
+                "cx": float(k[0][2]),
+                "cy": float(k[1][2]),
+                "R": target.get("R", np.eye(3).tolist()),
+                "t": target.get("t", [0.0, 0.0, 0.0]),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _depth_world_points_for_tabletop_reference(depth: np.ndarray, mask: np.ndarray, camera: dict) -> np.ndarray | None:
+        ys, xs = np.nonzero(np.asarray(mask, dtype=bool))
+        if len(xs) == 0:
+            return None
+        d = np.asarray(depth[ys, xs], dtype=np.float64)
+        fx = float(camera.get("fx", max(depth.shape) * 0.8))
+        fy = float(camera.get("fy", max(depth.shape) * 0.8))
+        cx = float(camera.get("cx", depth.shape[1] * 0.5))
+        cy = float(camera.get("cy", depth.shape[0] * 0.5))
+        rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
+        translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+        points_cam = np.stack(
+            [
+                (xs.astype(np.float64) - cx) * d / fx,
+                (ys.astype(np.float64) - cy) * d / fy,
+                d,
+            ],
+            axis=1,
+        )
+        points_world = points_cam @ rotation.T + translation.reshape(1, 3)
+        valid = np.isfinite(points_world).all(axis=1)
+        points_world = points_world[valid]
+        return points_world if len(points_world) else None
+
+    @staticmethod
+    def _fit_tabletop_reference_plane(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray] | None:
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 8:
+            return None
+        centroid = np.median(pts, axis=0)
+        centered = pts - centroid.reshape(1, 3)
+        try:
+            _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        except Exception:
+            return None
+        normal = np.asarray(vh[-1], dtype=np.float64)
+        norm = float(np.linalg.norm(normal))
+        if norm < 1e-8 or not math.isfinite(norm):
+            return None
+        normal = normal / norm
+        preferred_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        if float(normal @ preferred_up) < 0.0:
+            normal = -normal
+        offset = -float(normal @ centroid)
+        distances = pts @ normal + offset
+        finite = np.isfinite(distances)
+        if int(np.count_nonzero(finite)) < 8:
+            return None
+        return normal, offset, distances[finite]
+
+    @staticmethod
+    def _annotate_tabletop_contact_offsets(
+        track: dict,
+        *,
+        vertices: np.ndarray,
+        tabletop_reference: dict | None,
+    ) -> None:
+        if not isinstance(track, dict) or not isinstance(tabletop_reference, dict):
+            return
+        frames = track.get("frames")
+        if not isinstance(frames, list):
+            return
+        try:
+            normal = np.asarray(tabletop_reference.get("normal_world"), dtype=np.float64).reshape(3)
+            norm = float(np.linalg.norm(normal))
+        except Exception:
+            return
+        if norm < 1e-8 or not math.isfinite(norm):
+            return
+        normal = normal / norm
+        local_vertices = np.asarray(vertices, dtype=np.float64)
+        if local_vertices.ndim != 2 or local_vertices.shape[1] != 3 or len(local_vertices) == 0:
+            return
+        offsets: list[float] = []
+        for frame in frames:
+            if not isinstance(frame, dict) or not ProjectExecutor._frame_is_tabletop_contact(frame):
+                continue
+            try:
+                rotation = np.asarray(frame.get("rotation_matrix"), dtype=np.float64).reshape(3, 3)
+                scale = np.asarray(frame.get("scale"), dtype=np.float64).reshape(3)
+            except Exception:
+                continue
+            if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
+                continue
+            scaled = local_vertices * scale.reshape(1, 3)
+            projected = (rotation @ scaled.T).T @ normal
+            if projected.size == 0 or not np.isfinite(projected).any():
+                continue
+            bottom_offset = float(np.nanmin(projected))
+            if not math.isfinite(bottom_offset):
+                continue
+            data = frame.setdefault("tabletop_contact", {})
+            data["bottom_offset_m"] = bottom_offset
+            data["source"] = "mesh_bottom_projection"
+            offsets.append(bottom_offset)
+        if offsets:
+            track["tabletop_contact"] = {
+                "bottom_offset_m": float(np.median(np.asarray(offsets, dtype=np.float64))),
+                "source": "mesh_bottom_projection_median",
+                "frame_count": int(len(offsets)),
+            }
+
+    @staticmethod
+    def _frame_is_tabletop_contact(frame: dict) -> bool:
+        metric_candidates: list[dict] = []
+        quality = frame.get("quality")
+        if isinstance(quality, dict) and isinstance(quality.get("metrics"), dict):
+            metric_candidates.append(quality["metrics"])
+        if isinstance(frame.get("metrics"), dict):
+            metric_candidates.append(frame["metrics"])
+        pose_optimizer = frame.get("pose_optimizer")
+        if isinstance(pose_optimizer, dict) and isinstance(pose_optimizer.get("metrics"), dict):
+            metric_candidates.append(pose_optimizer["metrics"])
+        for metrics in metric_candidates:
+            phase = str(metrics.get("generic_pose_motion_phase") or metrics.get("pose_motion_phase") or "").strip().lower()
+            phase = phase.replace("-", "_")
+            if phase in {"contact", "contact_calibration", "table", "tabletop", "support", "supported"}:
+                return True
+            if metrics.get("support_plane_enabled") is True:
+                return True
+        return False
 
     @staticmethod
     def _find_glb(entry: dict) -> "Path | None":

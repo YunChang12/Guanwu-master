@@ -16,6 +16,7 @@ def smooth_object_trajectories(
     translation_spike_ratio: float = 4.0,
     min_translation_spike_m: float = 0.30,
     rotation_spike_deg: float = 45.0,
+    tabletop_reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Smooth per-object vehicle trajectories without crossing track gaps.
 
@@ -78,6 +79,7 @@ def smooth_object_trajectories(
                 max_low_quality_adjust_m=max_low_quality_adjust_m,
                 rotation_spike_deg=rotation_spike_deg,
             )
+        _snap_contact_frames_to_tabletop(frames, value, tabletop_reference, obj_report)
 
         report["objects"][obj_id] = obj_report
 
@@ -108,6 +110,7 @@ def _empty_object_report() -> dict[str, Any]:
         "max_rotation_adjust_deg": 0.0,
         "mean_translation_adjust_m": 0.0,
         "adjusted_frame_ids": [],
+        "tabletop_contact_snapped_frames": 0,
     }
 
 
@@ -232,6 +235,99 @@ def _translation_outlier_mask(
         )
         mask[idx] = bool(is_spike and _frame_quality_weight(frames[idx]) < 0.65)
     return mask
+
+
+def _snap_contact_frames_to_tabletop(
+    frames: list[dict[str, Any]],
+    track_value: Any,
+    tabletop_reference: dict[str, Any] | None,
+    report: dict[str, Any],
+) -> None:
+    plane = _normalize_tabletop_reference(tabletop_reference)
+    if plane is None:
+        return
+    contact = _track_tabletop_contact(track_value)
+    track_bottom_offset = _safe_float(contact.get("bottom_offset_m"))
+    if track_bottom_offset is None:
+        has_frame_offsets = any(_frame_tabletop_bottom_offset(frame) is not None for frame in frames)
+        if not has_frame_offsets:
+            return
+    normal = plane["normal"]
+    offset = float(plane["offset"])
+    for frame in frames:
+        if not _is_contact_frame(frame):
+            continue
+        bottom_offset_f = _frame_tabletop_bottom_offset(frame)
+        if bottom_offset_f is None:
+            bottom_offset_f = track_bottom_offset
+        if bottom_offset_f is None:
+            continue
+        center = _valid_vec3(frame.get("centroid_world"))
+        if center is None:
+            continue
+        signed_bottom = float(center @ normal + offset + bottom_offset_f)
+        if not math.isfinite(signed_bottom):
+            continue
+        if abs(signed_bottom) <= 1e-9:
+            continue
+        updated = center - normal * signed_bottom
+        frame["centroid_world"] = [float(v) for v in updated.tolist()]
+        _sync_transform_translation(frame, updated)
+        data = frame.setdefault("tabletop_contact", {})
+        data["snapped"] = True
+        data["snap_delta_m"] = abs(float(signed_bottom))
+        data["bottom_signed_before_m"] = float(signed_bottom)
+        data["bottom_signed_after_m"] = 0.0
+        _mark_frame_smoothing(frame, translation_adjust_m=abs(float(signed_bottom)))
+        _update_adjustment_report(report, frame, translation_adjust_m=abs(float(signed_bottom)))
+        report["tabletop_contact_snapped_frames"] = int(report.get("tabletop_contact_snapped_frames", 0)) + 1
+
+
+def _normalize_tabletop_reference(tabletop_reference: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(tabletop_reference, dict):
+        return None
+    raw_normal = tabletop_reference.get("normal_world") or tabletop_reference.get("normal")
+    try:
+        normal = np.asarray(raw_normal, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(normal))
+        offset = float(tabletop_reference.get("offset", 0.0))
+    except Exception:
+        return None
+    if norm < 1e-8 or not math.isfinite(norm) or not math.isfinite(offset):
+        return None
+    return {"normal": normal / norm, "offset": offset}
+
+
+def _track_tabletop_contact(track_value: Any) -> dict[str, Any]:
+    if isinstance(track_value, dict) and isinstance(track_value.get("tabletop_contact"), dict):
+        return track_value["tabletop_contact"]
+    return {}
+
+
+def _frame_tabletop_bottom_offset(frame: dict[str, Any]) -> float | None:
+    contact = frame.get("tabletop_contact")
+    if not isinstance(contact, dict):
+        return None
+    return _safe_float(contact.get("bottom_offset_m"))
+
+
+def _is_contact_frame(frame: dict[str, Any]) -> bool:
+    metrics = _frame_metrics(frame)
+    phase = str(metrics.get("generic_pose_motion_phase") or metrics.get("pose_motion_phase") or "").strip().lower()
+    if phase in {"contact", "contact_calibration", "table", "tabletop", "support", "supported"}:
+        return True
+    return bool(metrics.get("support_plane_enabled"))
+
+
+def _sync_transform_translation(frame: dict[str, Any], center: np.ndarray) -> None:
+    transform = frame.get("T_world_from_object")
+    if isinstance(transform, list):
+        try:
+            mat = np.asarray(transform, dtype=np.float64).reshape(4, 4)
+            mat[:3, 3] = np.asarray(center, dtype=np.float64).reshape(3)
+            frame["T_world_from_object"] = [[float(v) for v in row] for row in mat.tolist()]
+        except Exception:
+            pass
 
 
 def _smooth_rotation_segment(

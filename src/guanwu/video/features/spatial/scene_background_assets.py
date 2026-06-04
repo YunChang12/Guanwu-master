@@ -446,6 +446,36 @@ def generate_target_frame_background_assets(
         Image.fromarray(np.clip(confidence * 255.0, 0, 255).astype(np.uint8)).save(confidence_path)
         Image.fromarray(np.clip(source_count, 0, 255).astype(np.uint8)).save(source_count_path)
         _write_tabletop_background_obj(tabletop_mesh, output_dir, clean_rgb_path, width, height)
+        depth_asset = _try_generate_depth_background_asset_from_estimator(
+            clean_rgb_path=clean_rgb_path,
+            output_dir=output_dir,
+            target_frame_id=target_frame_id,
+            camera_trajectory_path=camera_trajectory_path,
+            depth_maps_dir=depth_maps_dir,
+            calibration_mask=(~target_mask),
+            grid_stride=grid_stride,
+            clean_depth_estimator=clean_depth_estimator,
+        )
+        if not depth_asset:
+            depth_asset = _try_generate_depth_background_asset(
+                clean_rgb_path=clean_rgb_path,
+                output_dir=output_dir,
+                target_frame_id=target_frame_id,
+                depth_maps_dir=depth_maps_dir,
+                camera_trajectory_path=camera_trajectory_path,
+                grid_stride=grid_stride,
+            )
+        tabletop_reference_asset = None
+        if depth_asset and str(depth_asset.get("quality", {}).get("depth_background_source", "")).strip() != "wildgs_depth_map_aligned_to_clean_rgb":
+            support_mask = _dilate(target_mask, 8) if target_mask.any() else target_mask
+            tabletop_reference_asset = _try_write_tabletop_reference_asset(
+                clean_depth_path=depth_asset.get("assets", {}).get("clean_depth"),
+                output_dir=output_dir,
+                target_frame_id=target_frame_id,
+                camera_trajectory_path=camera_trajectory_path,
+                support_mask=support_mask,
+                foreground_mask_path=dynamic_mask_path,
+            )
         manifest_path = output_dir / "background_manifest.json"
         manifest = {
             "schema": "guanwu.target_frame_background_assets.tabletop.v1",
@@ -471,6 +501,29 @@ def generate_target_frame_background_assets(
             },
             "road_plane": None,
         }
+        if depth_asset:
+            manifest["schema"] = "guanwu.target_frame_background_assets.tabletop_depth.v2"
+            manifest["assets"].update(
+                {key: value for key, value in depth_asset.get("assets", {}).items() if value}
+            )
+            manifest["quality"].update(depth_asset.get("quality", {}))
+        if tabletop_reference_asset:
+            manifest["assets"]["tabletop_reference"] = tabletop_reference_asset["path"]
+            if tabletop_reference_asset.get("background_geometry_reference_path"):
+                manifest["assets"]["background_geometry_reference"] = tabletop_reference_asset["background_geometry_reference_path"]
+            manifest["quality"].update(tabletop_reference_asset.get("quality", {}))
+            manifest["tabletop_reference"] = {
+                "path": tabletop_reference_asset["path"],
+                "source": tabletop_reference_asset["source"],
+                "target_frame_id": int(target_frame_id),
+            }
+            if tabletop_reference_asset.get("background_geometry_reference_path"):
+                manifest["background_geometry_reference"] = {
+                    "path": tabletop_reference_asset["background_geometry_reference_path"],
+                    "source": tabletop_reference_asset.get("background_geometry_reference_source", "clean_background_depth"),
+                    "target_frame_id": int(target_frame_id),
+                    "reference_type": "support_surface",
+                }
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"manifest_path": str(manifest_path), "mesh_dir": str(mesh_dir)}
 
@@ -2044,6 +2097,170 @@ def _calibrate_depth_to_metric_reference(
         "depth_calibration_median_abs_error": float(np.median(np.abs(full_residual))),
         "depth_calibration_p95_abs_error": float(np.percentile(np.abs(full_residual), 95)),
     }
+
+
+def _try_write_tabletop_reference_asset(
+    *,
+    clean_depth_path: str | Path | None,
+    output_dir: Path,
+    target_frame_id: int,
+    camera_trajectory_path: str | Path | None,
+    support_mask: np.ndarray | None,
+    foreground_mask_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    if not clean_depth_path or not camera_trajectory_path:
+        return None
+    camera = _camera_for_frame(camera_trajectory_path, target_frame_id)
+    if camera is None:
+        return None
+    try:
+        depth = np.load(str(clean_depth_path)).astype(np.float64)
+    except Exception:
+        return None
+    if depth.ndim == 3:
+        depth = depth[0]
+    if depth.ndim != 2:
+        return None
+    mask = np.isfinite(depth) & (depth > 1e-6)
+    if support_mask is not None:
+        support = np.asarray(support_mask, dtype=bool)
+        if support.shape != depth.shape:
+            support = cv2.resize(support.astype(np.uint8), (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+        candidate = mask & support
+        if int(np.count_nonzero(candidate)) >= min(32, max(8, int(depth.size // 128))):
+            mask = candidate
+    points = _depth_world_points_from_mask(depth=depth, mask=mask, camera=camera)
+    if points is None or len(points) < 8:
+        return None
+    if len(points) > 30000:
+        indices = np.linspace(0, len(points) - 1, 30000, dtype=np.int64)
+        points = points[indices]
+    plane = _fit_tabletop_plane(points)
+    if plane is None:
+        return None
+    normal, offset, distances = plane
+    reference_path = output_dir / "tabletop_reference.json"
+    background_geometry_reference_path = output_dir / "background_geometry_reference.json"
+    payload = {
+        "schema": "guanwu.tabletop_reference.v1",
+        "source": "clean_depth_background",
+        "target_frame_id": int(target_frame_id),
+        "normal_world": [float(v) for v in normal.tolist()],
+        "offset": float(offset),
+        "quality": {
+            "point_count": int(len(points)),
+            "rmse_m": float(np.sqrt(np.mean(distances * distances))),
+            "median_abs_m": float(np.median(np.abs(distances))),
+            "max_abs_m": float(np.max(np.abs(distances))),
+        },
+    }
+    reference_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    support_surface = {
+        "id": "support_surface_000001",
+        "type": "plane",
+        "source": "clean_background_depth",
+        "normal_world": [float(v) for v in normal.tolist()],
+        "offset": float(offset),
+        "confidence": float(
+            np.clip(
+                1.0 - payload["quality"]["median_abs_m"] / max(1e-6, payload["quality"]["rmse_m"] + 0.05),
+                0.0,
+                1.0,
+            )
+        ),
+        "quality": dict(payload["quality"]),
+    }
+    geometry_payload = {
+        "schema": "guanwu.background_geometry_reference.v1",
+        "reference_type": "support_surface",
+        "source": "clean_background_depth",
+        "target_frame_id": int(target_frame_id),
+        "normal_world": [float(v) for v in normal.tolist()],
+        "offset": float(offset),
+        "support_surfaces": [support_surface],
+        "depth": {
+            "clean_depth_path": str(clean_depth_path),
+            "coordinate_frame": "world",
+        },
+        "exclusion": {
+            "foreground_mask_path": str(foreground_mask_path) if foreground_mask_path else None,
+            "support_mask_source": "foreground_dilated_region" if support_mask is not None else "all_valid_depth",
+        },
+        "quality": dict(payload["quality"]),
+    }
+    background_geometry_reference_path.write_text(
+        json.dumps(geometry_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "path": str(reference_path),
+        "source": "clean_depth_background",
+        "background_geometry_reference_path": str(background_geometry_reference_path),
+        "background_geometry_reference_source": "clean_background_depth",
+        "quality": {
+            "tabletop_reference_source": "clean_depth_background",
+            "tabletop_reference_point_count": int(len(points)),
+            "tabletop_reference_rmse_m": payload["quality"]["rmse_m"],
+            "background_geometry_reference_source": "clean_background_depth",
+            "background_geometry_reference_type": "support_surface",
+        },
+    }
+
+
+def _depth_world_points_from_mask(
+    *,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    camera: dict[str, Any],
+) -> np.ndarray | None:
+    ys, xs = np.nonzero(mask.astype(bool))
+    if len(xs) == 0:
+        return None
+    d = depth[ys, xs].astype(np.float64)
+    fx = float(camera.get("fx", max(depth.shape) * 0.8))
+    fy = float(camera.get("fy", max(depth.shape) * 0.8))
+    cx = float(camera.get("cx", depth.shape[1] * 0.5))
+    cy = float(camera.get("cy", depth.shape[0] * 0.5))
+    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
+    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+    points_cam = np.stack(
+        [
+            (xs.astype(np.float64) - cx) * d / fx,
+            (ys.astype(np.float64) - cy) * d / fy,
+            d,
+        ],
+        axis=1,
+    )
+    points_world = points_cam @ rotation.T + translation.reshape(1, 3)
+    valid = np.isfinite(points_world).all(axis=1)
+    points_world = points_world[valid]
+    return points_world if len(points_world) else None
+
+
+def _fit_tabletop_plane(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray] | None:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 8:
+        return None
+    centroid = np.median(pts, axis=0)
+    centered = pts - centroid.reshape(1, 3)
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+    except Exception:
+        return None
+    normal = np.asarray(vh[-1], dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-8 or not math.isfinite(norm):
+        return None
+    normal = normal / norm
+    preferred_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    if float(normal @ preferred_up) < 0.0:
+        normal = -normal
+    offset = -float(normal @ centroid)
+    distances = pts @ normal + offset
+    finite = np.isfinite(distances)
+    if int(np.count_nonzero(finite)) < 8:
+        return None
+    return normal, offset, distances[finite]
 
 
 def _resolve_depth_for_frame(depth_maps_dir: str | Path, target_frame_id: int) -> Path | None:

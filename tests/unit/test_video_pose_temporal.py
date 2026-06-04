@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -154,6 +155,348 @@ def test_pose_track_scale_prior_excludes_low_observability_severe_truncation() -
     assert prior["sample_count"] == 2
     assert np.allclose(prior["scale"], [1.05, 1.05, 1.05])
     assert prior["frame_ids"] == [1, 2]
+
+
+def test_generic_contact_scale_prior_uses_only_supported_depth_frames() -> None:
+    bad_contact = _pose_record(frame_id=1, scale=1.8, mask_iou=0.91, bbox_iou=0.92)
+    bad_contact["metrics"].update(
+        {
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.96,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.14,
+            "depth_confidence": 1.0,
+            "depth_score": 0.82,
+        }
+    )
+    good_a = _pose_record(frame_id=2, scale=1.00, mask_iou=0.83, bbox_iou=0.86)
+    good_a["metrics"].update(
+        {
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.93,
+            "support_floating_distance_m": 0.01,
+            "support_penetration_distance_m": 0.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.91,
+        }
+    )
+    good_b = _pose_record(frame_id=3, scale=1.04, mask_iou=0.84, bbox_iou=0.87)
+    good_b["metrics"].update(
+        {
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.94,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.02,
+            "depth_confidence": 1.0,
+            "depth_score": 0.89,
+        }
+    )
+
+    prior = ProjectExecutor._generic_contact_scale_prior([bad_contact, good_a, good_b])
+
+    assert prior is not None
+    assert prior["source"] == "contact_supported_scale"
+    assert prior["sample_count"] == 2
+    assert prior["frame_ids"] == [2, 3]
+    assert np.allclose(prior["scale"], [1.02, 1.02, 1.02])
+
+
+def test_generic_phase_keeps_contact_lock_after_scale_prior_until_lift_evidence() -> None:
+    contact_records = []
+    for frame_id in (1, 2):
+        record = _pose_record(frame_id=frame_id, scale=1.0, mask_iou=0.92, bbox_iou=0.92)
+        record["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.94,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "depth_confidence": 1.0,
+                "depth_score": 0.91,
+            }
+        )
+        contact_records.append(record)
+    scale_prior = ProjectExecutor._generic_contact_scale_prior(contact_records)
+
+    phase = ProjectExecutor._generic_pose_phase_for_frame(
+        frame_id=3,
+        track_scale_prior=scale_prior,
+        previous_records=contact_records,
+        inst={"bbox": [374.0, 130.0, 409.0, 169.0]},
+    )
+
+    assert scale_prior is not None
+    assert phase == "contact_calibration"
+
+
+def test_generic_phase_switches_to_free_motion_when_bbox_area_shrinks_after_contact() -> None:
+    contact_records = []
+    for frame_id in range(1, 11):
+        record = _pose_record(frame_id=frame_id, scale=1.0, mask_iou=0.90, bbox_iou=0.90)
+        record["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "depth_confidence": 1.0,
+                "depth_score": 0.92,
+                "detection_bbox": [370.0, 130.0, 410.0, 170.0],
+            }
+        )
+        contact_records.append(record)
+    scale_prior = ProjectExecutor._generic_contact_scale_prior(contact_records)
+
+    phase = ProjectExecutor._generic_pose_phase_for_frame(
+        frame_id=21,
+        track_scale_prior=scale_prior,
+        previous_records=contact_records,
+        inst={"bbox": [386.0, 134.0, 410.0, 169.0]},
+    )
+
+    assert scale_prior is not None
+    assert phase == "free_motion"
+
+
+def test_generic_pose_record_preserves_support_contact_metrics(tmp_path: Path) -> None:
+    report_path = tmp_path / "optimization_report.json"
+    task_path = tmp_path / "task.json"
+    result_dir = tmp_path / "result"
+    report_path.write_text("{}", encoding="utf-8")
+    task_path.write_text("{}", encoding="utf-8")
+    result_dir.mkdir()
+    executor = object.__new__(ProjectExecutor)
+
+    record = executor._edge_pose_record_from_report(
+        obj_id="obj_000009",
+        frame_id=1,
+        report={
+            "json_bbox": [370.0, 130.0, 410.0, 170.0],
+            "optimized_corrected_pose_world": {
+                "translation_world": [0.0, 0.0, 1.0],
+                "rotation_matrix": np.eye(3).tolist(),
+                "scale": [1.0, 1.0, 1.0],
+            },
+            "metrics": {
+                "score": 2.0,
+                "mask_iou": 0.8,
+                "bbox_iou": 0.9,
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.93,
+                "support_floating_distance_m": 0.01,
+                "support_penetration_distance_m": 0.02,
+                "support_bottom_signed_m": -0.02,
+                "support_contact_max_abs_m": 0.02,
+            },
+        },
+        report_path=report_path,
+        result_dir=result_dir,
+        task_path=task_path,
+        timestamp_sec=0.0,
+        run_info={"returncode": 0},
+    )
+
+    assert record["metrics"]["support_plane_enabled"] is True
+    assert record["metrics"]["support_floating_distance_m"] == 0.01
+    assert record["metrics"]["support_penetration_distance_m"] == 0.02
+    assert record["metrics"]["support_bottom_signed_m"] == -0.02
+    assert record["metrics"]["detection_bbox"] == [370.0, 130.0, 410.0, 170.0]
+
+
+def test_scene_compose_loads_tabletop_reference_from_background_manifest(tmp_path: Path) -> None:
+    reference_path = tmp_path / "tabletop_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.tabletop_reference.v1",
+                "source": "clean_depth_background",
+                "normal_world": [0.0, -1.0, 0.0],
+                "offset": 0.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"assets": {"tabletop_reference": str(reference_path)}}),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(outputs={"background_assets_manifest": str(manifest_path)})
+
+    reference = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+
+    assert reference is not None
+    assert reference["source"] == "clean_depth_background"
+    assert np.allclose(reference["normal_world"], [0.0, -1.0, 0.0])
+    assert reference["offset"] == 0.25
+
+
+def test_scene_compose_prefers_background_geometry_reference_from_manifest(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "tabletop_reference.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.tabletop_reference.v1",
+                "source": "legacy_tabletop_reference",
+                "normal_world": [0.0, -1.0, 0.0],
+                "offset": 0.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry_path = tmp_path / "background_geometry_reference.json"
+    geometry_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "reference_type": "support_surface",
+                "source": "clean_background_depth",
+                "target_frame_id": 1,
+                "support_surfaces": [
+                    {
+                        "id": "support_surface_000001",
+                        "type": "plane",
+                        "normal_world": [0.0, -2.0, 0.0],
+                        "offset": 0.5,
+                        "confidence": 0.92,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "assets": {
+                    "background_geometry_reference": str(geometry_path),
+                    "tabletop_reference": str(legacy_path),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(outputs={"background_assets_manifest": str(manifest_path)})
+
+    reference = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+
+    assert reference is not None
+    assert reference["schema"] == "guanwu.background_geometry_reference.v1"
+    assert reference["source"] == "clean_background_depth"
+    assert reference["normal_world"] == [0.0, -1.0, 0.0]
+    assert reference["offset"] == 0.5
+    assert reference["support_plane_confidence"] == 0.92
+
+
+def test_scene_compose_annotates_tabletop_contact_offsets_per_frame_rotation() -> None:
+    vertices = np.asarray(
+        [
+            [0.0, -1.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.2, -1.0, 0.0],
+            [0.2, 2.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    flip_y = [
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ]
+    track = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "centroid_world": [0.0, 0.0, 0.0],
+                "rotation_matrix": np.eye(3).tolist(),
+                "scale": [1.0, 1.0, 1.0],
+                "quality": {"metrics": {"generic_pose_motion_phase": "contact_calibration"}},
+            },
+            {
+                "frame_id": 2,
+                "centroid_world": [0.0, 0.0, 0.0],
+                "rotation_matrix": flip_y,
+                "scale": [1.0, 1.0, 1.0],
+                "quality": {"metrics": {"generic_pose_motion_phase": "contact_calibration"}},
+            },
+        ]
+    }
+
+    ProjectExecutor._annotate_tabletop_contact_offsets(
+        track,
+        vertices=vertices,
+        tabletop_reference={"normal_world": [0.0, 1.0, 0.0], "offset": 0.0},
+    )
+
+    assert np.isclose(track["frames"][0]["tabletop_contact"]["bottom_offset_m"], -1.0)
+    assert np.isclose(track["frames"][1]["tabletop_contact"]["bottom_offset_m"], -2.0)
+
+
+def test_stabilize_generic_records_preserves_scored_scales() -> None:
+    records = [
+        _pose_record(frame_id=1, scale=1.8, mask_iou=0.91, bbox_iou=0.92),
+        _pose_record(frame_id=2, scale=1.0, mask_iou=0.83, bbox_iou=0.86),
+    ]
+    for record in records:
+        record["metrics"].update(
+            {
+                "appearance_score": 0.7,
+                "depth_score": 0.8,
+                "projection_valid_ratio": 1.0,
+                "observation_score": 1.2,
+            }
+        )
+
+    stabilized, summary = ProjectExecutor._stabilize_edge_pose_records(records)
+
+    assert summary["applied"] is False
+    assert summary["reason"] == "generic_pose_optimizer_preserves_scored_scale"
+    assert stabilized[0]["pose"]["scale"] == [1.8, 1.8, 1.8]
+    assert stabilized[1]["pose"]["scale"] == [1.0, 1.0, 1.0]
+
+
+def test_generic_executor_acceptance_uses_motion_phase_depth_support_rules() -> None:
+    base_report = {
+        "json_bbox": [10.0, 10.0, 110.0, 110.0],
+        "optimized_corrected_pose_world": {
+            "translation_world": [0.0, 0.0, 1.0],
+            "rotation_matrix": np.eye(3).tolist(),
+            "scale": [1.0, 1.0, 1.0],
+        },
+        "metrics": {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.91,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.0,
+        },
+    }
+    free_motion = dict(base_report)
+    free_motion["metrics"] = {
+        **base_report["metrics"],
+        "generic_pose_motion_phase": "free_motion",
+        "depth_score": 0.0,
+        "support_penetration_distance_m": 0.12,
+    }
+    contact = dict(base_report)
+    contact["metrics"] = {
+        **base_report["metrics"],
+        "generic_pose_motion_phase": "contact_calibration",
+        "depth_score": 0.82,
+        "support_penetration_distance_m": 0.08,
+    }
+
+    assert ProjectExecutor._generic_pose_optimizer_acceptance(free_motion)["accepted"] is True
+    contact_decision = ProjectExecutor._generic_pose_optimizer_acceptance(contact)
+    assert contact_decision["accepted"] is False
+    assert "contact_support_separation_above_threshold" in contact_decision["reason"]
 
 
 def test_pose_temporal_anchor_excludes_low_observability_severe_truncation() -> None:
@@ -2419,6 +2762,33 @@ def test_vehicle_pose_context_uses_background_manifest_fallback_road_plane(tmp_p
     assert context["bbox_bottom_ground"]["point_world"] == [0.0, 20.0, 10.0]
 
 
+def test_generic_pose_context_includes_background_geometry_reference() -> None:
+    reference = {
+        "schema": "guanwu.background_geometry_reference.v1",
+        "reference_type": "support_surface",
+        "source": "clean_background_depth",
+        "target_frame_id": 1,
+        "normal_world": [0.0, -1.0, 0.0],
+        "offset": 0.125,
+        "support_plane_confidence": 0.91,
+    }
+    context = {
+        "schema": "generic_pose_context.v1",
+        "object_id": "obj_000009",
+        "frame_id": 1,
+        "support_plane": "auto",
+        "generic_pose_motion_phase": "contact_calibration",
+    }
+
+    updated = ProjectExecutor._generic_pose_context_with_background_geometry_reference(context, reference)
+
+    assert updated is not context
+    assert updated["background_geometry_reference"]["schema"] == "guanwu.background_geometry_reference.v1"
+    assert updated["background_geometry_reference"]["source"] == "clean_background_depth"
+    assert updated["background_geometry_reference"]["normal_world"] == [0.0, -1.0, 0.0]
+    assert updated["background_geometry_reference"]["offset"] == 0.125
+
+
 def test_refine_candidate_selection_always_keeps_task_json_corrected_pose() -> None:
     args = type("Args", (), {"pareto_refine_selection_enabled": True})()
     candidates = [
@@ -2841,6 +3211,168 @@ def test_pose_tracks_build_refined_object_trajectories() -> None:
     assert refined["obj_000001"][0]["scale"] == [1.2, 1.2, 1.2]
     assert refined["obj_000001"][0]["trajectory_source"] == "pose_optimize"
     assert refined["obj_000001"][0]["pose_source"] == "edge_contour_fast_temporal"
+
+
+def test_scene_compose_loads_tabletop_reference_from_geometry_manifest(tmp_path: Path) -> None:
+    reference_path = tmp_path / "tabletop_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.tabletop_reference.v1",
+                "source": "clean_depth_background",
+                "normal_world": [0.0, -1.0, 0.0],
+                "offset": 0.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"assets": {"tabletop_reference": str(reference_path)}}),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(outputs={"background_assets_manifest": str(manifest_path)})
+
+    reference = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+
+    assert reference is not None
+    assert reference["source"] == "clean_depth_background"
+    assert reference["normal_world"] == [0.0, -1.0, 0.0]
+    assert reference["offset"] == 0.25
+
+
+def test_scene_compose_fits_tabletop_reference_from_legacy_clean_depth_manifest(tmp_path: Path) -> None:
+    height, width = 18, 24
+    yy, xx = np.mgrid[0:height, 0:width]
+    depth_path = tmp_path / "clean_depth.npy"
+    np.save(depth_path, (4.0 + 0.01 * xx + 0.02 * yy).astype(np.float32))
+    dynamic_mask = np.zeros((height, width), dtype=np.uint8)
+    dynamic_mask[7:12, 9:15] = 255
+    dynamic_mask_path = tmp_path / "dynamic_mask.png"
+    import cv2
+
+    cv2.imwrite(str(dynamic_mask_path), dynamic_mask)
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"assets": {"clean_depth": str(depth_path), "dynamic_mask": str(dynamic_mask_path)}}),
+        encoding="utf-8",
+    )
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[24.0, 0.0, 12.0], [0.0, 24.0, 9.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(
+        outputs={
+            "background_assets_manifest": str(manifest_path),
+            "camera_trajectory": str(camera_trajectory),
+        }
+    )
+
+    reference = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+
+    assert reference is not None
+    assert reference["source"] == "clean_depth_background_fallback"
+    assert np.isclose(np.linalg.norm(reference["normal_world"]), 1.0)
+    assert np.isfinite(float(reference["offset"]))
+
+
+def test_scene_compose_does_not_fit_tabletop_reference_from_raw_wildgs_depth(tmp_path: Path) -> None:
+    depth_path = tmp_path / "clean_depth.npy"
+    np.save(depth_path, np.full((18, 24), 4.0, dtype=np.float32))
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "assets": {"clean_depth": str(depth_path)},
+                "quality": {"depth_background_source": "wildgs_depth_map_aligned_to_clean_rgb"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[24.0, 0.0, 12.0], [0.0, 24.0, 9.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(
+        outputs={
+            "background_assets_manifest": str(manifest_path),
+            "camera_trajectory": str(camera_trajectory),
+        }
+    )
+
+    assert ProjectExecutor._tabletop_reference_from_geometry(geometry) is None
+
+
+def test_scene_compose_computes_per_frame_tabletop_contact_offset_from_mesh_orientation() -> None:
+    vertices = np.asarray(
+        [
+            [x, y, z]
+            for x in (-0.10, 0.10)
+            for y in (-0.02, 0.02)
+            for z in (-0.03, 0.03)
+        ],
+        dtype=np.float64,
+    )
+    rotation_z_90 = [
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    track = {
+        "frames": [
+            {
+                "frame_id": 1,
+                "centroid_world": [0.0, -0.12, 0.0],
+                "rotation_matrix": np.eye(3).tolist(),
+                "scale": [1.0, 1.0, 1.0],
+                "quality": {"metrics": {"generic_pose_motion_phase": "contact_calibration"}},
+            },
+            {
+                "frame_id": 2,
+                "centroid_world": [0.0, -0.12, 0.0],
+                "rotation_matrix": rotation_z_90,
+                "scale": [1.0, 1.0, 1.0],
+                "quality": {"metrics": {"generic_pose_motion_phase": "contact_calibration"}},
+            },
+            {
+                "frame_id": 3,
+                "centroid_world": [0.0, -0.12, 0.0],
+                "rotation_matrix": rotation_z_90,
+                "scale": [1.0, 1.0, 1.0],
+                "quality": {"metrics": {"generic_pose_motion_phase": "free_motion"}},
+            },
+        ]
+    }
+
+    ProjectExecutor._annotate_tabletop_contact_offsets(
+        track,
+        vertices=vertices,
+        tabletop_reference={"normal_world": [0.0, -1.0, 0.0], "offset": 0.0},
+    )
+
+    assert np.isclose(track["frames"][0]["tabletop_contact"]["bottom_offset_m"], -0.02)
+    assert np.isclose(track["frames"][1]["tabletop_contact"]["bottom_offset_m"], -0.10)
+    assert "tabletop_contact" not in track["frames"][2]
 
 
 def test_vehicle_mesh_axis_prior_uses_local_positive_y_as_roof_up() -> None:

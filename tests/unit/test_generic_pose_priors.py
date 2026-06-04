@@ -359,6 +359,286 @@ def test_make_support_aligned_seed_evaluates_corrected_candidate() -> None:
     assert seed["initializer_metadata"]["base_source"] == "temporal_prior"
 
 
+def test_make_support_aligned_seed_snaps_translation_to_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        make_support_aligned_seed,
+        support_bottom_points_for_pose,
+    )
+
+    plane = {
+        "normal": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "offset": 0.0,
+        "support_plane_confidence": 0.9,
+    }
+
+    class DummyEvaluator:
+        support_plane = plane
+        vertices = np.array(
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float64,
+        )
+
+        def evaluate_absolute(self, translation, rotation, scale):
+            from process.pose_optimizer.strategies.generic_appearance_temporal import support_orientation_score
+
+            bottom = support_bottom_points_for_pose(
+                self.vertices,
+                np.asarray(rotation, dtype=np.float64),
+                np.asarray(translation, dtype=np.float64),
+                np.asarray(scale, dtype=np.float64),
+                plane,
+            )
+            result = {
+                "score": 0.9,
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "projected_bbox": [0.0, 0.0, 10.0, 10.0],
+                "support_bottom_signed_m": bottom["support_bottom_signed_m"],
+            }
+            result.update(support_orientation_score(rotation, plane))
+            result["support_plane_confidence"] = plane["support_plane_confidence"]
+            return result
+
+    args = argparse.Namespace(
+        support_aligned_seed_enabled=True,
+        support_plane_min_confidence=0.70,
+        support_alignment_trigger_deg=6.0,
+        support_contact_snap_enabled=True,
+    )
+    theta = np.deg2rad(16.0)
+    tilted_rotation = np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    base = {
+        "score": 1.0,
+        "translation_cam": np.array([0.0, 1.2, 4.0], dtype=np.float64),
+        "rotation_cam": tilted_rotation,
+        "scale": np.ones(3, dtype=np.float64),
+        "support_normal_angle_deg": 16.0,
+        "support_axis_index": 1,
+        "support_axis_sign": 1.0,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    seed = make_support_aligned_seed(base, DummyEvaluator(), args)
+
+    assert seed is not None
+    assert abs(seed["support_bottom_signed_m"]) < 1e-9
+    assert np.allclose(seed["translation_cam"], [0.0, 0.5, 4.0])
+    assert seed["initializer_metadata"]["support_contact_snap_applied"] is True
+
+
+def test_contact_snap_rescue_snaps_visual_candidate_to_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        make_contact_snap_rescue_candidate,
+        support_bottom_points_for_pose,
+    )
+
+    plane = {
+        "normal": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "offset": 0.0,
+        "support_plane_confidence": 0.95,
+    }
+
+    class DummyEvaluator:
+        support_plane = plane
+        vertices = np.array(
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float64,
+        )
+
+        def evaluate_absolute(self, translation, rotation, scale, keep_mask=False):
+            bottom = support_bottom_points_for_pose(
+                self.vertices,
+                np.asarray(rotation, dtype=np.float64),
+                np.asarray(translation, dtype=np.float64),
+                np.asarray(scale, dtype=np.float64),
+                plane,
+            )
+            support_separation = abs(float(bottom["support_bottom_signed_m"]))
+            result = {
+                "score": 2.0 - support_separation,
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "mask_iou": 0.90,
+                "soft_mask_iou": 0.90,
+                "bbox_iou": 0.94,
+                "bbox_center_error_px": 2.0,
+                "projected_bbox": [0.0, 0.0, 10.0, 10.0],
+                "rendered_mask": np.ones((8, 8), dtype=np.uint8) if keep_mask else None,
+                "support_plane_enabled": True,
+                "support_plane_confidence": plane["support_plane_confidence"],
+                "support_bottom_signed_m": bottom["support_bottom_signed_m"],
+                "support_floating_distance_m": max(float(bottom["support_bottom_signed_m"]), 0.0),
+                "support_penetration_distance_m": max(-float(bottom["support_bottom_signed_m"]), 0.0),
+                "depth_confidence": 1.0,
+                "depth_score": 0.8,
+                "acceptance_status": "accepted" if support_separation <= 0.05 else "rejected",
+                "reject_reasons": [] if support_separation <= 0.05 else ["contact_support_separation_above_threshold"],
+            }
+            if not keep_mask:
+                result.pop("rendered_mask", None)
+            return result
+
+    args = argparse.Namespace(
+        generic_pose_motion_phase="contact_calibration",
+        support_contact_snap_enabled=True,
+        generic_contact_snap_rescue_enabled=True,
+        support_acceptance_min_confidence=0.70,
+        generic_contact_support_max_separation_m=0.05,
+    )
+    base = {
+        "score": 1.2,
+        "translation_cam": np.array([0.0, 1.2, 4.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "mask_iou": 0.90,
+        "soft_mask_iou": 0.90,
+        "bbox_iou": 0.94,
+        "bbox_center_error_px": 2.0,
+        "projected_bbox": [0.0, 0.0, 10.0, 10.0],
+        "support_plane_enabled": True,
+        "support_plane_confidence": 0.95,
+        "support_bottom_signed_m": 0.7,
+        "support_floating_distance_m": 0.7,
+        "support_penetration_distance_m": 0.0,
+        "initializer_metadata": {"source": "visual_candidate"},
+    }
+
+    rescued = make_contact_snap_rescue_candidate(base, DummyEvaluator(), args)
+
+    assert rescued is not None
+    assert rescued["acceptance_status"] == "accepted"
+    assert abs(rescued["support_bottom_signed_m"]) < 1e-9
+    assert np.allclose(rescued["translation_cam"], [0.0, 0.5, 4.0])
+    assert rescued["initializer_metadata"]["source"] == "contact_snap_rescue"
+    assert rescued["initializer_metadata"]["base_source"] == "visual_candidate"
+    assert rescued["contact_snap_rescue_applied"] is True
+
+
+def test_contact_snap_rescue_preserves_projection_by_scaling_depth_and_mesh() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        make_contact_snap_rescue_candidate,
+        support_bottom_points_for_pose,
+    )
+
+    plane = {
+        "normal": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "offset": -1.0,
+        "support_plane_confidence": 0.95,
+    }
+
+    class DummyEvaluator:
+        support_plane = plane
+        vertices = np.array(
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float64,
+        )
+
+        def evaluate_absolute(self, translation, rotation, scale, keep_mask=False):
+            bottom = support_bottom_points_for_pose(
+                self.vertices,
+                np.asarray(rotation, dtype=np.float64),
+                np.asarray(translation, dtype=np.float64),
+                np.asarray(scale, dtype=np.float64),
+                plane,
+            )
+            support_separation = abs(float(bottom["support_bottom_signed_m"]))
+            scale_value = float(np.median(np.asarray(scale, dtype=np.float64)))
+            projected_bbox = [10.0, 20.0, 110.0, 120.0]
+            return {
+                "score": 2.0 - support_separation,
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "mask_iou": 0.91,
+                "soft_mask_iou": 0.91,
+                "bbox_iou": 0.95,
+                "bbox_center_error_px": 1.0,
+                "projected_bbox": projected_bbox,
+                "support_plane_enabled": True,
+                "support_plane_confidence": plane["support_plane_confidence"],
+                "support_bottom_signed_m": bottom["support_bottom_signed_m"],
+                "support_floating_distance_m": max(float(bottom["support_bottom_signed_m"]), 0.0),
+                "support_penetration_distance_m": max(-float(bottom["support_bottom_signed_m"]), 0.0),
+                "depth_confidence": 1.0,
+                "depth_score": 0.8,
+                "acceptance_status": "accepted" if support_separation <= 0.05 else "rejected",
+                "reject_reasons": [] if support_separation <= 0.05 else ["contact_support_separation_above_threshold"],
+                "uniform_scale_debug": scale_value,
+            }
+
+    args = argparse.Namespace(
+        generic_pose_motion_phase="contact_calibration",
+        support_contact_snap_enabled=True,
+        generic_contact_snap_rescue_enabled=True,
+        generic_contact_scale_depth_rescue_enabled=True,
+        support_acceptance_min_confidence=0.70,
+        generic_contact_support_max_separation_m=0.05,
+    )
+    base = {
+        "score": 1.2,
+        "translation_cam": np.array([0.0, 2.0, 4.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "mask_iou": 0.91,
+        "soft_mask_iou": 0.91,
+        "bbox_iou": 0.95,
+        "bbox_center_error_px": 1.0,
+        "projected_bbox": [10.0, 20.0, 110.0, 120.0],
+        "support_plane_enabled": True,
+        "support_plane_confidence": 0.95,
+        "support_bottom_signed_m": 0.5,
+        "support_floating_distance_m": 0.5,
+        "support_penetration_distance_m": 0.0,
+        "initializer_metadata": {"source": "visual_candidate"},
+    }
+
+    rescued = make_contact_snap_rescue_candidate(base, DummyEvaluator(), args)
+
+    assert rescued is not None
+    assert rescued["acceptance_status"] == "accepted"
+    assert abs(rescued["support_bottom_signed_m"]) < 1e-9
+    assert np.allclose(rescued["translation_cam"], [0.0, 4.0 / 3.0, 8.0 / 3.0])
+    assert np.allclose(rescued["scale"], [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0])
+    assert rescued["initializer_metadata"]["source"] == "contact_scale_depth_rescue"
+    assert rescued["contact_scale_depth_rescue_applied"] is True
+
+
 def test_support_sample_region_uses_near_mask_ring_when_lower_band_is_sparse() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import (
         estimate_support_plane_from_observed_depth,
@@ -391,6 +671,35 @@ def test_support_sample_region_uses_near_mask_ring_when_lower_band_is_sparse() -
     assert plane["num_points"] >= 120
     assert plane["support_sample_debug"]["near_mask_ring_pixels"] > 0
     assert plane["support_sample_debug"]["lower_band_pixels"] < plane["support_sample_debug"]["final_pixels"]
+
+
+def test_background_geometry_reference_builds_camera_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        support_plane_from_background_geometry_reference,
+    )
+
+    task = {
+        "vehicle_pose_context": {
+            "background_geometry_reference": {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "reference_type": "support_surface",
+                "source": "clean_background_depth",
+                "normal_world": [0.0, -2.0, 0.0],
+                "offset": 0.5,
+                "support_plane_confidence": 0.91,
+            }
+        }
+    }
+    t_world_from_cam = np.eye(4, dtype=np.float64)
+    t_world_from_cam[:3, 3] = [0.0, 1.0, 0.0]
+
+    plane = support_plane_from_background_geometry_reference(task, t_world_from_cam)
+
+    assert plane["available"] is True
+    assert plane["source"] == "background_geometry_reference"
+    assert np.allclose(plane["normal"], [0.0, -1.0, 0.0])
+    assert np.isclose(plane["offset"], -0.75)
+    assert plane["support_plane_confidence"] == 0.91
 
 
 def test_support_plane_report_payload_omits_debug_region_arrays() -> None:
@@ -874,6 +1183,90 @@ def test_generic_refine_candidate_stages_light_search_then_single_full_score() -
     assert "rendered_mask" in refined
 
 
+def test_generic_refine_contact_phase_uses_full_scoring_during_fine_search() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import refine_candidate_stages
+
+    class DummyEvaluator:
+        def __init__(self, coarse: bool, label: str):
+            self.generic_args = argparse.Namespace(generic_coarse_scoring=coarse)
+            self.label = label
+            self.delta_modes: list[bool] = []
+            self.absolute_modes: list[bool] = []
+
+        def set_initializer_metadata(self, _metadata):
+            pass
+
+        def evaluate_delta(self, base_translation, base_rotation, base_scale, params, keep_mask=False):
+            self.delta_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(base_translation, base_rotation, base_scale, score=1.0, keep_mask=keep_mask)
+
+        def evaluate_delta_batch(self, base_translation, base_rotation, base_scale, params_batch, **_kwargs):
+            self.delta_modes.extend([bool(self.generic_args.generic_coarse_scoring)] * len(params_batch))
+            return [
+                self._result(base_translation, base_rotation, base_scale, score=1.0, keep_mask=False)
+                for _params in params_batch
+            ]
+
+        def evaluate_absolute(self, translation, rotation, scale, keep_mask=False):
+            self.absolute_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(translation, rotation, scale, score=2.0, keep_mask=keep_mask)
+
+        def _result(self, translation, rotation, scale, *, score: float, keep_mask: bool):
+            result = {
+                "score": score,
+                "mask_iou": 0.8,
+                "soft_mask_iou": 0.8,
+                "bbox_iou": 0.8,
+                "bbox_center_error_px": 0.0,
+                "projected_bbox": [1.0, 1.0, 5.0, 5.0],
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_bottom_signed_m": 0.0,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "acceptance_status": "accepted",
+            }
+            if keep_mask:
+                result["rendered_mask"] = np.ones((8, 8), dtype=np.uint8)
+            return result
+
+    candidate = {
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "candidate"},
+    }
+    proxy = DummyEvaluator(coarse=True, label="proxy")
+    full = DummyEvaluator(coarse=False, label="full")
+    args = argparse.Namespace(
+        stage1_iters=0,
+        stage2_iters=0,
+        stage3_iters=0,
+        step_decay=0.5,
+        max_translation_delta=0.8,
+        max_rotation_delta_deg=45.0,
+        scale_min_factor=0.5,
+        scale_max_factor=2.2,
+        save_full_history=False,
+        generic_lightweight_search_scoring=True,
+        generic_pose_motion_phase="contact_calibration",
+        generic_contact_snap_rescue_enabled=True,
+        support_contact_snap_enabled=True,
+        support_acceptance_min_confidence=0.70,
+        generic_contact_support_max_separation_m=0.05,
+    )
+
+    refined, _history = refine_candidate_stages(candidate, proxy, full, args)
+
+    assert full.delta_modes == [False, False]
+    assert full.absolute_modes == [False]
+    assert refined["score"] == 2.0
+    assert "rendered_mask" in refined
+
+
 def test_generic_support_penalty_uses_normalized_observation_gate() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
@@ -1000,26 +1393,38 @@ def test_generic_config_keeps_full_scoring_after_proxy_coarse_mode() -> None:
     assert cfg["generic_coarse_scoring"] is False
 
 
-def test_generic_config_disables_depth_support_defaults() -> None:
+def test_generic_config_enables_depth_support_defaults() -> None:
     from process.pose_optimizer.config import load_config
     from process.pose_optimizer.variants import VARIANTS
 
     cfg = load_config(VARIANTS["generic_appearance_temporal"].config_path)
 
-    assert cfg["support_plane_enabled"] == "disabled"
-    assert cfg["support_plane_weight"] == 0.0
-    assert cfg["support_penalty_weight"] == 0.0
+    assert cfg["depth_enabled"] is True
+    assert cfg["generic_depth_weight"] > 0.0
+    assert cfg["support_plane_enabled"] == "auto"
+    assert cfg["support_plane_weight"] > 0.0
+    assert cfg["support_penalty_weight"] > 0.0
     assert cfg["support_contact_sigma_m"] == 0.08
     assert cfg["support_contact_tolerance_m"] == 0.06
     assert cfg["support_floating_tolerance_m"] == 0.15
     assert cfg["support_penetration_tolerance_m"] == 0.07
-    assert cfg["support_orientation_penalty_weight"] == 0.0
+    assert cfg["support_orientation_penalty_weight"] > 0.0
     assert cfg["support_orientation_sigma_deg"] == 8.0
     assert cfg["support_orientation_tolerance_deg"] == 2.0
-    assert cfg["support_aligned_seed_enabled"] is False
+    assert cfg["support_aligned_seed_enabled"] is True
     assert cfg["support_alignment_trigger_deg"] == 6.0
     assert cfg["support_aligned_seed_score_margin"] == 0.20
     assert cfg["support_aligned_seed_source_top_k"] == 2
+    assert cfg["support_contact_snap_enabled"] is True
+    assert cfg["generic_contact_snap_rescue_enabled"] is True
+    assert cfg["generic_contact_snap_rescue_iters"] == 0
+    assert cfg["generic_contact_snap_rescue_min_mask_iou"] == 0.12
+    assert cfg["generic_contact_snap_rescue_min_bbox_iou"] == 0.10
+    assert cfg["generic_contact_scale_depth_rescue_enabled"] is True
+    assert cfg["generic_contact_scale_depth_rescue_min_factor"] == 0.25
+    assert cfg["generic_contact_scale_depth_rescue_max_factor"] == 2.50
+    assert cfg["support_acceptance_min_confidence"] == 0.70
+    assert cfg["support_acceptance_max_separation_m"] == 0.15
     assert cfg["generic_acceptance_truncated_min_projection_valid_ratio"] == 0.30
     assert cfg["generic_acceptance_projection_temporal_exempt_enabled"] is True
     assert cfg["generic_truncated_temporal_early_stop_enabled"] is True
@@ -1562,6 +1967,138 @@ def test_generic_acceptance_still_rejects_low_projection_non_truncated_candidate
     assert decision["reject_reasons"] == ["projection_valid_ratio_below_threshold"]
 
 
+def test_generic_acceptance_rejects_high_confidence_support_separation() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
+    evaluator.generic_args = argparse.Namespace(
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.94,
+            "mask_iou": 0.94,
+            "bbox_iou": 0.91,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.61,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.91,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.35,
+        }
+    )
+
+    assert decision["acceptance_status"] == "rejected"
+    assert decision["reject_reasons"] == ["support_separation_above_threshold"]
+
+
+def test_generic_acceptance_contact_phase_requires_tight_support() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="contact_calibration",
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+        generic_contact_depth_min_score=0.70,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        generic_contact_support_max_separation_m=0.05,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.91,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.82,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.08,
+        }
+    )
+
+    assert decision["acceptance_status"] == "rejected"
+    assert decision["reject_reasons"] == ["contact_support_separation_above_threshold"]
+
+
+def test_generic_acceptance_free_motion_ignores_depth_and_support_contact() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="free_motion",
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+        generic_contact_depth_min_score=0.70,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        generic_contact_support_max_separation_m=0.05,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.91,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.0,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.22,
+            "support_penetration_distance_m": 0.0,
+        }
+    )
+
+    assert decision["acceptance_status"] == "accepted"
+    assert decision["reject_reasons"] == []
+
+
 def test_executor_generic_mode_uses_generic_acceptance_without_road_gates(monkeypatch) -> None:
     from guanwu.video.project.executor import ProjectExecutor
 
@@ -1591,6 +2128,36 @@ def test_executor_generic_mode_uses_generic_acceptance_without_road_gates(monkey
         },
     }
     assert ProjectExecutor._generic_pose_optimizer_acceptance(report)["accepted"]
+
+
+def test_executor_generic_acceptance_rejects_high_confidence_support_separation() -> None:
+    from guanwu.video.project.executor import ProjectExecutor
+
+    report = {
+        "json_bbox": [10.0, 12.0, 210.0, 52.0],
+        "metrics": {
+            "mask_iou": 0.90,
+            "soft_mask_iou": 0.80,
+            "bbox_iou": 0.95,
+            "bbox_center_error_px": 2.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.60,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.37,
+        },
+        "optimized_corrected_pose_world": {
+            "translation_world": [0.0, 0.0, 1.0],
+            "scale": [0.05, 0.05, 0.05],
+        },
+    }
+
+    decision = ProjectExecutor._generic_pose_optimizer_acceptance(report)
+
+    assert decision["accepted"] is False
+    assert decision["reason"] == "support_separation_above_threshold:0.370"
 
 
 def test_generic_truncated_visible_bbox_becomes_primary_bbox_score() -> None:

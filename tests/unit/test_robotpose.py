@@ -136,6 +136,25 @@ def test_decode_uncompressed_grounded_sam2_rle_mask() -> None:
     assert selected[0]["label"] == "robot arm"
 
 
+def test_decode_compressed_grounded_sam2_rle_json_string_without_bbox_fallback() -> None:
+    from robotpose.sam2 import decode_instance_mask
+
+    expected_flat = np.zeros(12, dtype=bool)
+    expected_flat[2:5] = True
+    expected = expected_flat.reshape((3, 4), order="F")
+    inst = {
+        "label": "robotic arm",
+        "bbox": [0, 0, 4, 3],
+        "mask_rle": json.dumps({"size": [3, 4], "counts": "237"}),
+    }
+
+    decoded = decode_instance_mask(inst, expected.shape)
+
+    assert decoded is not None
+    assert np.array_equal(decoded, expected)
+    assert int(decoded.sum()) == 3
+
+
 def test_minimal_urdf_loader_builds_current_configuration_mesh(tmp_path: Path) -> None:
     from robotpose.urdf_model import load_robot_mesh_from_urdf
 

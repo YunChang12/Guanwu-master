@@ -180,16 +180,6 @@ support_aligned_seed_enabled: true
 support_alignment_trigger_deg: 6.0
 support_aligned_seed_score_margin: 0.20
 support_aligned_seed_source_top_k: 2
-support_contact_snap_enabled: true
-generic_contact_snap_rescue_enabled: true
-generic_contact_snap_rescue_iters: 0
-generic_contact_snap_rescue_min_mask_iou: 0.12
-generic_contact_snap_rescue_min_bbox_iou: 0.10
-generic_contact_scale_depth_rescue_enabled: true
-generic_contact_scale_depth_rescue_min_factor: 0.25
-generic_contact_scale_depth_rescue_max_factor: 2.50
-support_acceptance_min_confidence: 0.70
-support_acceptance_max_separation_m: 0.15
 optional_prior_gate_start: 0.35
 optional_prior_gate_range: 0.45
 generic_upright_enabled: auto
@@ -214,8 +204,8 @@ generic_acceptance_projection_temporal_exempt_enabled: true
 generic_acceptance_projection_exempt_min_mask_iou: 0.90
 generic_acceptance_projection_exempt_min_bbox_iou: 0.60
 generic_acceptance_projection_exempt_min_temporal_score: 0.50
-generic_acceptance_depth_confidence_high: 999.0
-generic_acceptance_depth_min_threshold: 0.0
+generic_acceptance_depth_confidence_high: 0.70
+generic_acceptance_depth_min_threshold: 0.25
 generic_truncated_temporal_early_stop_enabled: true
 generic_truncated_temporal_early_stop_min_score: 2.0
 generic_truncated_temporal_early_stop_min_mask_iou: 0.90

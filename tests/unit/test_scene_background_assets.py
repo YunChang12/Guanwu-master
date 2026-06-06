@@ -164,6 +164,63 @@ def test_openai_image_cleaner_prompt_only_omits_mask(tmp_path: Path) -> None:
         assert image.size == (64, 36)
 
 
+def test_openai_image_cleaner_uses_system_vlm_config_when_api_key_missing(monkeypatch, tmp_path: Path) -> None:
+    from guanwu.video.core import config as core_config
+    from guanwu.video.features.spatial.scene_background_assets import run_openai_image_edit_background_cleaner
+
+    system_config = tmp_path / "video.config.toml"
+    system_config.write_text(
+        """
+[vlm]
+mode = "embedded"
+backend = "api"
+api_key = "system-key"
+base_url = "https://system.example/v1"
+model = "gpt-5.5"
+max_retries = 3
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core_config, "DEFAULT_CONFIG_PATH", system_config)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    reference_path = tmp_path / "reference.png"
+    mask_path = tmp_path / "mask.png"
+    output_path = tmp_path / "clean.png"
+    Image.fromarray(np.zeros((36, 64, 3), dtype=np.uint8)).save(reference_path)
+    Image.fromarray(np.zeros((36, 64, 4), dtype=np.uint8)).save(mask_path)
+    captured: dict[str, object] = {}
+
+    class FakeImages:
+        def edit(self, **kwargs):
+            edited = Image.fromarray(np.full((36, 64, 3), 180, dtype=np.uint8))
+            buffer = io.BytesIO()
+            edited.save(buffer, format="PNG")
+            b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=b64)])
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.images = FakeImages()
+
+    original = openai.OpenAI
+    openai.OpenAI = FakeOpenAI
+    try:
+        run_openai_image_edit_background_cleaner(
+            image_path=reference_path,
+            mask_path=mask_path,
+            output_path=output_path,
+            config={"api_key": "", "base_url": "", "api_size": "64x36", "mask_mode": "prompt_only"},
+        )
+    finally:
+        openai.OpenAI = original
+
+    assert captured["api_key"] == "system-key"
+    assert captured["base_url"] == "https://system.example/v1"
+    assert output_path.exists()
+
+
 def test_build_dynamic_mask_uses_only_movable_categories_and_expands_shadow() -> None:
     car = np.zeros((24, 32), dtype=bool)
     car[8:14, 10:18] = True
@@ -1654,6 +1711,41 @@ def test_generate_depth_background_mesh_assets_writes_colored_glb_and_manifest(t
     assert manifest["quality"]["face_count"] > 0
     meshes = load_background_asset_meshes(str(result["manifest_path"]))
     assert [(name, path.name) for name, path in meshes] == [("depth_background", "depth_background.glb")]
+
+
+def test_generate_depth_background_mesh_assets_drops_large_depth_discontinuity_faces(tmp_path: Path) -> None:
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    rgb[:, :] = (80, 100, 120)
+    rgb_path = tmp_path / "clean_target_rgb.png"
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    depth = np.ones((8, 8), dtype=np.float32)
+    depth[:, 4:] = 8.0
+    depth_path = tmp_path / "clean_target_depth.npy"
+    np.save(depth_path, depth)
+
+    result = generate_depth_background_mesh_assets(
+        clean_rgb_path=rgb_path,
+        depth_path=depth_path,
+        output_dir=tmp_path / "depth_background",
+        camera={
+            "fx": 8.0,
+            "fy": 8.0,
+            "cx": 4.0,
+            "cy": 4.0,
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, 0.0],
+        },
+        grid_stride=1,
+        target_frame_id=3,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    mesh = trimesh.load(manifest["assets"]["depth_background_glb"], force="mesh")
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.faces)
+    face_depths = vertices[faces, 2]
+    assert not np.any((np.min(face_depths, axis=1) < 2.0) & (np.max(face_depths, axis=1) > 6.0))
+    assert manifest["quality"]["discontinuity_faces_removed"] > 0
 
 
 def test_load_background_asset_meshes_prefers_depth_background_over_tabletop_proxy(tmp_path: Path) -> None:

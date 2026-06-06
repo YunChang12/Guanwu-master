@@ -117,16 +117,38 @@ def render_mask_by_triangle_fill(
     height, width = [int(v) for v in image_shape]
     if height <= 0 or width <= 0:
         raise ValueError(f"image_shape must be positive, got {image_shape}")
-    mask_img = Image.new("L", (width, height), 0)
-    draw = ImageDraw.Draw(mask_img)
     faces_arr = np.asarray(faces, dtype=np.int32)
     if faces_arr.size == 0:
         return np.zeros((height, width), dtype=bool)
     valid_faces = np.asarray(valid_z, dtype=bool)[faces_arr].all(axis=1)
-    for tri in projected_uv[faces_arr[valid_faces]]:
+    triangles = projected_uv[faces_arr[valid_faces]]
+    if triangles.size == 0:
+        return np.zeros((height, width), dtype=bool)
+    finite = np.isfinite(triangles).all(axis=(1, 2))
+    in_view = ~(
+        (triangles[:, :, 0].max(axis=1) < 0)
+        | (triangles[:, :, 1].max(axis=1) < 0)
+        | (triangles[:, :, 0].min(axis=1) >= width)
+        | (triangles[:, :, 1].min(axis=1) >= height)
+    )
+    triangles = triangles[finite & in_view]
+    if triangles.size == 0:
+        return np.zeros((height, width), dtype=bool)
+    try:
+        import cv2  # type: ignore
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        points = np.rint(triangles).astype(np.int32)
+        for tri in points:
+            cv2.fillConvexPoly(mask, tri, 1)
+        return mask.astype(bool)
+    except Exception:
+        pass
+
+    mask_img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+    for tri in triangles:
         if not np.isfinite(tri).all():
-            continue
-        if tri[:, 0].max() < 0 or tri[:, 1].max() < 0 or tri[:, 0].min() >= width or tri[:, 1].min() >= height:
             continue
         pts = [(float(x), float(y)) for x, y in tri]
         draw.polygon(pts, fill=1)

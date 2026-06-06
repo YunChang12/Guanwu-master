@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,15 @@ from .optimizer import OptimizerOptions, RobotPoseResult, optimize_robot_pose, w
 from .render import RobotMesh, normalize_camera_K
 from .sam2 import call_grounded_sam2, mask_from_grounded_sam2_payload, save_payload
 from .urdf_model import load_robot_mesh_from_urdf
+
+
+class RobotPoseArgumentParser(argparse.ArgumentParser):
+    _negative_grid = re.compile(r"^-\d+(?:\.\d+)?(?:[,:].*)?$")
+
+    def _parse_optional(self, arg_string: str) -> Any:
+        if self._negative_grid.match(arg_string):
+            return None
+        return super()._parse_optional(arg_string)
 
 
 def estimate_robot_base_pose(
@@ -46,7 +56,7 @@ def estimate_robot_base_pose(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = RobotPoseArgumentParser(
         description="Estimate robot base pose T_C_B from URDF, joint angles, RGB image, camera intrinsics, and mask/SAM2.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -61,10 +71,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam2-payload", default=None, help="Use saved Grounded-SAM2 JSON instead of calling the service")
     parser.add_argument("--init-pose", default=None, help="JSON containing T_C_B or a raw 4x4 matrix")
     parser.add_argument("--max-iterations", type=int, default=90)
+    parser.add_argument("--optimizer-method", default="Powell", help="SciPy optimizer method, or 'pattern' for bounded local search only")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--stage-scales", default="0.35,0.65,1.0")
     parser.add_argument("--coarse-depths", default="0.8,1.2,1.8,2.5,3.5,5.0")
     parser.add_argument("--coarse-yaws-deg", default="0:360:30")
+    parser.add_argument("--coarse-pitches-deg", default="0")
+    parser.add_argument("--coarse-rolls-deg", default="0")
+    parser.add_argument(
+        "--coarse-lateral-offsets-px",
+        default="0,0",
+        help='Semicolon-separated bbox-center pixel offsets, e.g. "0,0;80,0;-80,0"',
+    )
+    parser.add_argument("--min-depth", type=float, default=None, help="Reject poses with base z below this camera depth")
+    parser.add_argument("--max-depth", type=float, default=None, help="Reject poses with base z above this camera depth")
+    parser.add_argument("--invalid-pose-loss", type=float, default=1_000_000.0)
+    parser.add_argument("--pattern-translation-steps", default="0.25,0.12,0.06,0.03,0.015")
+    parser.add_argument("--pattern-rotation-steps-deg", default="8,4,2")
+    parser.add_argument("--moment-refine-iterations", type=int, default=4)
+    parser.add_argument("--disable-initial-bbox-prefilter", action="store_true")
+    parser.add_argument("--initial-prefilter-render-limit", type=int, default=512)
+    parser.add_argument("--initial-prefilter-vertex-limit", type=int, default=512)
+    parser.add_argument("--prefilter-bbox-iou-min", type=float, default=0.01)
+    parser.add_argument("--prefilter-center-factor", type=float, default=1.25)
+    parser.add_argument("--prefilter-size-ratio-min", type=float, default=0.05)
+    parser.add_argument("--prefilter-size-ratio-max", type=float, default=8.0)
+    parser.add_argument("--prefilter-min-valid-ratio", type=float, default=0.05)
     parser.add_argument("--no-coarse-search", action="store_true")
     parser.add_argument("--render-backend", choices=["triangle_fill"], default="triangle_fill")
     return parser
@@ -96,9 +128,27 @@ def main(argv: list[str] | None = None) -> int:
         loss_config=LossConfig(),
         coarse_depths=parse_float_tuple(args.coarse_depths),
         coarse_yaws_deg=parse_angle_grid(args.coarse_yaws_deg),
+        coarse_pitch_deg=parse_angle_grid(args.coarse_pitches_deg),
+        coarse_roll_deg=parse_angle_grid(args.coarse_rolls_deg),
+        coarse_lateral_offsets_px=parse_lateral_offsets_px(args.coarse_lateral_offsets_px),
         top_k=int(args.top_k),
         stage_scales=parse_float_tuple(args.stage_scales),
         max_iterations=int(args.max_iterations),
+        optimizer_method=str(args.optimizer_method),
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+        invalid_pose_loss=float(args.invalid_pose_loss),
+        pattern_translation_steps=parse_float_tuple(args.pattern_translation_steps),
+        pattern_rotation_steps_deg=parse_angle_grid(args.pattern_rotation_steps_deg),
+        moment_refine_iterations=int(args.moment_refine_iterations),
+        enable_initial_bbox_prefilter=not bool(args.disable_initial_bbox_prefilter),
+        initial_prefilter_render_limit=int(args.initial_prefilter_render_limit),
+        initial_prefilter_vertex_limit=int(args.initial_prefilter_vertex_limit),
+        prefilter_bbox_iou_min=float(args.prefilter_bbox_iou_min),
+        prefilter_center_factor=float(args.prefilter_center_factor),
+        prefilter_size_ratio_min=float(args.prefilter_size_ratio_min),
+        prefilter_size_ratio_max=float(args.prefilter_size_ratio_max),
+        prefilter_min_valid_ratio=float(args.prefilter_min_valid_ratio),
         coarse_search=not bool(args.no_coarse_search),
     )
     if args.no_coarse_search and not init_poses:
@@ -140,6 +190,7 @@ def write_outputs(
     save_rgb(out_dir / "overlay.png", draw_overlay(image_rgb, observed_mask, result.rendered_mask))
     save_rgb(out_dir / "mask_comparison.png", draw_mask_comparison(image_rgb, observed_mask, result.rendered_mask))
     write_history_csv(out_dir / "loss_history.csv", result.history)
+    write_history_csv(out_dir / "initial_candidates.csv", result.initial_candidate_scores)
     payload = {
         "T_C_B": result.T_C_B.tolist(),
         "translation": result.translation.tolist(),
@@ -153,12 +204,32 @@ def write_outputs(
         "initial_loss_terms": result.initial_loss.terms,
         "selected_init_index": result.selected_init_index,
         "projected_bbox": result.projected_bbox,
+        "initial_candidate_summary": result.initial_candidate_summary,
+        "initial_candidate_preview": result.initial_candidate_scores[:20],
         "options": {
             "max_iterations": options.max_iterations,
+            "optimizer_method": options.optimizer_method,
             "top_k": options.top_k,
             "stage_scales": list(options.stage_scales),
             "coarse_depths": list(options.coarse_depths),
             "coarse_yaws_deg": list(options.coarse_yaws_deg),
+            "coarse_pitch_deg": list(options.coarse_pitch_deg),
+            "coarse_roll_deg": list(options.coarse_roll_deg),
+            "coarse_lateral_offsets_px": [list(item) for item in options.coarse_lateral_offsets_px],
+            "min_depth": options.min_depth,
+            "max_depth": options.max_depth,
+            "invalid_pose_loss": options.invalid_pose_loss,
+            "pattern_translation_steps": list(options.pattern_translation_steps),
+            "pattern_rotation_steps_deg": list(options.pattern_rotation_steps_deg),
+            "moment_refine_iterations": options.moment_refine_iterations,
+            "enable_initial_bbox_prefilter": options.enable_initial_bbox_prefilter,
+            "initial_prefilter_render_limit": options.initial_prefilter_render_limit,
+            "initial_prefilter_vertex_limit": options.initial_prefilter_vertex_limit,
+            "prefilter_bbox_iou_min": options.prefilter_bbox_iou_min,
+            "prefilter_center_factor": options.prefilter_center_factor,
+            "prefilter_size_ratio_min": options.prefilter_size_ratio_min,
+            "prefilter_size_ratio_max": options.prefilter_size_ratio_max,
+            "prefilter_min_valid_ratio": options.prefilter_min_valid_ratio,
             "loss_config": asdict(options.loss_config),
         },
         "outputs": {
@@ -167,6 +238,7 @@ def write_outputs(
             "rendered_mask": str(out_dir / "rendered_mask.png"),
             "observed_mask": str(out_dir / "observed_mask.png"),
             "loss_history": str(out_dir / "loss_history.csv"),
+            "initial_candidates": str(out_dir / "initial_candidates.csv"),
         },
     }
     (out_dir / "result.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -213,6 +285,21 @@ def parse_angle_grid(value: str) -> tuple[float, ...]:
             current += step
         return tuple(values)
     return parse_float_tuple(text)
+
+
+def parse_lateral_offsets_px(value: str) -> tuple[tuple[float, float], ...]:
+    offsets: list[tuple[float, float]] = []
+    for chunk in str(value).split(";"):
+        text = chunk.strip()
+        if not text:
+            continue
+        parts = [float(item.strip()) for item in text.split(",") if item.strip()]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid lateral offset {text!r}; expected 'du,dv'.")
+        offsets.append((parts[0], parts[1]))
+    if not offsets:
+        raise ValueError("--coarse-lateral-offsets-px must contain at least one du,dv pair")
+    return tuple(offsets)
 
 
 if __name__ == "__main__":

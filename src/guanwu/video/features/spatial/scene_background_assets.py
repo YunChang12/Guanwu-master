@@ -1072,6 +1072,24 @@ def _resolve_openai_image_edit_size(image_path: str | Path, configured_size: Any
     return raw
 
 
+def _load_system_vlm_openai_defaults() -> dict[str, Any]:
+    try:
+        from guanwu.video.core.config import load_settings
+
+        settings, _ = load_settings()
+    except Exception:
+        return {}
+    vlm = getattr(settings, "vlm", None)
+    if vlm is None:
+        return {}
+    defaults: dict[str, Any] = {}
+    if getattr(vlm, "api_key", None):
+        defaults["api_key"] = getattr(vlm, "api_key")
+    if getattr(vlm, "base_url", None):
+        defaults["base_url"] = getattr(vlm, "base_url")
+    return defaults
+
+
 def run_openai_image_edit_background_cleaner(
     *,
     image_path: str | Path,
@@ -1081,7 +1099,10 @@ def run_openai_image_edit_background_cleaner(
     reference_frame_id: int | None = None,
 ) -> dict[str, Any]:
     cfg = _load_openai_image_edit_config(config)
+    system_defaults = _load_system_vlm_openai_defaults()
     api_key = cfg.get("api_key") or os.environ.get(str(cfg.get("api_key_env") or "OPENAI_API_KEY"))
+    if not api_key:
+        api_key = system_defaults.get("api_key")
     if not api_key:
         raise RuntimeError(
             "OpenAI image cleaner requires an API key. Set api_key in the cleaner config "
@@ -1093,8 +1114,9 @@ def run_openai_image_edit_background_cleaner(
         raise RuntimeError("OpenAI image cleaner requires the openai Python package.") from exc
 
     client_kwargs: dict[str, Any] = {"api_key": api_key}
-    if cfg.get("base_url"):
-        client_kwargs["base_url"] = str(cfg["base_url"])
+    base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL") or system_defaults.get("base_url")
+    if base_url:
+        client_kwargs["base_url"] = str(base_url)
     if cfg.get("timeout_sec"):
         client_kwargs["timeout"] = float(cfg["timeout_sec"])
     client = OpenAI(**client_kwargs)
@@ -1877,7 +1899,7 @@ def generate_depth_background_mesh_assets(
     if depth.shape != (height, width):
         depth = cv2.resize(depth.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float64)
 
-    mesh = _build_depth_textured_mesh(
+    mesh, mesh_quality = _build_depth_textured_mesh(
         rgb=rgb,
         depth=depth,
         camera=camera,
@@ -1907,6 +1929,7 @@ def generate_depth_background_mesh_assets(
             "source": "clean_rgb_depth_mesh",
             "vertex_count": int(len(mesh.vertices)),
             "face_count": int(len(mesh.faces)),
+            **mesh_quality,
         },
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2352,6 +2375,28 @@ def _build_depth_textured_mesh(
             colors.append([r, g, b, 255])
 
     faces: list[list[int]] = []
+    discontinuity_faces_removed = 0
+    long_edge_faces_removed = 0
+
+    def _triangle_is_valid(face: list[int]) -> tuple[bool, str | None]:
+        pts = np.asarray([vertices[int(idx)] for idx in face], dtype=np.float64)
+        z = pts[:, 2]
+        min_depth = max(float(np.min(z)), 1e-6)
+        max_depth = float(np.max(z))
+        if max_depth / min_depth > 1.8 or (max_depth - min_depth) > max(0.12, min_depth * 0.18):
+            return False, "depth_discontinuity"
+        edge_lengths = [
+            float(np.linalg.norm(pts[0] - pts[1])),
+            float(np.linalg.norm(pts[1] - pts[2])),
+            float(np.linalg.norm(pts[2] - pts[0])),
+        ]
+        focal = max(1e-6, min(abs(fx), abs(fy)))
+        expected_grid_edge = min_depth * float(stride) / focal
+        max_reasonable_edge = max(0.08, expected_grid_edge * 4.0)
+        if max(edge_lengths) > max_reasonable_edge:
+            return False, "long_edge"
+        return True, None
+
     for yi in range(len(ys) - 1):
         for xi in range(len(xs) - 1):
             keys = [(yi, xi), (yi, xi + 1), (yi + 1, xi), (yi + 1, xi + 1)]
@@ -2363,15 +2408,25 @@ def _build_depth_textured_mesh(
             v11 = valid_index[(yi + 1, xi + 1)]
             z_values = [float(depth[ys[key[0]], xs[key[1]]]) for key in keys]
             if max(z_values) / max(min(z_values), 1e-6) > 1.8:
+                discontinuity_faces_removed += 2
                 continue
-            faces.append([v00, v10, v11])
-            faces.append([v00, v11, v01])
+            for face in ([v00, v10, v11], [v00, v11, v01]):
+                valid, reason = _triangle_is_valid(face)
+                if valid:
+                    faces.append(face)
+                elif reason == "long_edge":
+                    long_edge_faces_removed += 1
+                else:
+                    discontinuity_faces_removed += 1
 
     if not vertices or not faces:
         raise ValueError("Depth background mesh has no valid geometry")
     mesh = trimesh.Trimesh(vertices=np.asarray(vertices), faces=np.asarray(faces), process=False)
     mesh.visual = ColorVisuals(mesh=mesh, vertex_colors=np.asarray(colors, dtype=np.uint8))
-    return mesh
+    return mesh, {
+        "discontinuity_faces_removed": int(discontinuity_faces_removed),
+        "long_edge_faces_removed": int(long_edge_faces_removed),
+    }
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:

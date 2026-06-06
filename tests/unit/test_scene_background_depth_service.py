@@ -123,6 +123,29 @@ def test_clean_background_depth_estimator_calls_depth_anything_video_job(monkeyp
     assert float(saved[0, 0]) == 7.5
 
 
+def test_background_clean_depth_estimator_stays_enabled_for_tabletop_task(tmp_path: Path) -> None:
+    executor = object.__new__(ProjectExecutor)
+    executor.context = SimpleNamespace(
+        config=SimpleNamespace(
+            project=SimpleNamespace(provider_mode="zaiwu"),
+            settings=SimpleNamespace(
+                zaiwu=SimpleNamespace(
+                    enabled=True,
+                    depth_service="services.depth_anything3",
+                    job_timeout_sec=30.0,
+                )
+            ),
+        )
+    )
+
+    estimator = executor._build_background_clean_depth_estimator(
+        tmp_path / "background_assets",
+        background_mode="tabletop_task",
+    )
+
+    assert callable(estimator)
+
+
 def test_semantic_road_estimator_calls_grounded_sam2_frame_job(monkeypatch, tmp_path: Path) -> None:
     image = np.zeros((24, 32, 3), dtype=np.uint8)
     image[:, :] = (80, 90, 100)

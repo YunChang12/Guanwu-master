@@ -113,6 +113,201 @@ def test_triangle_renderer_and_optimizer_reduce_synthetic_pose_error() -> None:
     assert result.rendered_mask.shape == observed.shape
 
 
+def test_triangle_fill_unions_overlapping_faces_without_xor_holes() -> None:
+    from robotpose.render import render_mask_by_triangle_fill
+
+    projected_uv = np.array(
+        [
+            [10.0, 10.0],
+            [30.0, 10.0],
+            [30.0, 30.0],
+            [10.0, 30.0],
+        ],
+        dtype=np.float64,
+    )
+    valid_z = np.ones(4, dtype=bool)
+    faces = np.array([[0, 1, 2], [0, 1, 2]], dtype=np.int32)
+
+    mask = render_mask_by_triangle_fill(projected_uv, valid_z, faces, (40, 40))
+
+    assert mask.sum() == 231
+    assert mask[15, 20]
+    assert mask[20, 25]
+
+
+def test_pattern_optimizer_method_skips_scipy_minimize(monkeypatch: pytest.MonkeyPatch) -> None:
+    from robotpose.optimizer import OptimizerOptions, optimize_robot_pose
+    from robotpose.render import RobotMesh, render_robot_mask
+
+    vertices, faces = _square_mesh()
+    mesh = RobotMesh(vertices=vertices, faces=faces)
+    K = np.array([[80.0, 0.0, 48.0], [0.0, 80.0, 36.0], [0.0, 0.0, 1.0]])
+    image_shape = (72, 96)
+    true_pose = np.eye(4)
+    true_pose[:3, 3] = [0.0, 0.0, 4.0]
+    observed = render_robot_mask(mesh, K, true_pose, image_shape).mask
+    init_pose = np.eye(4)
+    init_pose[:3, 3] = [0.35, -0.25, 4.0]
+
+    def fail_minimize(*args: object, **kwargs: object) -> object:
+        raise AssertionError("SciPy minimize should not be called for optimizer_method='pattern'")
+
+    monkeypatch.setattr("robotpose.optimizer.minimize", fail_minimize)
+
+    result = optimize_robot_pose(
+        mesh,
+        K,
+        observed,
+        image_shape,
+        init_poses=[init_pose],
+        options=OptimizerOptions(
+            optimizer_method="pattern",
+            top_k=1,
+            stage_scales=(1.0,),
+            pattern_translation_steps=(0.20, 0.10, 0.05),
+            pattern_rotation_steps_deg=(),
+            moment_refine_iterations=0,
+        ),
+    )
+
+    assert result.loss.total < result.initial_loss.total
+
+
+def test_pose_depth_bounds_penalize_invalid_camera_depth() -> None:
+    from robotpose.optimizer import OptimizerOptions, _loss_for_pose
+    from robotpose.render import RobotMesh, render_robot_mask
+
+    vertices, faces = _square_mesh()
+    mesh = RobotMesh(vertices=vertices, faces=faces)
+    K = np.array([[80.0, 0.0, 48.0], [0.0, 80.0, 36.0], [0.0, 0.0, 1.0]])
+    image_shape = (72, 96)
+    valid_pose = np.eye(4)
+    valid_pose[:3, 3] = [0.0, 0.0, 1.2]
+    observed = render_robot_mask(mesh, K, valid_pose, image_shape).mask
+    invalid_pose = np.eye(4)
+    invalid_pose[:3, 3] = [0.0, 0.0, 0.2]
+    options = OptimizerOptions(min_depth=0.8, max_depth=2.0, invalid_pose_loss=100000.0)
+
+    valid = _loss_for_pose(mesh, K, observed, image_shape, valid_pose, valid_pose, options)
+    invalid = _loss_for_pose(mesh, K, observed, image_shape, invalid_pose, valid_pose, options)
+
+    assert valid.total < 100.0
+    assert invalid.total >= options.invalid_pose_loss
+    assert invalid.terms["pose_bounds"] > 0.0
+
+
+def test_initial_bbox_prefilter_skips_far_candidates_before_render(monkeypatch: pytest.MonkeyPatch) -> None:
+    from robotpose.optimizer import OptimizerOptions, _score_initial_candidates
+    from robotpose.render import RenderResult, RobotMesh, bbox_from_mask
+
+    vertices, faces = _square_mesh()
+    mesh = RobotMesh(vertices=vertices, faces=faces)
+    K = np.array([[80.0, 0.0, 48.0], [0.0, 80.0, 36.0], [0.0, 0.0, 1.0]])
+    image_shape = (72, 96)
+    observed = np.zeros(image_shape, dtype=bool)
+    observed[18:54, 30:66] = True
+    near_pose = np.eye(4)
+    near_pose[:3, 3] = [0.0, 0.0, 2.0]
+    far_pose = np.eye(4)
+    far_pose[:3, 3] = [8.0, 0.0, 2.0]
+    rendered_calls: list[np.ndarray] = []
+
+    def fake_render_robot_mask(mesh_arg: RobotMesh, camera_arg: np.ndarray, pose_arg: np.ndarray, shape_arg: tuple[int, int]) -> RenderResult:
+        rendered_calls.append(np.asarray(pose_arg, dtype=np.float64).copy())
+        return RenderResult(
+            mask=observed.copy(),
+            projected_uv=np.empty((0, 2), dtype=np.float64),
+            valid_z=np.empty((0,), dtype=bool),
+            projected_bbox=bbox_from_mask(observed),
+        )
+
+    monkeypatch.setattr("robotpose.optimizer.render_robot_mask", fake_render_robot_mask)
+
+    scored = _score_initial_candidates(
+        mesh,
+        K,
+        observed,
+        image_shape,
+        [near_pose, far_pose],
+        OptimizerOptions(
+            stage_scales=(1.0,),
+            enable_initial_bbox_prefilter=True,
+            initial_prefilter_render_limit=8,
+            prefilter_center_factor=0.25,
+        ),
+    )
+
+    assert [item[0] for item in scored] == [0]
+    assert len(rendered_calls) == 1
+    assert np.allclose(rendered_calls[0][:3, 3], near_pose[:3, 3])
+
+
+def test_estimate_cli_parses_full_coarse_pose_grid_options() -> None:
+    from robotpose.estimate import build_parser, parse_angle_grid, parse_lateral_offsets_px
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "image.png",
+            "--urdf",
+            "robot.urdf",
+            "--joints",
+            "joints.json",
+            "--camera",
+            "camera.json",
+            "--mask",
+            "mask.png",
+            "--output-dir",
+            "out",
+            "--coarse-pitches-deg",
+            "-60,0,60",
+            "--coarse-rolls-deg",
+            "-180:181:90",
+            "--coarse-lateral-offsets-px",
+            "0,0;80,-40;-80,40",
+        ]
+    )
+
+    assert parse_angle_grid(args.coarse_pitches_deg) == (-60.0, 0.0, 60.0)
+    assert parse_angle_grid(args.coarse_rolls_deg) == (-180.0, -90.0, 0.0, 90.0, 180.0)
+    assert parse_lateral_offsets_px(args.coarse_lateral_offsets_px) == (
+        (0.0, 0.0),
+        (80.0, -40.0),
+        (-80.0, 40.0),
+    )
+
+
+def test_estimate_cli_parses_refine_step_controls() -> None:
+    from robotpose.estimate import build_parser, parse_angle_grid, parse_float_tuple
+
+    args = build_parser().parse_args(
+        [
+            "--image",
+            "image.png",
+            "--urdf",
+            "robot.urdf",
+            "--joints",
+            "joints.json",
+            "--camera",
+            "camera.json",
+            "--mask",
+            "mask.png",
+            "--output-dir",
+            "out",
+            "--pattern-translation-steps",
+            "",
+            "--pattern-rotation-steps-deg",
+            "",
+            "--moment-refine-iterations",
+            "0",
+        ]
+    )
+
+    assert parse_float_tuple(args.pattern_translation_steps) == ()
+    assert parse_angle_grid(args.pattern_rotation_steps_deg) == ()
+    assert args.moment_refine_iterations == 0
+
+
 def test_decode_uncompressed_grounded_sam2_rle_mask() -> None:
     from robotpose.sam2 import decode_instance_mask, mask_from_grounded_sam2_payload
 

@@ -1416,10 +1416,9 @@ class ProjectExecutor:
                 target_frame_id=3,
                 depth_maps_dir=wildgs_outputs.get("depth_maps_dir"),
                 camera_trajectory_path=camera_path,
-                clean_depth_estimator=(
-                    None
-                    if tabletop_task_mode
-                    else self._build_clean_background_depth_estimator(out_dir / "background_assets")
+                clean_depth_estimator=self._build_background_clean_depth_estimator(
+                    out_dir / "background_assets",
+                    background_mode=background_mode,
                 ),
                 semantic_road_estimator=(
                     None
@@ -1489,6 +1488,10 @@ class ProjectExecutor:
             return self._estimate_clean_background_depth_with_zaiwu(clean_rgb_path, output_dir=output_dir)
 
         return estimate
+
+    def _build_background_clean_depth_estimator(self, output_dir: Path, *, background_mode: str):
+        _ = str(background_mode or "auto").strip().lower()
+        return self._build_clean_background_depth_estimator(output_dir)
 
     def _build_semantic_road_estimator(self, output_dir: Path):
         if self._provider_mode() != "zaiwu":
@@ -7276,21 +7279,27 @@ class ProjectExecutor:
         try:
             task = json.loads(task_path.read_text(encoding="utf-8"))
         except Exception:
-            return []
+            task = {}
         temporal_prior = task.get("temporal_prior_pose")
-        if not isinstance(temporal_prior, dict) or not temporal_prior:
-            return []
+        if isinstance(temporal_prior, dict) and temporal_prior:
+            top_k_candidates = "8"
+            refine_top_k = "2"
+        else:
+            top_k_candidates = "16"
+            refine_top_k = "4"
         return [
-            "--top_k_candidates",
-            "8",
-            "--refine_top_k",
-            "2",
+            "--batch_gpu_size",
+            "64",
             "--stage1_iters",
-            "4",
+            "5",
             "--stage2_iters",
-            "3",
+            "4",
             "--stage3_iters",
             "6",
+            "--top_k_candidates",
+            top_k_candidates,
+            "--refine_top_k",
+            refine_top_k,
         ]
 
     def _run_pose_optimizer_cli(
@@ -7727,6 +7736,190 @@ class ProjectExecutor:
             return int(value) if value is not None else None
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_scene_export_grounding_plane(reference: dict | None) -> dict | None:
+        if not isinstance(reference, dict):
+            return None
+        try:
+            normal = np.asarray(reference.get("normal_world"), dtype=np.float64).reshape(3)
+            norm = float(np.linalg.norm(normal))
+            offset = float(reference.get("offset"))
+        except Exception:
+            return None
+        if norm < 1e-8 or not math.isfinite(norm) or not math.isfinite(offset):
+            return None
+        plane = dict(reference)
+        plane["normal_world"] = [float(v) for v in (normal / norm).tolist()]
+        plane["offset"] = float(offset)
+        return plane
+
+    @staticmethod
+    def _scene_export_fixed_camera_grounding_plane(
+        geometry,
+        pose_road_geometry_path: str | Path | None,
+        *,
+        fallback_frame_id: int | None = None,
+    ) -> tuple[int | None, dict | None]:
+        frame_id = ProjectExecutor._background_assets_target_frame_id(geometry)
+        if frame_id is None:
+            frame_id = fallback_frame_id
+
+        tabletop_reference = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+        plane = ProjectExecutor._normalize_scene_export_grounding_plane(tabletop_reference)
+        if plane is not None:
+            try:
+                frame_id = int(plane.get("target_frame_id") or frame_id or 1)
+            except Exception:
+                frame_id = int(frame_id or 1)
+            return frame_id, plane
+
+        if not pose_road_geometry_path or not Path(pose_road_geometry_path).exists():
+            return (int(frame_id) if frame_id is not None else None), None
+        try:
+            road_geometry = json.loads(Path(pose_road_geometry_path).read_text(encoding="utf-8"))
+        except Exception:
+            road_geometry = {}
+        if str(road_geometry.get("default_plane_policy", "")).strip().lower() != "global_for_fixed_camera":
+            return (int(frame_id) if frame_id is not None else None), None
+        if frame_id is None:
+            frame_id = 1
+        road_plane = select_road_plane_for_frame(
+            road_geometry,
+            int(frame_id),
+            policy="global_for_fixed_camera",
+        )
+        return int(frame_id), ProjectExecutor._normalize_scene_export_grounding_plane(road_plane)
+
+    @staticmethod
+    def _align_vector_rotation(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+        src = np.asarray(source, dtype=np.float64).reshape(3)
+        dst = np.asarray(target, dtype=np.float64).reshape(3)
+        src_norm = float(np.linalg.norm(src))
+        dst_norm = float(np.linalg.norm(dst))
+        if src_norm < 1e-12 or dst_norm < 1e-12:
+            return np.eye(3, dtype=np.float64)
+        src = src / src_norm
+        dst = dst / dst_norm
+        cross = np.cross(src, dst)
+        cross_norm = float(np.linalg.norm(cross))
+        dot = float(np.clip(src @ dst, -1.0, 1.0))
+        if cross_norm < 1e-12:
+            if dot > 0.0:
+                return np.eye(3, dtype=np.float64)
+            fallback = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(src @ fallback)) > 0.9:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            axis = np.cross(src, fallback)
+            axis = axis / max(1e-12, float(np.linalg.norm(axis)))
+            x, y, z = axis
+            K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+            return np.eye(3, dtype=np.float64) + 2.0 * (K @ K)
+        axis = cross / cross_norm
+        x, y, z = axis
+        K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+        return np.eye(3, dtype=np.float64) + K * cross_norm + (K @ K) * (1.0 - dot)
+
+    @staticmethod
+    def _orthonormalize_rotation(rotation: np.ndarray) -> np.ndarray:
+        rot = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+        try:
+            u, _s, vh = np.linalg.svd(rot)
+        except Exception:
+            return rot
+        out = u @ vh
+        if float(np.linalg.det(out)) < 0.0:
+            u[:, -1] *= -1.0
+            out = u @ vh
+        return out
+
+    @staticmethod
+    def _ground_pose_to_plane(
+        rotation,
+        translation,
+        local_vertices,
+        scale,
+        plane_normal,
+        plane_offset,
+        *,
+        axis_roles: dict | None = None,
+        metrics: dict | None = None,
+        bottom_percentile: float = 3.0,
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
+        rot = ProjectExecutor._orthonormalize_rotation(np.asarray(rotation, dtype=np.float64).reshape(3, 3))
+        trans = np.asarray(translation, dtype=np.float64).reshape(3)
+        local = np.asarray(local_vertices, dtype=np.float64)
+        scale_arr = np.asarray(scale, dtype=np.float64).reshape(3)
+        normal = np.asarray(plane_normal, dtype=np.float64).reshape(3)
+        normal_norm = float(np.linalg.norm(normal))
+        if (
+            local.ndim != 2
+            or local.shape[1] != 3
+            or local.shape[0] == 0
+            or normal_norm < 1e-12
+            or not np.all(np.isfinite(scale_arr))
+        ):
+            return rot, trans, {"contact_axis_source": "none"}
+        normal = normal / normal_norm
+        scaled_local = local * scale_arr.reshape(1, 3)
+
+        axis_index = None
+        axis_sign = None
+        axis_source = "none"
+        if isinstance(axis_roles, dict):
+            raw_axis = axis_roles.get("up_axis_idx")
+            raw_sign = axis_roles.get("up_axis_sign")
+            if raw_axis is not None and raw_sign is not None:
+                try:
+                    axis_index = int(raw_axis)
+                    axis_sign = 1.0 if float(raw_sign) >= 0.0 else -1.0
+                    axis_source = "axis_roles"
+                except Exception:
+                    axis_index = None
+                    axis_sign = None
+        if axis_index is None and isinstance(metrics, dict):
+            raw_axis = metrics.get("support_axis_index")
+            raw_sign = metrics.get("support_axis_sign")
+            if raw_axis is not None and raw_sign is not None:
+                try:
+                    axis_index = int(raw_axis)
+                    axis_sign = 1.0 if float(raw_sign) >= 0.0 else -1.0
+                    axis_source = "support_metrics"
+                except Exception:
+                    axis_index = None
+                    axis_sign = None
+        if axis_index is not None and not 0 <= int(axis_index) <= 2:
+            axis_index = None
+            axis_sign = None
+            axis_source = "none"
+
+        if axis_index is not None and axis_sign is not None:
+            contact_axis = rot[:, int(axis_index)] * float(axis_sign)
+            delta_rot = ProjectExecutor._align_vector_rotation(contact_axis, normal)
+            rot = ProjectExecutor._orthonormalize_rotation(delta_rot @ rot)
+            local_coord = scaled_local[:, int(axis_index)] * float(axis_sign)
+            cutoff = float(np.percentile(local_coord, float(bottom_percentile)))
+            selector = local_coord <= cutoff
+            if not np.any(selector):
+                selector = np.ones(local.shape[0], dtype=bool)
+        else:
+            selector = np.ones(local.shape[0], dtype=bool)
+
+        transformed_rel = (rot @ scaled_local.T).T
+        selected = transformed_rel[selector]
+        if selected.size == 0:
+            selected = transformed_rel
+        bottom_rel = float(np.min(selected @ normal))
+        bottom_distance = float(normal @ trans + float(plane_offset) + bottom_rel)
+        if np.isfinite(bottom_distance):
+            trans = trans - normal * bottom_distance
+        return rot, trans, {
+            "contact_axis_source": axis_source,
+            "contact_axis_index": axis_index,
+            "contact_axis_sign": axis_sign,
+            "contact_bottom_distance_before_m": bottom_distance,
+            "contact_bottom_point_count": int(np.count_nonzero(selector)),
+        }
 
     @staticmethod
     def _tabletop_reference_from_geometry(geometry) -> dict | None:
@@ -9597,26 +9790,30 @@ class ProjectExecutor:
             if fixed_camera_T_ref is None:
                 fixed_camera_reference_frame_id = None
 
-        def _fixed_camera_grounded_pose(frame_id: int, rotation, translation, local_vertices, scale):
+        def _fixed_camera_grounded_pose(
+            frame_id: int,
+            rotation,
+            translation,
+            local_vertices,
+            scale,
+            *,
+            axis_roles=None,
+            metrics=None,
+        ):
             rot_world, trans_world = _fixed_camera_world_pose(frame_id, rotation, translation)
             if fixed_camera_T_ref is None or fixed_camera_road_normal is None or fixed_camera_road_offset is None:
                 return rot_world, trans_world
-            try:
-                local = np.asarray(local_vertices, dtype=np.float64)
-                scale_arr = np.asarray(scale, dtype=np.float64).reshape(3)
-                transformed = (rot_world @ (local * scale_arr[None, :]).T).T
-            except Exception:
-                return rot_world, trans_world
-            if transformed.ndim != 2 or transformed.shape[0] == 0 or transformed.shape[1] != 3:
-                return rot_world, trans_world
-            bottom_rel = float(np.min(transformed @ fixed_camera_road_normal))
-            if not np.isfinite(bottom_rel):
-                return rot_world, trans_world
-            bottom_distance = float(fixed_camera_road_normal @ trans_world + fixed_camera_road_offset + bottom_rel)
-            if not np.isfinite(bottom_distance):
-                return rot_world, trans_world
-            trans_world = trans_world - fixed_camera_road_normal * bottom_distance
-            return rot_world, trans_world
+            grounded_rot, grounded_trans, _meta = ProjectExecutor._ground_pose_to_plane(
+                rot_world,
+                trans_world,
+                local_vertices,
+                scale,
+                fixed_camera_road_normal,
+                fixed_camera_road_offset,
+                axis_roles=axis_roles,
+                metrics=metrics,
+            )
+            return grounded_rot, grounded_trans
 
         def _fixed_camera_world_pose(frame_id: int, rotation, translation):
             rot_world = np.eye(3, dtype=np.float64) if rotation is None else np.asarray(rotation, dtype=np.float64).reshape(3, 3)
@@ -9645,6 +9842,18 @@ class ProjectExecutor:
                 return True
             return isinstance(rec.get("pose_optimizer"), dict)
 
+        def _record_pose_metrics(rec: dict) -> dict:
+            quality = rec.get("quality") if isinstance(rec.get("quality"), dict) else {}
+            pose_optimizer = rec.get("pose_optimizer") if isinstance(rec.get("pose_optimizer"), dict) else {}
+            metrics = {}
+            for candidate in (
+                pose_optimizer.get("metrics"),
+                rec.get("metrics"),
+                quality.get("metrics"),
+            ):
+                if isinstance(candidate, dict):
+                    metrics.update(candidate)
+            return metrics
 
         stage = Usd.Stage.CreateNew(str(usdc_path))
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
@@ -9725,6 +9934,10 @@ class ProjectExecutor:
             "enabled": fixed_camera_reference_frame_id is not None,
             "reference_frame_id": fixed_camera_reference_frame_id,
         }
+        if isinstance(fixed_camera_road_plane, dict):
+            coord_report["fixed_camera"]["grounding_plane_source"] = fixed_camera_road_plane.get("source")
+            coord_report["fixed_camera"]["grounding_plane_normal_world"] = fixed_camera_road_plane.get("normal_world")
+            coord_report["fixed_camera"]["grounding_plane_offset"] = fixed_camera_road_plane.get("offset")
         if conversion_report_path is not None:
             Path(conversion_report_path).write_text(json.dumps(coord_report, indent=2), encoding="utf-8")
 
@@ -9915,21 +10128,23 @@ class ProjectExecutor:
                 frame_num = float(rec.get("frame_id", 0))
                 cx, cy, cz = rec["centroid_world"]
                 scale = np.asarray(rec.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64).reshape(3)
+                axis_roles = None
+                if isinstance(rec.get("axis_roles"), dict):
+                    axis_roles = rec.get("axis_roles")
+                elif isinstance(traj_data, dict) and isinstance(traj_data.get("axis_roles"), dict):
+                    axis_roles = traj_data.get("axis_roles")
+                elif isinstance(entry, dict) and isinstance(entry.get("axis_roles"), dict):
+                    axis_roles = entry.get("axis_roles")
 
-                if _is_pose_optimizer_record(rec):
-                    rot_world, trans_world = _fixed_camera_world_pose(
-                        int(frame_num),
-                        rec.get("rotation_matrix"),
-                        [cx, cy, cz],
-                    )
-                else:
-                    rot_world, trans_world = _fixed_camera_grounded_pose(
-                        int(frame_num),
-                        rec.get("rotation_matrix"),
-                        [cx, cy, cz],
-                        verts,
-                        scale,
-                    )
+                rot_world, trans_world = _fixed_camera_grounded_pose(
+                    int(frame_num),
+                    rec.get("rotation_matrix"),
+                    [cx, cy, cz],
+                    verts,
+                    scale,
+                    axis_roles=axis_roles,
+                    metrics=_record_pose_metrics(rec),
+                )
                 rot_usd, trans_usd = convert_world_pose_to_usd(
                     rot_world,
                     trans_world,
@@ -10320,18 +10535,11 @@ class ProjectExecutor:
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
             object_visibility_frames = self._object_visibility_frames_from_index()
 
-            fixed_camera_reference_frame_id = None
-            fixed_camera_road_plane = None
-            if pose_road_geometry_path and Path(pose_road_geometry_path).exists():
-                try:
-                    road_geometry = self._json_load(pose_road_geometry_path)
-                except Exception:
-                    road_geometry = {}
-                if str(road_geometry.get("default_plane_policy", "")).strip().lower() == "global_for_fixed_camera":
-                    fixed_camera_reference_frame_id = self._background_assets_target_frame_id(geometry)
-                    if fixed_camera_reference_frame_id is None:
-                        fixed_camera_reference_frame_id = self._pose_target_frame_id() or 1
-                    fixed_camera_road_plane = select_road_plane_for_frame(road_geometry, int(fixed_camera_reference_frame_id), policy="global_for_fixed_camera")
+            fixed_camera_reference_frame_id, fixed_camera_road_plane = self._scene_export_fixed_camera_grounding_plane(
+                geometry,
+                pose_road_geometry_path,
+                fallback_frame_id=self._pose_target_frame_id() or 1,
+            )
 
             usdc_path = out_dir / "scene.usdc"
             conversion_report_path = out_dir / "conversion_report.json"

@@ -88,12 +88,28 @@ def test_pose_track_scale_prior_ignores_seed_track_and_outliers() -> None:
     assert prior["frame_ids"] == [3, 4]
 
 
-def test_generic_temporal_speedup_args_require_temporal_prior(tmp_path: Path) -> None:
+def test_generic_temporal_speedup_args_use_stable_first_frame_settings_without_prior(tmp_path: Path) -> None:
     task_dir = tmp_path / "obj_000001@000001"
     task_dir.mkdir()
     (task_dir / "task.json").write_text(json.dumps({"task_id": "obj_000001@000001"}), encoding="utf-8")
 
-    assert ProjectExecutor._generic_temporal_speedup_args_for_task(task_dir) == []
+    args = ProjectExecutor._generic_temporal_speedup_args_for_task(task_dir)
+
+    assert args == [
+        "--batch_gpu_size",
+        "64",
+        "--stage1_iters",
+        "5",
+        "--stage2_iters",
+        "4",
+        "--stage3_iters",
+        "6",
+        "--top_k_candidates",
+        "16",
+        "--refine_top_k",
+        "4",
+    ]
+    assert "--proxy_face_count" not in args
 
 
 def test_generic_temporal_speedup_args_apply_after_prior_exists(tmp_path: Path) -> None:
@@ -117,16 +133,18 @@ def test_generic_temporal_speedup_args_apply_after_prior_exists(tmp_path: Path) 
     )
 
     assert ProjectExecutor._generic_temporal_speedup_args_for_task(task_dir) == [
+        "--batch_gpu_size",
+        "64",
+        "--stage1_iters",
+        "5",
+        "--stage2_iters",
+        "4",
+        "--stage3_iters",
+        "6",
         "--top_k_candidates",
         "8",
         "--refine_top_k",
         "2",
-        "--stage1_iters",
-        "4",
-        "--stage2_iters",
-        "3",
-        "--stage3_iters",
-        "6",
     ]
 
 

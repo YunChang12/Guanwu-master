@@ -17,6 +17,7 @@ from guanwu.video.features.spatial.scene_background_assets import (
     _fill_low_candidate_dynamic_regions,
     _estimate_global_road_plane_from_semantic_depth,
     _resolve_openai_image_edit_size,
+    _resolve_depth_for_frame,
     _road_surface_mask_for_static_gap,
     build_dynamic_mask,
     expand_road_mask_with_side_boundaries,
@@ -81,6 +82,82 @@ def test_resolve_openai_image_edit_size_uses_original_image_dimensions(tmp_path:
     assert _resolve_openai_image_edit_size(image_path, "original") == "64x36"
     assert _resolve_openai_image_edit_size(image_path, "same") == "64x36"
     assert _resolve_openai_image_edit_size(image_path, "1024x1024") == "1024x1024"
+
+
+def test_resolve_depth_for_frame_maps_pipeline_frame_to_zero_based_wildgs_depth(tmp_path: Path) -> None:
+    depth_dir = tmp_path / "depth_maps"
+    nested_depth_dir = depth_dir / "depth_maps"
+    nested_depth_dir.mkdir(parents=True)
+    expected = nested_depth_dir / "00002.npy"
+    stale_one_based = nested_depth_dir / "00003.npy"
+    np.save(expected, np.zeros((2, 2), dtype=np.float32))
+    np.save(stale_one_based, np.ones((2, 2), dtype=np.float32))
+
+    assert _resolve_depth_for_frame(depth_dir, 3) == expected
+
+
+def test_generate_background_assets_defaults_to_first_frame_and_zero_based_wildgs_depth(tmp_path: Path) -> None:
+    rgb = np.full((24, 32, 3), 96, dtype=np.uint8)
+    mask = np.zeros((24, 32), dtype=bool)
+    mask[10:18, 12:20] = True
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "detections": str(
+                            _write_frame(
+                                tmp_path / "frame_000001",
+                                1,
+                                rgb,
+                                [_mask_instance("obj_000001", "object", mask, [12, 10, 20, 18])],
+                            )
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[28.0, 0.0, 16.0], [0.0, 28.0, 12.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    wildgs_depth_dir = tmp_path / "wildgs_depth"
+    wildgs_depth_dir.mkdir()
+    np.save(wildgs_depth_dir / "00000.npy", np.full((24, 32), 6.0, dtype=np.float32))
+    external_depth = tmp_path / "external_depth.npy"
+    np.save(external_depth, np.full((24, 32), 9.0, dtype=np.float32))
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary_path,
+        output_dir=tmp_path / "background_assets",
+        depth_maps_dir=wildgs_depth_dir,
+        camera_trajectory_path=camera_trajectory,
+        clean_depth_estimator=lambda _path: {
+            "depth_path": external_depth,
+            "source": "depth_anything3_clean_rgb",
+        },
+        grid_stride=4,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["target_frame_id"] == 1
+    assert manifest["quality"]["depth_calibration_reference"].endswith("00000.npy")
+    assert manifest["quality"]["depth_calibration_reference_frame_mapping"] == "pipeline_frame_id_minus_1"
+    assert manifest["quality"]["wildgs_depth_index"] == 0
 
 
 def test_openai_image_cleaner_uses_api_size_and_saves_original_dimensions(tmp_path: Path) -> None:

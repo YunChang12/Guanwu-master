@@ -105,6 +105,7 @@ class VideoProjectExecutor:
             for object_id in workspace.video_pipeline.task_foreground_object_ids
             if str(object_id).strip()
         ]
+        context.config.settings.zaiwu.background_target_frame_id = workspace.video_pipeline.background_target_frame_id
         context.config.settings.zaiwu.background_cleaner = workspace.video_pipeline.background_cleaner
         context.config.settings.zaiwu.background_cleaner_config_path = (
             workspace.video_pipeline.background_cleaner_config_path

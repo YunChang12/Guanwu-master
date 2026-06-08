@@ -22,6 +22,7 @@ def test_default_config():
     assert cfg.video_pipeline.background_mode == "auto"
     assert cfg.video_pipeline.background_disable_road_semantics is False
     assert cfg.video_pipeline.task_foreground_object_ids == []
+    assert cfg.video_pipeline.background_target_frame_id == 1
     assert cfg.video_pipeline.background_cleaner == "temporal"
     assert cfg.video_pipeline.background_cleaner_config_path is None
     assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"
@@ -57,6 +58,7 @@ video_pipeline:
   background_disable_road_semantics: true
   task_foreground_object_ids:
     - obj_000009
+  background_target_frame_id: 1
   background_cleaner: openai_image_edit
   background_cleaner_config_path: /root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml
   background_cleaner_model: gpt-image-2
@@ -84,6 +86,7 @@ datasets:
     assert cfg.video_pipeline.background_mode == "tabletop_task"
     assert cfg.video_pipeline.background_disable_road_semantics is True
     assert cfg.video_pipeline.task_foreground_object_ids == ["obj_000009"]
+    assert cfg.video_pipeline.background_target_frame_id == 1
     assert cfg.video_pipeline.background_cleaner == "openai_image_edit"
     assert cfg.video_pipeline.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"

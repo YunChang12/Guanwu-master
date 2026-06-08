@@ -354,6 +354,58 @@ def _visible_region_from_truncation(
         return None
 
 
+def _locked_mesh_up_axis(mesh_axis_prior: dict[str, Any] | None) -> tuple[int, float] | None:
+    if not isinstance(mesh_axis_prior, dict):
+        return None
+    if not mesh_axis_prior.get("available") or not bool(mesh_axis_prior.get("lock_up_sign")):
+        return None
+    try:
+        axis_idx = int(mesh_axis_prior.get("up_axis_idx"))
+    except Exception:
+        return None
+    if axis_idx not in (0, 1, 2):
+        return None
+    try:
+        up_sign = -1.0 if float(mesh_axis_prior.get("up_sign", 1.0)) < 0.0 else 1.0
+    except Exception:
+        up_sign = 1.0
+    return axis_idx, up_sign
+
+
+def locked_up_axis_orientation_reject_reason(
+    result: dict[str, Any],
+    mesh_axis_prior: dict[str, Any] | None,
+    args: argparse.Namespace,
+    motion_phase: str,
+) -> str | None:
+    if _normalize_generic_motion_phase(motion_phase) != "contact_calibration":
+        return None
+    if _locked_mesh_up_axis(mesh_axis_prior) is None:
+        return None
+    if not bool(result.get("support_plane_enabled")):
+        return None
+    try:
+        support_confidence = float(result.get("support_plane_confidence") or 0.0)
+    except Exception:
+        support_confidence = 0.0
+    min_confidence = float(getattr(args, "support_acceptance_min_confidence", 0.70))
+    if support_confidence < min_confidence:
+        return None
+    angle_value = result.get("support_normal_angle_deg")
+    if angle_value is None:
+        return None
+    try:
+        angle_deg = float(angle_value)
+    except Exception:
+        return None
+    if not math.isfinite(angle_deg):
+        return None
+    max_angle = float(getattr(args, "support_locked_up_max_angle_deg", 50.0))
+    if angle_deg > max_angle:
+        return "locked_up_axis_support_angle_above_threshold"
+    return None
+
+
 def support_bottom_points_for_pose(
     vertices: np.ndarray,
     rotation_cam: np.ndarray,
@@ -364,6 +416,7 @@ def support_bottom_points_for_pose(
     bottom_percentile: float = 3.0,
     mode: str = "local_axis",
     max_points: int = 512,
+    mesh_axis_prior: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select support-contact vertices from the object's local bottom band.
 
@@ -384,6 +437,7 @@ def support_bottom_points_for_pose(
     mode_value = str(mode or "local_axis").lower()
     bottom_percentile = float(bottom_percentile)
 
+    locked_up_axis = _locked_mesh_up_axis(mesh_axis_prior)
     if mode_value in {"signed_distance", "plane_distance"}:
         support_cutoff = float(np.percentile(signed_dist, bottom_percentile))
         selector = signed_dist <= support_cutoff
@@ -392,15 +446,25 @@ def support_bottom_points_for_pose(
         alignment = 0.0
         angle_deg = None
     else:
-        axis_vectors = [rotation[:, idx] for idx in range(3)]
-        signed_alignments = [
-            float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal))))
-            for axis in axis_vectors
-        ]
-        support_axis_index = int(np.argmax(np.abs(signed_alignments)))
-        support_axis_sign = 1.0 if signed_alignments[support_axis_index] >= 0.0 else -1.0
-        alignment = abs(float(signed_alignments[support_axis_index]))
-        angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+        if locked_up_axis is not None:
+            support_axis_index, support_axis_sign = locked_up_axis
+            support_axis = rotation[:, support_axis_index] * support_axis_sign
+            signed_alignment = float(
+                np.dot(support_axis, normal)
+                / max(1e-12, float(np.linalg.norm(support_axis)) * float(np.linalg.norm(normal)))
+            )
+            alignment = float(np.clip(signed_alignment, -1.0, 1.0))
+            angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+        else:
+            axis_vectors = [rotation[:, idx] for idx in range(3)]
+            signed_alignments = [
+                float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal))))
+                for axis in axis_vectors
+            ]
+            support_axis_index = int(np.argmax(np.abs(signed_alignments)))
+            support_axis_sign = 1.0 if signed_alignments[support_axis_index] >= 0.0 else -1.0
+            alignment = abs(float(signed_alignments[support_axis_index]))
+            angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
         local_support_coord = scaled_local[:, support_axis_index] * support_axis_sign
         local_cutoff = float(np.percentile(local_support_coord, bottom_percentile))
         selector = local_support_coord <= local_cutoff
@@ -429,6 +493,7 @@ def support_orientation_score(
     *,
     sigma_deg: float = 20.0,
     tolerance_deg: float = 4.0,
+    mesh_axis_prior: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normal = _normalize(np.asarray(plane.get("normal"), dtype=np.float64))
     if normal.shape != (3,) or float(np.linalg.norm(normal)) <= 1e-12:
@@ -441,14 +506,24 @@ def support_orientation_score(
             "support_orientation_penalty": 0.0,
         }
     rotation = np.asarray(rotation_cam, dtype=np.float64)
-    alignments = []
-    for idx in range(3):
-        axis = rotation[:, idx]
-        alignments.append(float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal)))))
-    axis_index = int(np.argmax(np.abs(alignments)))
-    axis_sign = 1.0 if alignments[axis_index] >= 0.0 else -1.0
-    alignment = abs(float(alignments[axis_index]))
-    angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+    locked_up_axis = _locked_mesh_up_axis(mesh_axis_prior)
+    if locked_up_axis is not None:
+        axis_index, axis_sign = locked_up_axis
+        support_axis = rotation[:, axis_index] * axis_sign
+        alignment = float(
+            np.dot(support_axis, normal)
+            / max(1e-12, float(np.linalg.norm(support_axis)) * float(np.linalg.norm(normal)))
+        )
+        angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
+    else:
+        alignments = []
+        for idx in range(3):
+            axis = rotation[:, idx]
+            alignments.append(float(np.dot(axis, normal) / max(1e-12, float(np.linalg.norm(axis)) * float(np.linalg.norm(normal)))))
+        axis_index = int(np.argmax(np.abs(alignments)))
+        axis_sign = 1.0 if alignments[axis_index] >= 0.0 else -1.0
+        alignment = abs(float(alignments[axis_index]))
+        angle_deg = float(math.degrees(math.acos(np.clip(alignment, -1.0, 1.0))))
     excess = max(0.0, angle_deg - float(tolerance_deg))
     sigma = max(1e-6, float(sigma_deg))
     score = float(math.exp(-((excess / sigma) ** 2)))
@@ -772,6 +847,14 @@ def _background_geometry_reference_from_task(task: dict[str, Any]) -> dict[str, 
     return None
 
 
+def _pose_context_from_task(task: dict[str, Any]) -> dict[str, Any]:
+    for key in ("generic_pose_context", "vehicle_pose_context"):
+        context = task.get(key)
+        if isinstance(context, dict):
+            return context
+    return {}
+
+
 def _select_background_support_surface(reference: dict[str, Any]) -> dict[str, Any]:
     if reference.get("normal_world") is not None and reference.get("offset") is not None:
         return reference
@@ -920,6 +1003,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         depth_prior: DepthConsistencyPrior | None,
         support_plane: dict[str, Any] | None = None,
         t_world_from_cam: np.ndarray | None = None,
+        mesh_axis_prior: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -932,6 +1016,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         self.depth_prior = depth_prior
         self.support_plane = support_plane or {"available": False, "support_plane_confidence": 0.0}
         self.t_world_from_cam = None if t_world_from_cam is None else np.asarray(t_world_from_cam, dtype=np.float64)
+        self.mesh_axis_prior = dict(mesh_axis_prior) if isinstance(mesh_axis_prior, dict) else None
         self.current_initializer_metadata: dict[str, Any] = {}
         self._target_contour_edge = temporal_fast._mask_contour(self.full_mask)
         self._target_contour_distance = cv2.distanceTransform(
@@ -1052,6 +1137,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 bottom_percentile=bottom_percentile,
                 mode=str(getattr(self.generic_args, "support_bottom_selection_mode", "local_axis")),
                 max_points=512,
+                mesh_axis_prior=self.mesh_axis_prior,
             )
             support_cam = np.asarray(bottom["support_points_cam"], dtype=np.float64)
             contact = support_contact_score(
@@ -1071,6 +1157,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 self.support_plane,
                 sigma_deg=float(getattr(self.generic_args, "support_orientation_sigma_deg", 20.0)),
                 tolerance_deg=float(getattr(self.generic_args, "support_orientation_tolerance_deg", 4.0)),
+                mesh_axis_prior=self.mesh_axis_prior,
             )
             support_cutoff = float(bottom["support_bottom_signed_m"])
             floating_distance = max(support_cutoff, 0.0)
@@ -1224,6 +1311,14 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             and (not support_enabled or support_confidence < float(getattr(self.generic_args, "support_acceptance_min_confidence", 0.70)))
         ):
             reject_reasons.append("contact_support_plane_low_confidence")
+        locked_up_reject_reason = locked_up_axis_orientation_reject_reason(
+            result,
+            getattr(self, "mesh_axis_prior", None),
+            self.generic_args,
+            motion_phase,
+        )
+        if locked_up_reject_reason is not None:
+            reject_reasons.append(locked_up_reject_reason)
         return {
             "acceptance_status": "accepted" if not reject_reasons else "rejected",
             "reject_reasons": reject_reasons,
@@ -2479,6 +2574,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
 
     task = fast.read_json(sample_dir / "task.json")
     motion_constraints_report = apply_generic_task_motion_constraints(args, task)
+    pose_context = _pose_context_from_task(task)
+    mesh_axis_prior = pose_context.get("mesh_axis_prior") if isinstance(pose_context.get("mesh_axis_prior"), dict) else None
     image = fast.read_image(sample_dir / "image.jpg", mode="color")
     crop_mask = fast.read_image(sample_dir / "mask.png", mode="gray")
     crop_image_path = sample_dir / "crop.jpg"
@@ -2495,7 +2592,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     mesh = fast.load_glb_as_mesh(mesh_path)
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int32)
-    mesh_meta = fast.mesh_axis_metadata(vertices)
+    mesh_meta = fast.apply_mesh_axis_prior(fast.mesh_axis_metadata(vertices), mesh_axis_prior)
     proxy_vertices, proxy_faces = fast.build_proxy_mesh(vertices, faces, target_faces=args.proxy_face_count)
 
     t_world_from_cam = np.asarray(task["camera"]["T_world_from_cam"], dtype=np.float64)
@@ -2625,6 +2722,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         depth_prior=depth_prior,
         support_plane=support_plane,
         t_world_from_cam=t_world_from_cam,
+        mesh_axis_prior=mesh_axis_prior,
     )
     proxy_evaluator = GenericPoseEvaluator(
         vertices=proxy_vertices,
@@ -3063,6 +3161,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--support_orientation_penalty_weight", type=float, default=0.0)
     parser.add_argument("--support_orientation_sigma_deg", type=float, default=20.0)
     parser.add_argument("--support_orientation_tolerance_deg", type=float, default=4.0)
+    parser.add_argument("--support_locked_up_max_angle_deg", type=float, default=50.0)
     parser.add_argument("--support_aligned_seed_enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--support_alignment_trigger_deg", type=float, default=6.0)
     parser.add_argument("--support_aligned_seed_score_margin", type=float, default=0.20)

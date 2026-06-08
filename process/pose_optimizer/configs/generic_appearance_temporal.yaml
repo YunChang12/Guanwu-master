@@ -176,6 +176,7 @@ support_penetration_penalty_weight: 1.00
 support_orientation_penalty_weight: 0.35
 support_orientation_sigma_deg: 8.0
 support_orientation_tolerance_deg: 2.0
+support_locked_up_max_angle_deg: 50.0
 support_aligned_seed_enabled: true
 support_alignment_trigger_deg: 6.0
 support_aligned_seed_score_margin: 0.20

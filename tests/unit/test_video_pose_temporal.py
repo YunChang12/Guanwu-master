@@ -278,6 +278,164 @@ def test_generic_phase_switches_to_free_motion_when_bbox_area_shrinks_after_cont
     assert phase == "free_motion"
 
 
+def test_generic_phase_switches_to_free_motion_on_moderate_lift_motion() -> None:
+    contact_records = []
+    for frame_id in range(1, 11):
+        record = _pose_record(frame_id=frame_id, scale=1.0, mask_iou=0.90, bbox_iou=0.90)
+        record["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "depth_confidence": 1.0,
+                "depth_score": 0.92,
+                "detection_bbox": [430.0, 180.0, 583.0, 361.0],
+            }
+        )
+        contact_records.append(record)
+    scale_prior = ProjectExecutor._generic_contact_scale_prior(contact_records)
+
+    phase = ProjectExecutor._generic_pose_phase_for_frame(
+        frame_id=192,
+        track_scale_prior=scale_prior,
+        previous_records=contact_records,
+        inst={"bbox": [409.0, 121.0, 568.0, 318.0]},
+    )
+
+    assert scale_prior is not None
+    assert phase == "free_motion"
+
+
+def test_generic_phase_switches_to_free_motion_on_moderate_bbox_area_shrink() -> None:
+    contact_records = []
+    for frame_id in range(1, 11):
+        record = _pose_record(frame_id=frame_id, scale=1.0, mask_iou=0.90, bbox_iou=0.90)
+        record["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "depth_confidence": 1.0,
+                "depth_score": 0.92,
+                "detection_bbox": [100.0, 100.0, 200.0, 200.0],
+            }
+        )
+        contact_records.append(record)
+    scale_prior = ProjectExecutor._generic_contact_scale_prior(contact_records)
+
+    phase = ProjectExecutor._generic_pose_phase_for_frame(
+        frame_id=30,
+        track_scale_prior=scale_prior,
+        previous_records=contact_records,
+        inst={"bbox": [100.0, 100.0, 193.0, 193.0]},
+    )
+
+    assert scale_prior is not None
+    assert phase == "free_motion"
+
+
+def test_generic_static_pose_reuse_decision_reuses_stable_bbox_and_mask() -> None:
+    previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
+    previous["metrics"].update(
+        {
+            "generic_pose_motion_phase": "contact_calibration",
+            "detection_bbox": [430.0, 180.0, 583.0, 361.0],
+            "mask_area_px": 25000,
+        }
+    )
+
+    decision = ProjectExecutor._generic_static_pose_reuse_decision(
+        frame_id=43,
+        generic_phase="contact_calibration",
+        previous_accepted=previous,
+        inst={"bbox": [430.2, 180.1, 583.1, 361.0]},
+        current_mask_area_px=25020,
+        track_scale_prior={"available": True, "scale": [1.0, 1.0, 1.0]},
+        last_optimizer_frame_id=42,
+        revalidation_interval=10,
+    )
+
+    assert decision["reuse"] is True
+    assert decision["reuse_reason"] == "bbox_and_mask_stable"
+    assert decision["generic_pose_motion_phase"] == "static_supported"
+
+
+def test_generic_static_pose_reuse_decision_forces_periodic_revalidation() -> None:
+    previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
+    previous["metrics"].update(
+        {
+            "generic_pose_motion_phase": "contact_calibration",
+            "detection_bbox": [430.0, 180.0, 583.0, 361.0],
+            "mask_area_px": 25000,
+        }
+    )
+
+    decision = ProjectExecutor._generic_static_pose_reuse_decision(
+        frame_id=52,
+        generic_phase="contact_calibration",
+        previous_accepted=previous,
+        inst={"bbox": [430.0, 180.0, 583.0, 361.0]},
+        current_mask_area_px=25000,
+        track_scale_prior={"available": True, "scale": [1.0, 1.0, 1.0]},
+        last_optimizer_frame_id=42,
+        revalidation_interval=10,
+    )
+
+    assert decision["reuse"] is False
+    assert decision["reason"] == "periodic_revalidation_due"
+
+
+def test_reused_generic_pose_record_exports_as_track_frame(tmp_path: Path) -> None:
+    executor = object.__new__(ProjectExecutor)
+    previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
+    previous["metrics"].update(
+        {
+            "generic_pose_motion_phase": "contact_calibration",
+            "detection_bbox": [430.0, 180.0, 583.0, 361.0],
+            "mask_area_px": 25000,
+        }
+    )
+    decision = ProjectExecutor._generic_static_pose_reuse_decision(
+        frame_id=43,
+        generic_phase="contact_calibration",
+        previous_accepted=previous,
+        inst={"bbox": [430.0, 180.0, 583.0, 361.0]},
+        current_mask_area_px=25000,
+        track_scale_prior={"available": True, "scale": [1.2, 1.2, 1.2]},
+        last_optimizer_frame_id=42,
+        revalidation_interval=10,
+    )
+
+    record = executor._reused_generic_pose_record(
+        obj_id="obj_000001",
+        frame_id=43,
+        previous_record=previous,
+        inst={"bbox": [430.0, 180.0, 583.0, 361.0]},
+        current_mask_area_px=25000,
+        timestamp_sec=1.43,
+        task_dir=tmp_path / "tasks" / "obj_000001@000043",
+        result_dir=tmp_path / "results" / "obj_000001@000043",
+        reuse_decision=decision,
+        track_scale_prior={"available": True, "scale": [1.2, 1.2, 1.2]},
+    )
+    frame = ProjectExecutor._edge_pose_track_frame(record, pose_source="generic_appearance_temporal")
+
+    assert decision["reuse"] is True
+    assert record is not None
+    assert record["reason"] == "pose_reuse_static_bbox"
+    assert record["pose"]["scale"] == [1.2, 1.2, 1.2]
+    assert frame is not None
+    assert frame["frame_id"] == 43
+    assert frame["quality"]["metrics"]["generic_pose_motion_phase"] == "static_supported"
+    assert frame["quality"]["metrics"]["reused_from_frame_id"] == 42
+    assert frame["quality"]["metrics"]["scale_locked"] is True
+    assert Path(record["report"]).exists()
+
+
 def test_generic_pose_record_preserves_support_contact_metrics(tmp_path: Path) -> None:
     report_path = tmp_path / "optimization_report.json"
     task_path = tmp_path / "task.json"
@@ -2807,6 +2965,48 @@ def test_generic_pose_context_includes_background_geometry_reference() -> None:
     assert updated["background_geometry_reference"]["offset"] == 0.125
 
 
+def test_generic_pose_context_for_frame_preserves_mesh_axis_prior() -> None:
+    mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "up_sign_candidates": [1.0],
+        "lock_up_sign": True,
+    }
+    base_context = {
+        "schema": "vehicle_pose_context.v1",
+        "object_id": "obj_000003",
+        "frame_id": 1,
+        "mesh_axis_prior": mesh_axis_prior,
+    }
+    reference = {
+        "schema": "guanwu.background_geometry_reference.v1",
+        "reference_type": "support_surface",
+        "source": "clean_background_depth",
+        "target_frame_id": 1,
+        "normal_world": [0.0, -1.0, 0.0],
+        "offset": 0.125,
+    }
+
+    context = ProjectExecutor._generic_pose_context_for_frame(
+        base_context=base_context,
+        obj_id="obj_000003",
+        frame_id=1,
+        generic_phase="contact_calibration",
+        depth_map_path=Path("/tmp/depth_maps/00000.npy"),
+        background_geometry_reference=reference,
+    )
+
+    assert context["schema"] == "generic_pose_context.v1"
+    assert context["object_id"] == "obj_000003"
+    assert context["frame_id"] == 1
+    assert context["support_plane"] == "auto"
+    assert context["generic_pose_motion_phase"] == "contact_calibration"
+    assert context["mesh_axis_prior"] == mesh_axis_prior
+    assert context["depth_map_path"] == "/tmp/depth_maps/00000.npy"
+    assert context["background_geometry_reference"]["source"] == "clean_background_depth"
+
+
 def test_refine_candidate_selection_always_keeps_task_json_corrected_pose() -> None:
     args = type("Args", (), {"pareto_refine_selection_enabled": True})()
     candidates = [
@@ -3526,6 +3726,13 @@ def test_pose_all_frame_candidate_frame_ids_keep_small_generic_frames_at_500_px(
 
 def test_pose_target_frame_mode_reads_all_frames_env(monkeypatch) -> None:
     monkeypatch.setenv("GUANWU_POSE_TARGET_FRAME_MODE", "all_frames")
+
+    assert ProjectExecutor._pose_target_frame_mode() == "all_frames"
+
+
+def test_pose_target_frame_mode_defaults_to_all_frames(monkeypatch) -> None:
+    monkeypatch.delenv("GUANWU_POSE_ALL_FRAMES", raising=False)
+    monkeypatch.delenv("GUANWU_POSE_TARGET_FRAME_MODE", raising=False)
 
     assert ProjectExecutor._pose_target_frame_mode() == "all_frames"
 

@@ -136,6 +136,15 @@ _GENERIC_POSE_METRIC_KEYS = (
     "scale_lock_applied",
     "generic_track_scale_prior_scale",
     "generic_pose_motion_phase",
+    "pose_reuse_source",
+    "pose_reuse_reason",
+    "reused_from_frame_id",
+    "scale_locked",
+    "mask_area_px",
+    "bbox_stability_iou",
+    "bbox_stability_center_delta_px",
+    "bbox_stability_size_delta_ratio",
+    "mask_area_delta_ratio",
     "optional_prior_score",
     "support_plane_enabled",
     "support_plane_disable_reason",
@@ -1410,10 +1419,11 @@ class ProjectExecutor:
                 "config_path": getattr(zaiwu_settings, "background_cleaner_config_path", None),
                 "model": getattr(zaiwu_settings, "background_cleaner_model", "gpt-image-2"),
             }
+            background_target_frame_id = max(1, int(getattr(zaiwu_settings, "background_target_frame_id", 1) or 1))
             background_assets = generate_target_frame_background_assets(
                 summary_path=summary_path,
                 output_dir=out_dir / "background_assets",
-                target_frame_id=3,
+                target_frame_id=background_target_frame_id,
                 depth_maps_dir=wildgs_outputs.get("depth_maps_dir"),
                 camera_trajectory_path=camera_path,
                 clean_depth_estimator=self._build_background_clean_depth_estimator(
@@ -1434,7 +1444,7 @@ class ProjectExecutor:
                 background_cleaner_reference_frame_id=getattr(
                     zaiwu_settings,
                     "background_cleaner_reference_frame_id",
-                    1,
+                    background_target_frame_id,
                 ),
             )
             _logger.info(
@@ -2347,6 +2357,7 @@ class ProjectExecutor:
         rejected_frames = 0
         failed_frames = 0
         reused_frames = 0
+        static_reused_frames = 0
         tracked_objects = 0
         skipped_objects = 0
         target_accepted_objects = 0
@@ -2506,6 +2517,8 @@ class ProjectExecutor:
             previous_candidate_prior: dict | None = None
             previous_anchor: dict | None = None
             stable_temporal_streak = 0
+            last_optimizer_frame_id: int | None = None
+            object_static_reused = 0
             all_frame_prior_records: list[dict] = []
             frame_records: dict[str, dict] = {}
             candidate_records_by_frame: dict[int, list[dict]] = {}
@@ -2617,20 +2630,65 @@ class ProjectExecutor:
                         previous_records=all_frame_prior_records if all_frames_mode else accepted_records,
                         inst=inst,
                     )
-                    vehicle_pose_context = {
-                        "schema": "generic_pose_context.v1",
-                        "object_id": obj_id,
-                        "frame_id": int(frame_id),
-                        "support_plane": "auto",
-                        "generic_pose_motion_phase": generic_phase,
-                    }
                     depth_map_path = self._resolve_depth_map_for_frame(depth_maps_dir, int(frame_id))
-                    if depth_map_path:
-                        vehicle_pose_context["depth_map_path"] = str(depth_map_path)
-                    vehicle_pose_context = self._generic_pose_context_with_background_geometry_reference(
-                        vehicle_pose_context,
-                        background_geometry_reference,
+                    vehicle_pose_context = self._generic_pose_context_for_frame(
+                        base_context=vehicle_pose_context,
+                        obj_id=obj_id,
+                        frame_id=int(frame_id),
+                        generic_phase=generic_phase,
+                        depth_map_path=depth_map_path,
+                        background_geometry_reference=background_geometry_reference,
                     )
+                    reuse_decision = self._generic_static_pose_reuse_decision(
+                        frame_id=int(frame_id),
+                        generic_phase=generic_phase,
+                        previous_accepted=previous_candidate_prior if all_frames_mode else previous_accepted,
+                        inst=inst,
+                        current_mask_area_px=int(np.count_nonzero(mask)),
+                        track_scale_prior=track_scale_prior,
+                        last_optimizer_frame_id=last_optimizer_frame_id,
+                    )
+                    if reuse_decision.get("reuse"):
+                        reuse_record = self._reused_generic_pose_record(
+                            obj_id=obj_id,
+                            frame_id=int(frame_id),
+                            previous_record=previous_candidate_prior if all_frames_mode else previous_accepted,
+                            inst=inst,
+                            current_mask_area_px=int(np.count_nonzero(mask)),
+                            timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
+                            task_dir=task_dir,
+                            result_dir=result_dir,
+                            reuse_decision=reuse_decision,
+                            track_scale_prior=track_scale_prior,
+                        )
+                        if reuse_record is not None:
+                            if not all_frames_mode:
+                                accepted_frames += 1
+                            reused_frames += 1
+                            static_reused_frames += 1
+                            object_static_reused += 1
+                            if all_frames_mode:
+                                if self._pose_record_updates_temporal_anchor(reuse_record):
+                                    previous_candidate_prior = reuse_record
+                                    stable_temporal_streak = 0
+                                elif self._pose_record_promotes_temporal_candidate(
+                                    reuse_record,
+                                    stable_streak_count=stable_temporal_streak,
+                                ):
+                                    previous_candidate_prior = reuse_record
+                                else:
+                                    stable_temporal_streak += 1
+                                all_frame_prior_records.append(reuse_record)
+                                candidate_records_by_frame[int(frame_id)] = [reuse_record]
+                                if self._generic_pose_motion_phase_from_metrics(reuse_record.get("metrics", {})) == "contact_calibration":
+                                    generic_contact_records.append(reuse_record)
+                            else:
+                                accepted_records.append(reuse_record)
+                                previous_accepted = reuse_record
+                                if self._generic_pose_motion_phase_from_metrics(reuse_record.get("metrics", {})) == "contact_calibration":
+                                    generic_contact_records.append(reuse_record)
+                            frame_records[f"frame_{int(frame_id):06d}"] = reuse_record
+                            continue
                 vehicle_pose_context["temporal_window"] = {
                     "mode": target_frame_mode,
                     "base_radius": int(target_window_radius),
@@ -2668,6 +2726,7 @@ class ProjectExecutor:
                 object_attempted += 1
                 if can_reuse_result:
                     reused_frames += 1
+                    last_optimizer_frame_id = int(frame_id)
                     run_info = {
                         "returncode": 0,
                         "stdout_tail": "",
@@ -2681,6 +2740,8 @@ class ProjectExecutor:
                         else self._run_edge_contour_fast(task_dir, result_dir)
                     )
                     report_path = result_dir / "optimization_report.json"
+                    if run_info.get("returncode") == 0 and report_path.exists():
+                        last_optimizer_frame_id = int(frame_id)
                 record_base = {
                     "frame_id": int(frame_id),
                     "task": str(task_path),
@@ -2752,6 +2813,8 @@ class ProjectExecutor:
                     timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
                     run_info=run_info,
                 )
+                if generic_mode:
+                    pose_record.setdefault("metrics", {})["mask_area_px"] = int(np.count_nonzero(mask))
                 candidate_records = self._edge_pose_candidate_records_from_report(
                     obj_id=obj_id,
                     frame_id=int(frame_id),
@@ -2762,6 +2825,9 @@ class ProjectExecutor:
                     timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
                     run_info=run_info,
                 )
+                if generic_mode:
+                    for candidate_record in candidate_records:
+                        candidate_record.setdefault("metrics", {})["mask_area_px"] = int(np.count_nonzero(mask))
                 accepted_candidate_records = []
                 for candidate_record in candidate_records:
                     candidate_report = self._pose_optimizer_report_from_candidate(report, candidate_record)
@@ -3056,6 +3122,7 @@ class ProjectExecutor:
                 "accepted_frame_count": len(frames),
                 "rejected_frame_count": object_rejected,
                 "failed_frame_count": object_failed,
+                "static_pose_reuse_frame_count": object_static_reused,
                 "target_report": target_record.get("report"),
                 "target_output_dir": target_record.get("output_dir"),
                 "target_metrics": target_record.get("metrics", {}),
@@ -3108,6 +3175,7 @@ class ProjectExecutor:
             "rejected_pose_frame_count": rejected_frames,
             "failed_pose_frame_count": failed_frames,
             "reused_pose_frame_count": reused_frames,
+            "static_pose_reuse_frame_count": static_reused_frames,
             "per_frame_count": len(per_frame_object_poses),
             "road_geometry_available": bool((road_geometry or {}).get("available")),
             "strategy": pose_strategy,
@@ -3200,7 +3268,9 @@ class ProjectExecutor:
         raw = str(os.environ.get("GUANWU_POSE_TARGET_FRAME_MODE", "")).strip().lower().replace("-", "_")
         if raw in {"all", "all_frame", "all_frames", "full", "full_video", "sequence"}:
             return "all_frames"
-        return "single_frame"
+        if raw in {"single", "single_frame", "target", "target_frame"}:
+            return "single_frame"
+        return "all_frames"
 
     @staticmethod
     def _background_road_geometry_from_manifest(geometry) -> dict | None:
@@ -5271,6 +5341,105 @@ class ProjectExecutor:
             records.append(record)
         return records
 
+    def _reused_generic_pose_record(
+        self,
+        *,
+        obj_id: str,
+        frame_id: int,
+        previous_record: dict | None,
+        inst: dict | None,
+        current_mask_area_px: int | float | None,
+        timestamp_sec: float,
+        task_dir: Path,
+        result_dir: Path,
+        reuse_decision: dict,
+        track_scale_prior: dict | None,
+    ) -> dict | None:
+        if not isinstance(previous_record, dict):
+            return None
+        pose = previous_record.get("pose") if isinstance(previous_record.get("pose"), dict) else {}
+        if (
+            not self._valid_vec3_like(pose.get("translation_world"))
+            or not self._valid_vec3_like(pose.get("scale"))
+            or not isinstance(pose.get("rotation_matrix"), list)
+        ):
+            return None
+        task_dir.mkdir(parents=True, exist_ok=True)
+        result_dir.mkdir(parents=True, exist_ok=True)
+        current_bbox = None if inst is None else inst.get("bbox_xyxy") or inst.get("bbox")
+        prev_metrics = previous_record.get("metrics") if isinstance(previous_record.get("metrics"), dict) else {}
+        metrics = dict(prev_metrics)
+        metrics.update(
+            {
+                "detection_bbox": [float(v) for v in current_bbox[:4]] if isinstance(current_bbox, (list, tuple)) and len(current_bbox) >= 4 else current_bbox,
+                "mask_area_px": int(current_mask_area_px or 0),
+                "generic_pose_motion_phase": str(reuse_decision.get("generic_pose_motion_phase") or "static_supported"),
+                "pose_reuse_source": "previous_accepted_pose",
+                "pose_reuse_reason": str(reuse_decision.get("reuse_reason") or "bbox_and_mask_stable"),
+                "reused_from_frame_id": int(reuse_decision.get("reused_from_frame_id") or previous_record.get("frame_id") or 0),
+                "scale_locked": bool(reuse_decision.get("scale_locked", True)),
+                "bbox_stability_iou": reuse_decision.get("iou"),
+                "bbox_stability_center_delta_px": reuse_decision.get("center_delta_px"),
+                "bbox_stability_size_delta_ratio": reuse_decision.get("size_delta_ratio"),
+                "mask_area_delta_ratio": reuse_decision.get("mask_area_delta_ratio"),
+            }
+        )
+        if isinstance(track_scale_prior, dict) and self._valid_vec3_like(track_scale_prior.get("scale")):
+            metrics["generic_track_scale_prior_scale"] = track_scale_prior.get("scale")
+            pose_scale = [float(v) for v in track_scale_prior.get("scale")]
+        else:
+            pose_scale = [float(v) for v in pose.get("scale")]
+        report_path = result_dir / "pose_reuse_record.json"
+        task_path = task_dir / "task.json"
+        if not task_path.exists():
+            self._json_dump(
+                task_path,
+                {
+                    "task_id": f"{obj_id}@{int(frame_id):06d}",
+                    "object_id": obj_id,
+                    "frame_idx": int(frame_id),
+                    "reuse": {
+                        "source": "pose_reuse_static_bbox",
+                        "reused_from_frame_id": metrics["reused_from_frame_id"],
+                        "reason": metrics["pose_reuse_reason"],
+                    },
+                },
+            )
+        record = {
+            "object_id": obj_id,
+            "frame_id": int(frame_id),
+            "timestamp_sec": float(timestamp_sec),
+            "task": str(task_path),
+            "output_dir": str(result_dir),
+            "report": str(report_path),
+            "pose": {
+                "translation_world": [float(v) for v in pose.get("translation_world")],
+                "rotation_matrix": pose.get("rotation_matrix"),
+                "scale": pose_scale,
+            },
+            "metrics": metrics,
+            "status": "accepted",
+            "reason": "pose_reuse_static_bbox",
+            "returncode": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "reused_optimizer_result": False,
+            "reused_previous_pose": True,
+        }
+        self._json_dump(
+            report_path,
+            {
+                "schema": "guanwu.pose_reuse_record.v1",
+                "status": "accepted",
+                "reason": "pose_reuse_static_bbox",
+                "reused_from_frame_id": metrics["reused_from_frame_id"],
+                "optimized_corrected_pose_world": record["pose"],
+                "json_bbox": metrics.get("detection_bbox"),
+                "metrics": metrics,
+            },
+        )
+        return record
+
     @staticmethod
     def _pose_optimizer_report_from_candidate(base_report: dict, candidate_record: dict) -> dict:
         report = dict(base_report)
@@ -5940,7 +6109,7 @@ class ProjectExecutor:
     def _generic_pose_motion_phase_from_metrics(metrics: dict | None) -> str:
         value = (metrics or {}).get("generic_pose_motion_phase") or (metrics or {}).get("pose_motion_phase") or "auto"
         phase = str(value or "auto").strip().lower().replace("-", "_")
-        if phase in {"contact", "table", "tabletop", "supported", "support", "contact_calibration"}:
+        if phase in {"contact", "table", "tabletop", "supported", "support", "contact_calibration", "static_supported"}:
             return "contact_calibration"
         if phase in {"free", "free_motion", "lift", "lifted", "grasp", "grasped", "manipulated"}:
             return "free_motion"
@@ -5955,7 +6124,7 @@ class ProjectExecutor:
         inst: dict | None = None,
         min_contact_frames: int = 10,
         lift_bbox_center_delta_px: float = 18.0,
-        bbox_area_shrink_ratio: float = 0.70,
+        bbox_area_shrink_ratio: float = 0.88,
         bbox_area_shrink_min_contact_frames: int = 3,
     ) -> str:
         if not track_scale_prior:
@@ -5997,6 +6166,123 @@ class ProjectExecutor:
             if anchor_center_y - current_center_y >= float(lift_bbox_center_delta_px):
                 return "free_motion"
         return "contact_calibration"
+
+    @staticmethod
+    def _bbox_xyxy_stats(current_bbox: object, previous_bbox: object) -> dict:
+        if (
+            not isinstance(current_bbox, (list, tuple))
+            or len(current_bbox) < 4
+            or not isinstance(previous_bbox, (list, tuple))
+            or len(previous_bbox) < 4
+        ):
+            return {"valid": False}
+        try:
+            cx1, cy1, cx2, cy2 = [float(v) for v in current_bbox[:4]]
+            px1, py1, px2, py2 = [float(v) for v in previous_bbox[:4]]
+        except Exception:
+            return {"valid": False}
+        current_w = max(0.0, cx2 - cx1)
+        current_h = max(0.0, cy2 - cy1)
+        previous_w = max(0.0, px2 - px1)
+        previous_h = max(0.0, py2 - py1)
+        if min(current_w, current_h, previous_w, previous_h) <= 0.0:
+            return {"valid": False}
+        ix1 = max(cx1, px1)
+        iy1 = max(cy1, py1)
+        ix2 = min(cx2, px2)
+        iy2 = min(cy2, py2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        current_area = current_w * current_h
+        previous_area = previous_w * previous_h
+        union = current_area + previous_area - inter
+        center_delta = math.hypot(0.5 * (cx1 + cx2 - px1 - px2), 0.5 * (cy1 + cy2 - py1 - py2))
+        previous_diag = math.hypot(previous_w, previous_h)
+        size_delta_ratio = max(
+            abs(current_w - previous_w) / max(previous_w, 1e-6),
+            abs(current_h - previous_h) / max(previous_h, 1e-6),
+        )
+        return {
+            "valid": True,
+            "iou": float(inter / max(union, 1e-6)),
+            "center_delta_px": float(center_delta),
+            "center_delta_ratio": float(center_delta / max(previous_diag, 1e-6)),
+            "size_delta_ratio": float(size_delta_ratio),
+            "current_area_px": float(current_area),
+            "previous_area_px": float(previous_area),
+        }
+
+    @staticmethod
+    def _generic_static_pose_reuse_decision(
+        *,
+        frame_id: int,
+        generic_phase: str,
+        previous_accepted: dict | None,
+        inst: dict | None,
+        current_mask_area_px: int | float | None,
+        track_scale_prior: dict | None,
+        last_optimizer_frame_id: int | None,
+        revalidation_interval: int = 12,
+        bbox_iou_min: float = 0.995,
+        bbox_center_delta_ratio_max: float = 0.003,
+        bbox_size_delta_ratio_max: float = 0.006,
+        mask_area_delta_ratio_max: float = 0.02,
+    ) -> dict:
+        if ProjectExecutor._generic_pose_motion_phase_from_metrics({"generic_pose_motion_phase": generic_phase}) != "contact_calibration":
+            return {"reuse": False, "reason": "not_contact_phase"}
+        if not track_scale_prior:
+            return {"reuse": False, "reason": "missing_scale_prior"}
+        if not isinstance(previous_accepted, dict) or previous_accepted.get("status") not in {None, "accepted"}:
+            return {"reuse": False, "reason": "missing_previous_accepted"}
+        if last_optimizer_frame_id is not None:
+            try:
+                if int(frame_id) - int(last_optimizer_frame_id) >= max(1, int(revalidation_interval)):
+                    return {"reuse": False, "reason": "periodic_revalidation_due"}
+            except Exception:
+                return {"reuse": False, "reason": "invalid_last_optimizer_frame"}
+        pose = previous_accepted.get("pose") if isinstance(previous_accepted.get("pose"), dict) else {}
+        if (
+            not ProjectExecutor._valid_vec3_like(pose.get("translation_world"))
+            or not ProjectExecutor._valid_vec3_like(pose.get("scale"))
+            or not isinstance(pose.get("rotation_matrix"), list)
+        ):
+            return {"reuse": False, "reason": "invalid_previous_pose"}
+        metrics = previous_accepted.get("metrics") if isinstance(previous_accepted.get("metrics"), dict) else {}
+        previous_bbox = metrics.get("detection_bbox") or metrics.get("bbox_xyxy") or metrics.get("bbox")
+        current_bbox = None if inst is None else inst.get("bbox_xyxy") or inst.get("bbox")
+        bbox_stats = ProjectExecutor._bbox_xyxy_stats(current_bbox, previous_bbox)
+        if not bbox_stats.get("valid"):
+            return {"reuse": False, "reason": "invalid_bbox"}
+        if float(bbox_stats["iou"]) < float(bbox_iou_min):
+            return {"reuse": False, "reason": "bbox_iou_changed", **bbox_stats}
+        if float(bbox_stats["center_delta_ratio"]) > float(bbox_center_delta_ratio_max):
+            return {"reuse": False, "reason": "bbox_center_changed", **bbox_stats}
+        if float(bbox_stats["size_delta_ratio"]) > float(bbox_size_delta_ratio_max):
+            return {"reuse": False, "reason": "bbox_size_changed", **bbox_stats}
+        previous_mask_area = metrics.get("mask_area_px")
+        mask_delta_ratio = None
+        try:
+            previous_mask_value = float(previous_mask_area)
+            current_mask_value = float(current_mask_area_px)
+            if previous_mask_value > 0.0 and current_mask_value > 0.0:
+                mask_delta_ratio = abs(current_mask_value - previous_mask_value) / max(previous_mask_value, 1e-6)
+        except Exception:
+            mask_delta_ratio = None
+        if mask_delta_ratio is not None and mask_delta_ratio > float(mask_area_delta_ratio_max):
+            return {
+                "reuse": False,
+                "reason": "mask_area_changed",
+                "mask_area_delta_ratio": float(mask_delta_ratio),
+                **bbox_stats,
+            }
+        return {
+            "reuse": True,
+            "reuse_reason": "bbox_and_mask_stable",
+            "generic_pose_motion_phase": "static_supported",
+            "reused_from_frame_id": int(previous_accepted.get("frame_id") or 0),
+            "scale_locked": True,
+            "mask_area_delta_ratio": None if mask_delta_ratio is None else float(mask_delta_ratio),
+            **bbox_stats,
+        }
 
     @staticmethod
     def _bbox_center_y(bbox: object) -> float | None:
@@ -8025,6 +8311,37 @@ class ProjectExecutor:
             payload = dict(normalized)
         updated["background_geometry_reference"] = payload
         return updated
+
+    @staticmethod
+    def _generic_pose_context_for_frame(
+        *,
+        base_context: dict | None,
+        obj_id: str,
+        frame_id: int,
+        generic_phase: str,
+        depth_map_path: Path | str | None,
+        background_geometry_reference: dict | None,
+    ) -> dict:
+        context: dict = {
+            "schema": "generic_pose_context.v1",
+            "object_id": obj_id,
+            "frame_id": int(frame_id),
+            "support_plane": "auto",
+            "generic_pose_motion_phase": generic_phase,
+        }
+        if isinstance(base_context, dict):
+            mesh_axis_prior = base_context.get("mesh_axis_prior")
+            if isinstance(mesh_axis_prior, dict) and mesh_axis_prior.get("available"):
+                try:
+                    context["mesh_axis_prior"] = json.loads(json.dumps(mesh_axis_prior))
+                except Exception:
+                    context["mesh_axis_prior"] = dict(mesh_axis_prior)
+        if depth_map_path:
+            context["depth_map_path"] = str(depth_map_path)
+        return ProjectExecutor._generic_pose_context_with_background_geometry_reference(
+            context,
+            background_geometry_reference,
+        )
 
     @staticmethod
     def _tabletop_reference_from_clean_depth_manifest(manifest: dict, geometry) -> dict | None:

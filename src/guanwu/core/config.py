@@ -49,6 +49,7 @@ class VideoPipelineConfig(BaseModel):
     background_mode: str = "auto"
     background_disable_road_semantics: bool = False
     task_foreground_object_ids: list[str] = Field(default_factory=list)
+    background_target_frame_id: int = 1
     background_cleaner: str = "temporal"
     background_cleaner_config_path: str | None = None
     background_cleaner_model: str = "gpt-image-2"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
+import pytest
 
 
 def test_appearance_prior_scores_background_leakage_lower_than_target() -> None:
@@ -247,6 +248,169 @@ def test_support_bottom_points_use_local_axis_to_penalize_tilted_contact() -> No
     assert aligned_contact["support_contact_coverage"] > 0.95
     assert tilted_contact["support_contact_coverage"] < 0.60
     assert aligned_contact["support_contact_score"] > tilted_contact["support_contact_score"]
+
+
+def test_support_bottom_points_respect_locked_mesh_up_axis() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        support_bottom_points_for_pose,
+        support_orientation_score,
+    )
+
+    vertices = np.array(
+        [
+            [-0.5, -1.0, -0.2],
+            [0.5, -1.0, -0.2],
+            [-0.5, 1.0, 0.2],
+            [0.5, 1.0, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    plane = {
+        "normal": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "offset": 0.0,
+        "support_plane_confidence": 1.0,
+    }
+    rotation = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+
+    bottom = support_bottom_points_for_pose(
+        vertices,
+        rotation,
+        np.zeros(3, dtype=np.float64),
+        np.ones(3, dtype=np.float64),
+        plane,
+        bottom_percentile=10.0,
+        mode="local_axis",
+        mesh_axis_prior=mesh_axis_prior,
+    )
+    orientation = support_orientation_score(rotation, plane, mesh_axis_prior=mesh_axis_prior)
+
+    assert bottom["support_axis_index"] == 1
+    assert bottom["support_axis_sign"] == 1.0
+    assert orientation["support_axis_index"] == 1
+    assert orientation["support_axis_sign"] == 1.0
+    assert orientation["support_normal_angle_deg"] == pytest.approx(90.0)
+
+
+def test_locked_mesh_up_axis_rejects_sideways_contact_orientation() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        locked_up_axis_orientation_reject_reason,
+    )
+
+    mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    args = argparse.Namespace(
+        support_acceptance_min_confidence=0.70,
+        support_locked_up_max_angle_deg=50.0,
+    )
+
+    reason = locked_up_axis_orientation_reject_reason(
+        {
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_normal_angle_deg": 89.0,
+        },
+        mesh_axis_prior,
+        args,
+        "contact_calibration",
+    )
+
+    assert reason == "locked_up_axis_support_angle_above_threshold"
+    assert (
+        locked_up_axis_orientation_reject_reason(
+            {
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_normal_angle_deg": 35.0,
+            },
+            mesh_axis_prior,
+            args,
+            "contact_calibration",
+        )
+        is None
+    )
+    assert (
+        locked_up_axis_orientation_reject_reason(
+            {
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_normal_angle_deg": 89.0,
+            },
+            mesh_axis_prior,
+            args,
+            "free_motion",
+        )
+        is None
+    )
+
+
+def test_generic_pose_acceptance_rejects_locked_up_axis_sideways_contact() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = GenericPoseEvaluator.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 100.0
+    evaluator.truncation_info = {"is_truncated": False}
+    evaluator.mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="contact_calibration",
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_min_threshold=0.0,
+        generic_contact_depth_min_score=0.70,
+        generic_acceptance_depth_confidence_high=999.0,
+        generic_contact_support_max_separation_m=0.05,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        support_locked_up_max_angle_deg=50.0,
+    )
+
+    acceptance = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.90,
+            "bbox_center_error_px": 4.0,
+            "projection_valid_ratio": 0.95,
+            "depth_confidence": 0.0,
+            "depth_score": 1.0,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.0,
+            "support_normal_angle_deg": 89.0,
+        }
+    )
+
+    assert acceptance["acceptance_status"] == "rejected"
+    assert "locked_up_axis_support_angle_above_threshold" in acceptance["reject_reasons"]
 
 
 def test_support_orientation_score_penalizes_axis_tilt_softly() -> None:

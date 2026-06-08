@@ -248,7 +248,7 @@ def generate_target_frame_background_assets(
     *,
     summary_path: str | Path,
     output_dir: str | Path,
-    target_frame_id: int = 3,
+    target_frame_id: int = 1,
     road_geometry_path: str | Path | None = None,
     object_index_path: str | Path | None = None,
     depth_maps_dir: str | Path | None = None,
@@ -1968,6 +1968,8 @@ def _try_generate_depth_background_asset(
     quality = dict(quality)
     quality["depth_background_source"] = "wildgs_depth_map_aligned_to_clean_rgb"
     quality["depth_background_manifest"] = result["manifest_path"]
+    quality["depth_background_reference_frame_mapping"] = "pipeline_frame_id_minus_1"
+    quality["wildgs_depth_index"] = _wildgs_depth_index_for_pipeline_frame(target_frame_id)
     return {
         "assets": {
             "clean_depth": assets.get("clean_depth"),
@@ -2020,6 +2022,8 @@ def _try_generate_depth_background_asset_from_estimator(
     quality = dict(manifest.get("quality", {}))
     quality["depth_background_source"] = source
     quality["depth_background_manifest"] = result["manifest_path"]
+    quality["depth_background_reference_frame_mapping"] = "pipeline_frame_id_minus_1"
+    quality["wildgs_depth_index"] = _wildgs_depth_index_for_pipeline_frame(target_frame_id)
     quality.update(calibration_quality)
     quality.update(extra_quality)
     return {
@@ -2114,6 +2118,8 @@ def _calibrate_depth_to_metric_reference(
     return calibrated_path, {
         "depth_calibration_source": "wildgs_metric_depth_affine",
         "depth_calibration_reference": str(reference_path),
+        "depth_calibration_reference_frame_mapping": "pipeline_frame_id_minus_1",
+        "wildgs_depth_index": _wildgs_depth_index_for_pipeline_frame(target_frame_id),
         "depth_calibration_scale": float(scale),
         "depth_calibration_bias": float(bias),
         "depth_calibration_sample_count": int(np.count_nonzero(mask)),
@@ -2286,28 +2292,41 @@ def _fit_tabletop_plane(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarr
     return normal, offset, distances[finite]
 
 
+def _wildgs_depth_index_for_pipeline_frame(target_frame_id: int) -> int:
+    return max(int(target_frame_id) - 1, 0)
+
+
 def _resolve_depth_for_frame(depth_maps_dir: str | Path, target_frame_id: int) -> Path | None:
     root = Path(depth_maps_dir)
-    candidates = [
-        root / f"{int(target_frame_id):05d}.npy",
-        root / f"{max(int(target_frame_id) - 1, 0):05d}.npy",
-        root / "depth_maps" / f"{int(target_frame_id):05d}.npy",
-        root / "depth_maps" / f"{max(int(target_frame_id) - 1, 0):05d}.npy",
-    ]
+    wildgs_index = _wildgs_depth_index_for_pipeline_frame(target_frame_id)
+    legacy_one_based_index = max(int(target_frame_id), 0)
+    roots = [root, root / "depth_maps", root / "depth_maps" / "depth_maps"]
+    candidates = [candidate_root / f"{wildgs_index:05d}.npy" for candidate_root in roots]
+    if legacy_one_based_index != wildgs_index:
+        candidates.extend(candidate_root / f"{legacy_one_based_index:05d}.npy" for candidate_root in roots)
     for path in candidates:
         try:
             if path.exists():
                 return path
         except OSError:
             continue
+    files: list[Path] = []
+    for candidate_root in roots:
+        try:
+            files.extend(candidate_root.glob("*.npy"))
+        except OSError:
+            continue
+    files = sorted(set(files), key=lambda p: (int(p.stem) if p.stem.isdigit() else 10**9, str(p)))
+    numeric_files = [path for path in files if path.stem.isdigit()]
+    if numeric_files:
+        return min(numeric_files, key=lambda p: abs(int(p.stem) - wildgs_index))
     try:
         files = sorted(root.glob("*.npy"), key=lambda p: int(p.stem))
     except OSError:
         files = []
     if not files:
         return None
-    target = max(int(target_frame_id) - 1, 0)
-    return min(files, key=lambda p: abs(int(p.stem) - target))
+    return min(files, key=lambda p: abs(int(p.stem) - wildgs_index))
 
 
 def _camera_for_frame(camera_trajectory_path: str | Path, target_frame_id: int) -> dict[str, Any] | None:

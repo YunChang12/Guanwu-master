@@ -1609,6 +1609,88 @@ def test_generic_refine_contact_phase_uses_full_scoring_during_fine_search() -> 
     assert "rendered_mask" in refined
 
 
+def test_generic_refine_depth_enabled_uses_full_scoring_during_fine_search() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import refine_candidate_stages
+
+    class DummyEvaluator:
+        def __init__(self, coarse: bool, label: str):
+            self.generic_args = argparse.Namespace(generic_coarse_scoring=coarse)
+            self.label = label
+            self.delta_modes: list[bool] = []
+            self.absolute_modes: list[bool] = []
+
+        def set_initializer_metadata(self, _metadata):
+            pass
+
+        def evaluate_delta(self, base_translation, base_rotation, base_scale, params, keep_mask=False):
+            self.delta_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(base_translation, base_rotation, base_scale, score=1.0, keep_mask=keep_mask)
+
+        def evaluate_delta_batch(self, base_translation, base_rotation, base_scale, params_batch, **_kwargs):
+            self.delta_modes.extend([bool(self.generic_args.generic_coarse_scoring)] * len(params_batch))
+            return [
+                self._result(base_translation, base_rotation, base_scale, score=1.0, keep_mask=False)
+                for _params in params_batch
+            ]
+
+        def evaluate_absolute(self, translation, rotation, scale, keep_mask=False):
+            self.absolute_modes.append(bool(self.generic_args.generic_coarse_scoring))
+            return self._result(translation, rotation, scale, score=2.0, keep_mask=keep_mask)
+
+        def _result(self, translation, rotation, scale, *, score: float, keep_mask: bool):
+            result = {
+                "score": score,
+                "mask_iou": 0.8,
+                "soft_mask_iou": 0.8,
+                "bbox_iou": 0.8,
+                "bbox_center_error_px": 0.0,
+                "projected_bbox": [1.0, 1.0, 5.0, 5.0],
+                "translation_cam": np.asarray(translation, dtype=np.float64),
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "depth_enabled": True,
+                "depth_confidence": 1.0,
+                "depth_score": 1.0,
+                "depth_error": 0.0,
+                "valid_depth_ratio": 0.8,
+                "acceptance_status": "accepted",
+            }
+            if keep_mask:
+                result["rendered_mask"] = np.ones((8, 8), dtype=np.uint8)
+            return result
+
+    candidate = {
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "candidate"},
+    }
+    proxy = DummyEvaluator(coarse=True, label="proxy")
+    full = DummyEvaluator(coarse=False, label="full")
+    args = argparse.Namespace(
+        stage1_iters=0,
+        stage2_iters=0,
+        stage3_iters=0,
+        step_decay=0.5,
+        max_translation_delta=0.8,
+        max_rotation_delta_deg=45.0,
+        scale_min_factor=0.5,
+        scale_max_factor=2.2,
+        save_full_history=False,
+        generic_lightweight_search_scoring=True,
+        generic_pose_motion_phase="free_motion",
+        depth_enabled=True,
+        generic_depth_refine_fine_full_scoring=True,
+    )
+
+    refined, _history = refine_candidate_stages(candidate, proxy, full, args)
+
+    assert full.delta_modes == [False, False]
+    assert full.absolute_modes == [False]
+    assert refined["score"] == 2.0
+    assert "rendered_mask" in refined
+
+
 def test_generic_support_penalty_uses_normalized_observation_gate() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
@@ -1776,6 +1858,311 @@ def test_generic_config_enables_depth_support_defaults() -> None:
     assert cfg["save_fg_bg_samples"] is False
     assert cfg["save_candidate_appearance_overlay"] is False
     assert cfg["save_score_breakdown"] is False
+
+
+def test_generic_motion_constraints_keep_target_depth_in_free_motion() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import apply_generic_task_motion_constraints
+
+    args = argparse.Namespace(
+        generic_pose_motion_phase="auto",
+        depth_enabled=True,
+        generic_depth_weight=0.15,
+        generic_free_motion_depth_enabled=True,
+        generic_free_motion_depth_weight=0.60,
+        support_plane_enabled="auto",
+        support_plane_weight=0.12,
+        support_penalty_weight=0.15,
+        support_orientation_penalty_weight=0.35,
+        support_aligned_seed_enabled=True,
+        generic_locked_scale_init_factors="0.95,1.0,1.05",
+        scale_min_factor=0.5,
+        scale_max_factor=2.2,
+        generic_scale_prior_weight=0.30,
+        generic_scale_prior_sigma_log=0.20,
+    )
+    task = {
+        "vehicle_pose_context": {
+            "generic_pose_motion_phase": "free_motion",
+            "track_scale_prior": {
+                "scale": [0.1, 0.1, 0.1],
+                "source": "contact_supported_scale",
+                "sample_count": 10,
+                "frame_ids": [1, 2, 3],
+            },
+        }
+    }
+
+    report = apply_generic_task_motion_constraints(args, task)
+
+    assert report["phase"] == "free_motion"
+    assert args.depth_enabled is True
+    assert args.generic_depth_weight == 0.60
+    assert args.support_plane_enabled == "disabled"
+    assert args.support_plane_weight == 0.0
+    assert args.support_penalty_weight == 0.0
+    assert args.support_orientation_penalty_weight == 0.0
+    assert args.generic_scale_lock_applied is True
+    assert task["corrected_pose"]["scale"] == [0.1, 0.1, 0.1]
+
+
+def test_depth_snapped_candidate_shifts_camera_z_by_median_depth_error() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        make_depth_snapped_candidate,
+    )
+
+    class DummyEvaluator:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate_absolute(self, translation, rotation, scale):
+            translation = np.asarray(translation, dtype=np.float64)
+            self.calls.append(translation.copy())
+            depth_error = float(translation[2] - 3.0)
+            return {
+                "score": 0.8,
+                "translation_cam": translation,
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "projected_bbox": [1.0, 1.0, 10.0, 10.0],
+                "depth_enabled": True,
+                "depth_confidence": 1.0,
+                "depth_score": float(np.exp(-abs(depth_error) / 0.06)),
+                "depth_error": abs(depth_error),
+                "median_rendered_depth": float(translation[2]),
+                "median_observed_depth": 3.0,
+            }
+
+    candidate = {
+        "score": 0.9,
+        "translation_cam": np.array([0.2, -0.1, 3.25], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "projected_bbox": [1.0, 1.0, 10.0, 10.0],
+        "depth_enabled": True,
+        "depth_confidence": 1.0,
+        "depth_error": 0.25,
+        "valid_depth_ratio": 0.80,
+        "median_rendered_depth": 3.25,
+        "median_observed_depth": 3.0,
+        "initializer_metadata": {"source": "visual_candidate"},
+    }
+
+    snapped = make_depth_snapped_candidate(
+        candidate,
+        DummyEvaluator(),
+        argparse.Namespace(generic_depth_snap_candidate_max_delta_m=0.60),
+    )
+
+    assert snapped is not None
+    assert np.allclose(snapped["translation_cam"], [0.2, -0.1, 3.0])
+    assert snapped["depth_error"] == pytest.approx(0.0)
+    assert snapped["initializer_metadata"]["source"] == "depth_snapped_seed"
+    assert snapped["initializer_metadata"]["base_source"] == "visual_candidate"
+    assert snapped["initializer_metadata"]["depth_snap_delta_m"] == pytest.approx(-0.25)
+
+
+def test_depth_snapped_candidate_temporarily_full_scores_coarse_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        make_depth_snapped_candidate,
+    )
+
+    class DummyEvaluator:
+        def __init__(self):
+            self.generic_args = argparse.Namespace(generic_coarse_scoring=True)
+            self.modes = []
+
+        def evaluate_absolute(self, translation, rotation, scale):
+            self.modes.append(bool(self.generic_args.generic_coarse_scoring))
+            translation = np.asarray(translation, dtype=np.float64)
+            depth_error = float(translation[2] - 3.0)
+            return {
+                "score": 0.8,
+                "translation_cam": translation,
+                "rotation_cam": np.asarray(rotation, dtype=np.float64),
+                "scale": np.asarray(scale, dtype=np.float64),
+                "projected_bbox": [1.0, 1.0, 10.0, 10.0],
+                "depth_enabled": not bool(self.generic_args.generic_coarse_scoring),
+                "depth_confidence": 0.0 if self.generic_args.generic_coarse_scoring else 1.0,
+                "depth_score": 0.0 if self.generic_args.generic_coarse_scoring else float(np.exp(-abs(depth_error) / 0.06)),
+                "depth_error": None if self.generic_args.generic_coarse_scoring else abs(depth_error),
+                "valid_depth_ratio": 0.0 if self.generic_args.generic_coarse_scoring else 0.8,
+                "median_rendered_depth": None if self.generic_args.generic_coarse_scoring else float(translation[2]),
+                "median_observed_depth": None if self.generic_args.generic_coarse_scoring else 3.0,
+            }
+
+    evaluator = DummyEvaluator()
+    candidate = {
+        "score": 0.9,
+        "translation_cam": np.array([0.2, -0.1, 3.25], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "projected_bbox": [1.0, 1.0, 10.0, 10.0],
+        "initializer_metadata": {"source": "coarse_search"},
+    }
+
+    snapped = make_depth_snapped_candidate(
+        candidate,
+        evaluator,
+        argparse.Namespace(
+            depth_enabled=True,
+            generic_depth_snap_candidate_max_delta_m=0.60,
+        ),
+    )
+
+    assert snapped is not None
+    assert evaluator.modes == [False, False]
+    assert evaluator.generic_args.generic_coarse_scoring is True
+    assert np.allclose(snapped["translation_cam"], [0.2, -0.1, 3.0])
+
+
+def test_select_generic_refine_candidates_preserves_visual_and_depth_buckets() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    def candidate(score: float, depth_score: float, tx: float, source: str) -> dict[str, object]:
+        return {
+            "score": score,
+            "depth_score": depth_score,
+            "depth_confidence": 1.0,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": {"source": source},
+        }
+
+    candidates = [
+        candidate(10.0, 0.10, 0.0, "visual_top"),
+        candidate(9.0, 0.20, 1.0, "visual_second"),
+        candidate(3.0, 0.99, 2.0, "depth_good"),
+        candidate(2.0, 0.98, 3.0, "depth_second"),
+    ]
+
+    selected = select_generic_refine_candidates(
+        candidates,
+        refine_top_k=3,
+        depth_bucket_top_k=1,
+        visual_bucket_top_k=2,
+    )
+    sources = [item.get("initializer_metadata", {}).get("source") for item in selected]
+
+    assert sources[:2] == ["visual_top", "visual_second"]
+    assert "depth_good" in sources
+
+
+def test_merge_depth_snapped_initial_candidates_preserves_low_visual_depth_seed() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import merge_depth_snapped_initial_candidates
+
+    def candidate(score: float, tx: float, source: str, depth_score: float = 0.0) -> dict[str, object]:
+        return {
+            "score": score,
+            "depth_score": depth_score,
+            "depth_confidence": 1.0 if depth_score > 0.0 else 0.0,
+            "valid_depth_ratio": 0.8 if depth_score > 0.0 else 0.0,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": {"source": source},
+        }
+
+    visual_candidates = [
+        candidate(10.0, 0.0, "visual_0"),
+        candidate(9.0, 1.0, "visual_1"),
+    ]
+    depth_seed = candidate(1.0, 2.0, "depth_snapped_seed", depth_score=0.99)
+
+    merged = merge_depth_snapped_initial_candidates(
+        visual_candidates,
+        [depth_seed],
+        argparse.Namespace(top_k_candidates=2, refine_top_k=2),
+    )
+    sources = [item.get("initializer_metadata", {}).get("source") for item in merged]
+
+    assert sources[:2] == ["visual_0", "visual_1"]
+    assert "depth_snapped_seed" in sources
+
+
+def test_merge_protected_initial_candidates_preserves_support_and_depth_seeds() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import merge_protected_initial_candidates
+
+    def candidate(score: float, tx: float, source: str, depth_score: float = 0.0) -> dict[str, object]:
+        return {
+            "score": score,
+            "depth_score": depth_score,
+            "depth_confidence": 1.0 if depth_score > 0.0 else 0.0,
+            "valid_depth_ratio": 0.8 if depth_score > 0.0 else 0.0,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": {"source": source},
+        }
+
+    visual_candidates = [
+        candidate(10.0, 0.0, "visual_0"),
+        candidate(9.0, 1.0, "visual_1"),
+    ]
+    support_seed = candidate(0.5, 2.0, "support_aligned_seed")
+    depth_seed = candidate(0.4, 3.0, "depth_snapped_seed", depth_score=0.99)
+
+    merged = merge_protected_initial_candidates(
+        visual_candidates,
+        support_aligned_seeds=[support_seed],
+        depth_snapped_seeds=[depth_seed],
+        args=argparse.Namespace(top_k_candidates=2, refine_top_k=2, generic_depth_refine_bucket_top_k=1),
+    )
+    sources = [item.get("initializer_metadata", {}).get("source") for item in merged]
+
+    assert sources[:2] == ["visual_0", "visual_1"]
+    assert "support_aligned_seed" in sources
+    assert "depth_snapped_seed" in sources
+
+
+def test_generic_pose_acceptance_rejects_free_motion_depth_outlier() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = GenericPoseEvaluator.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 100.0
+    evaluator.truncation_info = {"is_truncated": False}
+    evaluator.mesh_axis_prior = None
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="free_motion",
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_min_threshold=0.0,
+        generic_contact_depth_min_score=0.70,
+        generic_acceptance_depth_confidence_high=999.0,
+        generic_depth_hard_gate_enabled=True,
+        generic_depth_gate_min_confidence=0.70,
+        generic_depth_min_overlap_ratio=0.35,
+        generic_depth_hard_gate_max_error_m=0.12,
+        generic_contact_support_max_separation_m=0.05,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+    )
+
+    acceptance = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.90,
+            "bbox_center_error_px": 4.0,
+            "projection_valid_ratio": 0.95,
+            "depth_confidence": 1.0,
+            "depth_score": 0.05,
+            "depth_error": 0.18,
+            "valid_depth_ratio": 0.72,
+            "support_plane_enabled": False,
+            "support_plane_confidence": 0.0,
+        }
+    )
+
+    assert acceptance["acceptance_status"] == "rejected"
+    assert "target_depth_error_above_threshold" in acceptance["reject_reasons"]
 
 
 def test_generic_proxy_scoring_forces_light_mode_while_full_keeps_config(monkeypatch, tmp_path) -> None:

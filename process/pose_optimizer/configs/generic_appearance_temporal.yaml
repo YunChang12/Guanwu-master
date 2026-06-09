@@ -80,7 +80,7 @@ depth_unit: meter
 depth_fallback_to_wildgs: false
 depth_min_valid_ratio: 0.10
 min_valid_depth_ratio: 0.10
-depth_sigma: 0.75
+depth_sigma: 0.06
 depth_robust_stat: median
 depth_use_mask_erode: true
 depth_mask_erode_px: 5
@@ -88,6 +88,18 @@ depth_error_mode: median_z
 depth_render_face_limit: 8000
 depth_outlier_score_threshold: 0.10
 depth_outlier_penalty: 0.0
+generic_free_motion_depth_enabled: true
+generic_free_motion_depth_weight: 0.60
+generic_depth_refine_fine_full_scoring: true
+generic_depth_refine_bucket_top_k: 1
+generic_visual_refine_bucket_top_k: 2
+generic_depth_snap_candidate_enabled: true
+generic_depth_snap_candidate_source_top_k: 8
+generic_depth_snap_candidate_max_delta_m: 0.60
+generic_depth_min_overlap_ratio: 0.35
+generic_depth_gate_min_confidence: 0.70
+generic_depth_hard_gate_enabled: true
+generic_depth_hard_gate_max_error_m: 0.12
 
 edge_score_enabled: true
 edge_weight: 0.20

@@ -10603,31 +10603,6 @@ class ProjectExecutor:
             if fixed_camera_T_ref is None:
                 fixed_camera_reference_frame_id = None
 
-        def _fixed_camera_grounded_pose(
-            frame_id: int,
-            rotation,
-            translation,
-            local_vertices,
-            scale,
-            *,
-            axis_roles=None,
-            metrics=None,
-        ):
-            rot_world, trans_world = _fixed_camera_world_pose(frame_id, rotation, translation)
-            if fixed_camera_T_ref is None or fixed_camera_road_normal is None or fixed_camera_road_offset is None:
-                return rot_world, trans_world
-            grounded_rot, grounded_trans, _meta = ProjectExecutor._ground_pose_to_plane(
-                rot_world,
-                trans_world,
-                local_vertices,
-                scale,
-                fixed_camera_road_normal,
-                fixed_camera_road_offset,
-                axis_roles=axis_roles,
-                metrics=metrics,
-            )
-            return grounded_rot, grounded_trans
-
         def _fixed_camera_world_pose(frame_id: int, rotation, translation):
             rot_world = np.eye(3, dtype=np.float64) if rotation is None else np.asarray(rotation, dtype=np.float64).reshape(3, 3)
             trans_world = np.asarray(translation, dtype=np.float64).reshape(3)
@@ -10746,6 +10721,8 @@ class ProjectExecutor:
         coord_report["fixed_camera"] = {
             "enabled": fixed_camera_reference_frame_id is not None,
             "reference_frame_id": fixed_camera_reference_frame_id,
+            "object_grounding_enabled": False,
+            "object_grounding_policy": "preserve_pose_optimizer_pose",
         }
         if isinstance(fixed_camera_road_plane, dict):
             coord_report["fixed_camera"]["grounding_plane_source"] = fixed_camera_road_plane.get("source")
@@ -10949,14 +10926,10 @@ class ProjectExecutor:
                 elif isinstance(entry, dict) and isinstance(entry.get("axis_roles"), dict):
                     axis_roles = entry.get("axis_roles")
 
-                rot_world, trans_world = _fixed_camera_grounded_pose(
+                rot_world, trans_world = _fixed_camera_world_pose(
                     int(frame_num),
                     rec.get("rotation_matrix"),
                     [cx, cy, cz],
-                    verts,
-                    scale,
-                    axis_roles=axis_roles,
-                    metrics=_record_pose_metrics(rec),
                 )
                 rot_usd, trans_usd = convert_world_pose_to_usd(
                     rot_world,

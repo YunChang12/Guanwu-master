@@ -92,6 +92,9 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "support_alignment_axis_index",
     "support_alignment_axis_sign",
     "support_alignment_delta_deg",
+    "depth_snapped_candidate_used",
+    "depth_snap_delta_m",
+    "depth_snap_source_error_m",
     "support_bottom_point_count",
     "support_bottom_mean_abs_m",
     "support_bottom_max_abs_m",
@@ -193,8 +196,14 @@ def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[s
         args.support_plane_weight = max(float(getattr(args, "support_plane_weight", 0.20)), 0.35)
         args.support_penalty_weight = max(float(getattr(args, "support_penalty_weight", 0.15)), 0.60)
     elif phase == "free_motion":
-        args.depth_enabled = False
-        args.generic_depth_weight = 0.0
+        args.depth_enabled = bool(getattr(args, "generic_free_motion_depth_enabled", True))
+        if bool(args.depth_enabled):
+            args.generic_depth_weight = max(
+                float(getattr(args, "generic_depth_weight", 0.15)),
+                float(getattr(args, "generic_free_motion_depth_weight", 0.60)),
+            )
+        else:
+            args.generic_depth_weight = 0.0
         args.support_plane_enabled = "disabled"
         args.support_plane_weight = 0.0
         args.support_penalty_weight = 0.0
@@ -212,6 +221,14 @@ def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[s
     if not hasattr(args, "generic_scale_lock_applied"):
         args.generic_scale_lock_applied = False
     return report
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def clamp01(value: float) -> float:
@@ -1378,6 +1395,34 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             return None
 
     def _support_contact(self, result: dict[str, Any]) -> dict[str, Any]:
+        if str(getattr(self.generic_args, "support_plane_enabled", "auto")).strip().lower() in {"0", "false", "off", "disabled", "none"}:
+            return {
+                "support_plane_enabled": False,
+                "support_plane_disable_reason": "disabled",
+                "support_plane_confidence": 0.0,
+                "support_plane_inlier_ratio": 0.0,
+                "support_plane_residual_m": None,
+                "support_contact_score": 0.0,
+                "support_contact_distance_score": 0.0,
+                "support_contact_coverage": 0.0,
+                "support_contact_mean_abs_m": None,
+                "support_contact_max_abs_m": None,
+                "support_bottom_selection_mode": None,
+                "support_axis_index": None,
+                "support_axis_sign": None,
+                "support_normal_alignment": 0.0,
+                "support_normal_angle_deg": None,
+                "support_orientation_score": 0.0,
+                "support_orientation_penalty": 0.0,
+                "support_bottom_mean_abs_m": None,
+                "support_bottom_max_abs_m": None,
+                "support_bottom_signed_m": None,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "support_floating_penalty": 0.0,
+                "support_penetration_penalty": 0.0,
+                "support_penalty": 0.0,
+            }
         confidence = float((self.support_plane or {}).get("support_plane_confidence") or 0.0)
         if confidence < float(getattr(self.generic_args, "support_plane_min_confidence", 0.70)):
             return {
@@ -1553,6 +1598,16 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             reject_reasons.append("projection_valid_ratio_below_threshold")
         depth_confidence = float(result.get("depth_confidence") or 0.0)
         depth_score = float(result.get("depth_score") or 0.0)
+        depth_error = _finite_float(result.get("depth_error"))
+        valid_depth_ratio = float(result.get("valid_depth_ratio") or 0.0)
+        if (
+            bool(getattr(self.generic_args, "generic_depth_hard_gate_enabled", True))
+            and depth_error is not None
+            and depth_confidence >= float(getattr(self.generic_args, "generic_depth_gate_min_confidence", 0.70))
+            and valid_depth_ratio >= float(getattr(self.generic_args, "generic_depth_min_overlap_ratio", 0.35))
+            and depth_error > float(getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.12))
+        ):
+            reject_reasons.append("target_depth_error_above_threshold")
         if motion_phase != "free_motion":
             depth_threshold = float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.25))
             if motion_phase == "contact_calibration":
@@ -2076,8 +2131,13 @@ def refine_candidate_stages(
         ("fine", full_evaluator, args.stage3_iters),
     ):
         original_stage_coarse_scoring = bool(getattr(evaluator.generic_args, "generic_coarse_scoring", False))
+        depth_full_fine = (
+            stage_name == "fine"
+            and bool(getattr(args, "depth_enabled", False))
+            and bool(getattr(args, "generic_depth_refine_fine_full_scoring", True))
+        )
         stage_uses_lightweight = lightweight_search and not (
-            motion_phase == "contact_calibration" and stage_name == "fine"
+            (motion_phase == "contact_calibration" and stage_name == "fine") or depth_full_fine
         )
         if stage_uses_lightweight:
             evaluator.generic_args.generic_coarse_scoring = True
@@ -2323,6 +2383,214 @@ def select_contact_snap_rescue_result(
     if not original_accepted and float(rescue.get("score") or -1e9) > float(original.get("score") or -1e9):
         return rescue
     return original
+
+
+def _depth_candidate_key(result: dict[str, Any]) -> tuple[float, float, float]:
+    depth_score = float(result.get("depth_score") or 0.0) * float(result.get("depth_confidence") or 0.0)
+    valid_ratio = float(result.get("valid_depth_ratio") or 0.0)
+    visual_score = float(result.get("score") or -1e9)
+    return depth_score, valid_ratio, visual_score
+
+
+def _candidate_depth_is_reliable(result: dict[str, Any], args: argparse.Namespace) -> bool:
+    if not bool(result.get("depth_enabled", False)):
+        return False
+    if float(result.get("depth_confidence") or 0.0) < float(getattr(args, "generic_depth_gate_min_confidence", 0.70)):
+        return False
+    if float(result.get("valid_depth_ratio") or 0.0) < float(getattr(args, "generic_depth_min_overlap_ratio", 0.35)):
+        return False
+    return True
+
+
+def make_depth_snapped_candidate(
+    base_candidate: dict[str, Any] | None,
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Shift a candidate along camera z so rendered median depth matches observed target depth."""
+
+    if base_candidate is None:
+        return None
+    if not bool(getattr(args, "depth_enabled", True)):
+        return None
+    if not bool(getattr(args, "generic_depth_snap_candidate_enabled", True)):
+        return None
+    candidate_for_depth = base_candidate
+    if not _candidate_depth_is_reliable(candidate_for_depth, args):
+        evaluator_args = getattr(evaluator, "generic_args", None)
+        original_coarse_scoring = bool(getattr(evaluator_args, "generic_coarse_scoring", False)) if evaluator_args is not None else False
+        if evaluator_args is not None:
+            evaluator_args.generic_coarse_scoring = False
+        try:
+            if not hasattr(evaluator, "evaluate_absolute"):
+                return None
+            rescored = evaluator.evaluate_absolute(
+                np.asarray(base_candidate["translation_cam"], dtype=np.float64),
+                np.asarray(base_candidate["rotation_cam"], dtype=np.float64),
+                np.asarray(base_candidate["scale"], dtype=np.float64),
+            )
+        finally:
+            if evaluator_args is not None:
+                evaluator_args.generic_coarse_scoring = original_coarse_scoring
+        if rescored.get("projected_bbox") is None:
+            return None
+        rescored.setdefault("initializer_metadata", dict(base_candidate.get("initializer_metadata") or {}))
+        candidate_for_depth = rescored
+    if not _candidate_depth_is_reliable(candidate_for_depth, args):
+        return None
+
+    rendered = _finite_float(candidate_for_depth.get("median_rendered_depth"))
+    observed = _finite_float(candidate_for_depth.get("median_observed_depth"))
+    if rendered is None or observed is None:
+        return None
+    signed_error = rendered - observed
+    if not math.isfinite(signed_error):
+        return None
+    max_delta = max(0.0, float(getattr(args, "generic_depth_snap_candidate_max_delta_m", 0.60)))
+    if abs(signed_error) <= 1e-6 or abs(signed_error) > max_delta:
+        return None
+
+    translation = np.asarray(candidate_for_depth["translation_cam"], dtype=np.float64).reshape(3).copy()
+    translation[2] -= signed_error
+    if not np.all(np.isfinite(translation)) or float(translation[2]) <= 0.05:
+        return None
+
+    evaluator_args = getattr(evaluator, "generic_args", None)
+    original_coarse_scoring = bool(getattr(evaluator_args, "generic_coarse_scoring", False)) if evaluator_args is not None else False
+    if evaluator_args is not None:
+        evaluator_args.generic_coarse_scoring = False
+    try:
+        result = evaluator.evaluate_absolute(
+            translation,
+            np.asarray(candidate_for_depth["rotation_cam"], dtype=np.float64),
+            np.asarray(candidate_for_depth["scale"], dtype=np.float64),
+        )
+    finally:
+        if evaluator_args is not None:
+            evaluator_args.generic_coarse_scoring = original_coarse_scoring
+    if result.get("projected_bbox") is None:
+        return None
+    base_meta = dict(candidate_for_depth.get("initializer_metadata") or base_candidate.get("initializer_metadata") or {})
+    result["initializer_metadata"] = {
+        **base_meta,
+        "source": "depth_snapped_seed",
+        "base_source": base_meta.get("source", "unknown"),
+        "depth_snap_delta_m": float(-signed_error),
+        "depth_snap_source_error_m": float(signed_error),
+    }
+    result["depth_snapped_candidate_used"] = True
+    result["depth_snap_delta_m"] = float(-signed_error)
+    result["depth_snap_source_error_m"] = float(signed_error)
+    return result
+
+
+def make_depth_snapped_candidates(
+    candidates: list[dict[str, Any]],
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+    *,
+    temporal_seed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "depth_enabled", True)):
+        return []
+    if not bool(getattr(args, "generic_depth_snap_candidate_enabled", True)):
+        return []
+    sources: list[dict[str, Any]] = []
+    if temporal_seed is not None:
+        sources.append(temporal_seed)
+    source_limit = max(0, int(getattr(args, "generic_depth_snap_candidate_source_top_k", 8)))
+    sources.extend(candidates[:source_limit])
+    snapped: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for candidate in sources:
+        seed = make_depth_snapped_candidate(candidate, evaluator, args)
+        if seed is None:
+            continue
+        signature = fast.pose_signature(seed)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        snapped.append(seed)
+    return sorted(snapped, key=_depth_candidate_key, reverse=True)
+
+
+def merge_pose_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    sort_key: Any | None = None,
+) -> list[dict[str, Any]]:
+    sorted_candidates = sorted(
+        [item for item in candidates if item is not None],
+        key=sort_key or (lambda item: float(item.get("score", -1e9))),
+        reverse=True,
+    )
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for candidate in sorted_candidates:
+        signature = fast.pose_signature(candidate)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        merged.append(candidate)
+        if limit is not None and len(merged) >= int(limit):
+            break
+    return merged
+
+
+def merge_depth_snapped_initial_candidates(
+    initial_candidates: list[dict[str, Any]],
+    depth_snapped_seeds: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Keep visual top candidates while reserving slots for depth-aligned seeds."""
+
+    if not depth_snapped_seeds:
+        return initial_candidates
+    return merge_protected_initial_candidates(
+        initial_candidates,
+        support_aligned_seeds=[],
+        depth_snapped_seeds=depth_snapped_seeds,
+        args=args,
+    )
+
+
+def merge_protected_initial_candidates(
+    initial_candidates: list[dict[str, Any]],
+    *,
+    support_aligned_seeds: list[dict[str, Any]],
+    depth_snapped_seeds: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Merge search candidates without losing protected support/depth seeds to score truncation."""
+
+    visual_limit = max(int(getattr(args, "top_k_candidates", 0)), int(getattr(args, "refine_top_k", 0)), 1)
+    depth_reserve = max(1, int(getattr(args, "generic_depth_refine_bucket_top_k", 1))) if depth_snapped_seeds else 0
+    support_reserve = len(support_aligned_seeds)
+    visual = merge_pose_candidates(
+        initial_candidates,
+        limit=visual_limit,
+        sort_key=lambda item: float(item.get("score", -1e9)),
+    )
+    merged = list(visual)
+    seen = {fast.pose_signature(item) for item in merged}
+
+    def append_unique(items: list[dict[str, Any]], reserve: int, *, sort_key: Any | None = None) -> None:
+        added = 0
+        ordered = sorted(items, key=sort_key or (lambda item: float(item.get("score", -1e9))), reverse=True)
+        for item in ordered:
+            if added >= reserve:
+                break
+            signature = fast.pose_signature(item)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(item)
+            added += 1
+
+    append_unique(support_aligned_seeds, support_reserve)
+    append_unique(depth_snapped_seeds, depth_reserve, sort_key=_depth_candidate_key)
+    return merged
 
 
 def generic_early_stop_reached(
@@ -2653,6 +2921,8 @@ def select_generic_refine_candidates(
     support_alignment_trigger_deg: float = 6.0,
     support_aligned_seed_score_margin: float = 0.20,
     prefer_temporal_first: bool = False,
+    depth_bucket_top_k: int = 0,
+    visual_bucket_top_k: int | None = None,
 ) -> list[dict[str, Any]]:
     """Select high-scoring generic candidates while preserving trusted seeds."""
 
@@ -2724,6 +2994,41 @@ def select_generic_refine_candidates(
         if prefer_temporal_first:
             required = sorted(required, key=_temporal_refine_priority)
         return required[:limit]
+
+    if depth_bucket_top_k > 0:
+        selected: list[dict[str, Any]] = []
+        selected_signatures: set[tuple[float, ...]] = set(required_signatures)
+
+        def add_items(items: list[dict[str, Any]], quota: int | None = None) -> None:
+            added = 0
+            for item in items:
+                if len(selected) + len(required) >= limit:
+                    break
+                signature = fast.pose_signature(item)
+                if signature in selected_signatures:
+                    continue
+                selected_signatures.add(signature)
+                selected.append(item)
+                added += 1
+                if quota is not None and added >= quota:
+                    break
+
+        visual_quota = max(0, int(visual_bucket_top_k)) if visual_bucket_top_k is not None else max(1, limit - int(depth_bucket_top_k))
+        depth_quota = max(0, int(depth_bucket_top_k))
+        add_items(unique, visual_quota)
+        depth_candidates = [
+            item
+            for item in unique
+            if float(item.get("depth_confidence") or 0.0) > 0.0
+            and float(item.get("depth_score") or 0.0) > 0.0
+        ]
+        add_items(sorted(depth_candidates, key=_depth_candidate_key, reverse=True), depth_quota)
+        add_items(unique, None)
+        if prefer_temporal_first:
+            required = sorted(required, key=_temporal_refine_priority)
+            return (required + selected)[:limit]
+        selected.extend(required)
+        return selected[:limit]
 
     selected: list[dict[str, Any]] = []
     fill_limit = limit - len(required)
@@ -3094,6 +3399,18 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         top_k=args.top_k_candidates,
         refine_top_k=args.refine_top_k,
     )
+    depth_snapped_seeds = make_depth_snapped_candidates(
+        initial_candidates,
+        proxy_evaluator,
+        args,
+        temporal_seed=temporal_seed,
+    )
+    if depth_snapped_seeds:
+        initial_candidates = merge_depth_snapped_initial_candidates(
+            initial_candidates,
+            depth_snapped_seeds,
+            args,
+        )
     support_aligned_seeds = make_support_aligned_seeds(
         initial_candidates,
         proxy_evaluator,
@@ -3101,17 +3418,12 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         temporal_seed=temporal_seed,
     )
     if support_aligned_seeds:
-        combined_with_support = list(initial_candidates) + list(support_aligned_seeds)
-        seen_support: set[tuple[float, ...]] = set()
-        initial_candidates = []
-        for candidate in sorted(combined_with_support, key=lambda item: float(item.get("score", -1e9)), reverse=True):
-            signature = fast.pose_signature(candidate)
-            if signature in seen_support:
-                continue
-            seen_support.add(signature)
-            initial_candidates.append(candidate)
-        limit = max(int(args.top_k_candidates), int(args.refine_top_k), len(support_aligned_seeds), 1)
-        initial_candidates = initial_candidates[:limit]
+        initial_candidates = merge_protected_initial_candidates(
+            initial_candidates,
+            support_aligned_seeds=support_aligned_seeds,
+            depth_snapped_seeds=depth_snapped_seeds,
+            args=args,
+        )
     print(f"[generic-search] generated {len(initial_candidates)} candidates")
 
     preview_rows = []
@@ -3129,6 +3441,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         support_alignment_trigger_deg=float(getattr(args, "support_alignment_trigger_deg", 6.0)),
         support_aligned_seed_score_margin=float(getattr(args, "support_aligned_seed_score_margin", 0.20)),
         prefer_temporal_first=bool(getattr(args, "generic_prefer_temporal_refine_first", True)),
+        depth_bucket_top_k=int(getattr(args, "generic_depth_refine_bucket_top_k", 1)),
+        visual_bucket_top_k=int(getattr(args, "generic_visual_refine_bucket_top_k", max(1, int(args.refine_top_k) - 1))),
     )
     refined_results: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     best_result: dict[str, Any] | None = None
@@ -3451,6 +3765,18 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--depth_render_face_limit", type=int, default=8000)
     parser.add_argument("--depth_outlier_score_threshold", type=float, default=0.10)
     parser.add_argument("--depth_outlier_penalty", type=float, default=0.0)
+    parser.add_argument("--generic_free_motion_depth_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_free_motion_depth_weight", type=float, default=0.60)
+    parser.add_argument("--generic_depth_refine_fine_full_scoring", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_depth_refine_bucket_top_k", type=int, default=1)
+    parser.add_argument("--generic_visual_refine_bucket_top_k", type=int, default=2)
+    parser.add_argument("--generic_depth_snap_candidate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_depth_snap_candidate_source_top_k", type=int, default=8)
+    parser.add_argument("--generic_depth_snap_candidate_max_delta_m", type=float, default=0.60)
+    parser.add_argument("--generic_depth_min_overlap_ratio", type=float, default=0.35)
+    parser.add_argument("--generic_depth_gate_min_confidence", type=float, default=0.70)
+    parser.add_argument("--generic_depth_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_depth_hard_gate_max_error_m", type=float, default=0.12)
 
     parser.add_argument("--generic_mask_weight", type=float, default=1.00)
     parser.add_argument("--generic_bbox_weight", type=float, default=0.15)

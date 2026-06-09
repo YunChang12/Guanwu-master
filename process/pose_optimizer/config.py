@@ -63,6 +63,12 @@ NEGATED_BOOLEAN_OPTIONS = {
     "save_candidate_appearance_overlay",
     "save_score_breakdown",
     "support_aligned_seed_enabled",
+    "depth_fallback_to_wildgs",
+    "depth_use_mask_erode",
+    "support_fallback_to_wildgs",
+    "support_fit_from_current_frame_depth",
+    "support_exclude_object_masks",
+    "support_exclude_other_instance_masks",
 }
 
 
@@ -86,10 +92,48 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return data
 
 
+NESTED_KEY_PREFIXES = {
+    "depth": {
+        "source": "depth_source",
+        "type": "depth_type",
+        "depth_type": "depth_type",
+        "unit": "depth_unit",
+        "depth_unit": "depth_unit",
+        "fallback_to_wildgs": "depth_fallback_to_wildgs",
+        "generic_depth_weight": "generic_depth_weight",
+        "depth_sigma": "depth_sigma",
+        "use_mask_erode": "depth_use_mask_erode",
+        "depth_mask_erode_px": "depth_mask_erode_px",
+        "min_valid_depth_ratio": "min_valid_depth_ratio",
+        "depth_error_mode": "depth_error_mode",
+    },
+    "support": {
+        "source": "support_depth_source",
+        "depth_source": "support_depth_source",
+        "fallback_to_wildgs": "support_fallback_to_wildgs",
+        "support_plane_weight": "support_plane_weight",
+        "support_penalty_weight": "support_penalty_weight",
+        "fit_from_current_frame_depth": "support_fit_from_current_frame_depth",
+        "exclude_object_masks": "support_exclude_object_masks",
+        "exclude_other_instance_masks": "support_exclude_other_instance_masks",
+        "support_min_points": "support_min_points",
+        "support_plane_min_points": "support_plane_min_points",
+        "support_min_ransac_inlier_ratio": "support_min_ransac_inlier_ratio",
+        "support_max_plane_fit_rmse": "support_max_plane_fit_rmse",
+    },
+}
+
+
 def parse_simple_yaml(text: str, path: Path | None = None) -> dict[str, Any]:
-    """Parse a deliberately small YAML subset: one flat ``key: value`` map."""
+    """Parse a deliberately small YAML subset.
+
+    The optimizer configs are mostly flat. A tiny one-level nested form is also
+    accepted for depth/support settings and flattened to the legacy CLI option
+    names so older strategy entrypoints keep working.
+    """
 
     data: dict[str, Any] = {}
+    current_section: str | None = None
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -99,11 +143,21 @@ def parse_simple_yaml(text: str, path: Path | None = None) -> dict[str, Any]:
             raise ConfigError(f"Expected 'key: value' in {location}: {raw_line!r}")
 
         key, value = raw_line.split(":", 1)
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
         key = key.strip()
         value = strip_inline_comment(value.strip())
         if not key:
             location = f"{path}:{line_number}" if path else f"line {line_number}"
             raise ConfigError(f"Empty config key in {location}")
+        if indent == 0:
+            current_section = key if value == "" and key in NESTED_KEY_PREFIXES else None
+            if current_section is None:
+                data[key] = parse_scalar(value)
+            continue
+        if current_section in NESTED_KEY_PREFIXES:
+            flat_key = NESTED_KEY_PREFIXES[current_section].get(key, f"{current_section}_{key}")
+            data[flat_key] = parse_scalar(value)
+            continue
         data[key] = parse_scalar(value)
     return data
 

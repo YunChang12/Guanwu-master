@@ -17,8 +17,10 @@ image_edit:
   prompt: |-
     Edit the input image minimally. Keep the scene as close as possible to the original frame.
 
-    Remove only the active manipulation objects on the central wooden board: the target wooden block, loose small blocks, and robot parts that directly occlude the board. Preserve everything else unless it clearly covers the central board surface.
+    Generate a clean background for a tabletop robotic manipulation scene.
 
-    Maintain the exact camera perspective, wood board boundaries, metal grooved table, edge context, lighting, reflections, shadows, stains, scratches, seams, and natural texture. The result should still feel like the same robotic workbench scene, only with the active objects gently removed.
+    Remove all active foreground manipulation objects from the work surface: cups, bowls, bottles, cylinders, blocks, packages, tools, loose objects, round objects, and robot gripper or arm parts that occlude the tabletop. The tabletop/work surface should be visible where these objects were.
 
-    Avoid over-cleaning, avoid replacing the environment, avoid making the tabletop pristine, and avoid changing geometry or style.
+    Preserve the static scene as much as possible: exact camera perspective, tabletop boundaries, wood grain, table edge context, background fixtures, lighting, reflections, soft shadows, stains, scratches, seams, and natural texture. The result should still feel like the same real robotic workbench scene, only with movable foreground objects gently removed.
+
+    Avoid over-cleaning, avoid making the tabletop pristine, avoid replacing the environment, avoid inventing a new table, and avoid changing geometry or style.

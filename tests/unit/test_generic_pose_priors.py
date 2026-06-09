@@ -100,6 +100,158 @@ def test_depth_prior_scores_consistent_depth_and_disables_low_overlap() -> None:
     assert sparse["depth_score"] == 0.0
 
 
+def test_depth_prior_uses_eroded_mask_and_median_z_error_without_penalty() -> None:
+    from process.pose_optimizer.priors.depth_consistency_prior import (
+        DepthConsistencyConfig,
+        DepthConsistencyPrior,
+    )
+
+    observed = np.full((40, 40), 4.0, dtype=np.float32)
+    detection = np.zeros((40, 40), dtype=np.uint8)
+    detection[8:32, 8:32] = 1
+    observed[8:32, 8:32] = 4.2
+    # Boundary pixels are intentionally noisy. Erosion should remove them from
+    # the median z calculation.
+    observed[8:11, 8:32] = 9.0
+    observed[29:32, 8:32] = 9.0
+    observed[8:32, 8:11] = 9.0
+    observed[8:32, 29:32] = 9.0
+    prior = DepthConsistencyPrior(
+        observed,
+        detection,
+        config=DepthConsistencyConfig(
+            depth_sigma=0.75,
+            min_valid_ratio=0.10,
+            mask_erode_px=5,
+            error_mode="median_z",
+        ),
+    )
+
+    render_mask = detection.copy()
+    render_depth = np.zeros_like(observed)
+    render_depth[render_mask > 0] = 4.0
+    score = prior.score(render_depth, render_mask)
+
+    assert score["depth_enabled"] is True
+    assert score["depth_error"] == pytest.approx(0.2, abs=1e-4)
+    assert score["median_rendered_depth"] == pytest.approx(4.0)
+    assert score["median_observed_depth"] == pytest.approx(4.2)
+    assert score["depth_score"] == pytest.approx(np.exp(-0.2 / 0.75), abs=1e-4)
+
+
+def test_depth_prior_disables_low_valid_ratio_without_penalizing_candidate() -> None:
+    from process.pose_optimizer.priors.depth_consistency_prior import (
+        DepthConsistencyConfig,
+        DepthConsistencyPrior,
+    )
+
+    observed = np.zeros((40, 40), dtype=np.float32)
+    detection = np.zeros((40, 40), dtype=np.uint8)
+    detection[8:32, 8:32] = 1
+    observed[18:20, 18:20] = 4.0
+    prior = DepthConsistencyPrior(
+        observed,
+        detection,
+        config=DepthConsistencyConfig(
+            depth_sigma=0.75,
+            min_valid_ratio=0.10,
+            mask_erode_px=3,
+            error_mode="median_z",
+        ),
+    )
+
+    render_depth = np.full_like(observed, 4.0)
+    score = prior.score(render_depth, detection)
+
+    assert score["depth_enabled"] is False
+    assert score["depth_confidence"] == 0.0
+    assert score["depth_score"] == 0.0
+    assert score["debug"]["reason"] == "low_valid_depth_ratio"
+
+
+def test_da3_only_depth_loader_rejects_wildgs_task_depth_without_fallback(tmp_path) -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import load_observed_depth_for_task
+
+    wildgs_depth = tmp_path / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / "00000.npy"
+    wildgs_depth.parent.mkdir(parents=True)
+    np.save(wildgs_depth, np.full((8, 8), 2.0, dtype=np.float32))
+    task = {
+        "task_id": "obj_000001@000001",
+        "frame_idx": 1,
+        "depth_path": str(wildgs_depth),
+    }
+    args = argparse.Namespace(
+        observed_depth_map_path="",
+        depth_source="depth_anything3",
+        depth_fallback_to_wildgs=False,
+        depth_type="metric",
+        depth_unit="meter",
+    )
+
+    depth, info = load_observed_depth_for_task(tmp_path / "outputs" / "08_pose_optimize" / "tasks" / "obj_000001@000001", task, args)
+
+    assert depth is None
+    assert info["available"] is False
+    assert info["reason"] == "wildgs_depth_disallowed"
+
+
+def test_da3_only_depth_loader_uses_wildgs_only_when_fallback_enabled(tmp_path) -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import load_observed_depth_for_task
+
+    wildgs_depth = tmp_path / "06_geometry_lift" / "wildgs" / "exports" / "depth_maps" / "depth_maps" / "00000.npy"
+    wildgs_depth.parent.mkdir(parents=True)
+    np.save(wildgs_depth, np.full((8, 8), 2.0, dtype=np.float32))
+    task = {
+        "task_id": "obj_000001@000001",
+        "frame_idx": 1,
+        "depth_sources": {
+            "primary_depth_path": str(tmp_path / "06_geometry_lift" / "depth_anything3" / "depth_maps" / "00000.npy"),
+            "primary_depth_source": "depth_anything3",
+            "wildgs_depth_path": str(wildgs_depth),
+            "use_wildgs_depth": False,
+        },
+    }
+    args = argparse.Namespace(
+        observed_depth_map_path="",
+        depth_source="depth_anything3",
+        depth_fallback_to_wildgs=True,
+        depth_type="metric",
+        depth_unit="meter",
+    )
+
+    depth, info = load_observed_depth_for_task(tmp_path / "outputs" / "08_pose_optimize" / "tasks" / "obj_000001@000001", task, args)
+
+    assert depth is not None
+    assert float(depth[0, 0]) == 2.0
+    assert info["available"] is True
+    assert info["depth_source"] == "wildgs"
+    assert info["fallback_to_wildgs"] is True
+
+
+def test_support_depth_gate_rejects_wildgs_when_support_fallback_disabled() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_support_observed_depth
+
+    args = argparse.Namespace(
+        depth_source="depth_anything3",
+        support_depth_source="depth_anything3",
+        support_fallback_to_wildgs=False,
+    )
+    wildgs_depth = np.ones((8, 8), dtype=np.float32)
+    depth_info = {
+        "available": True,
+        "depth_source": "wildgs",
+        "fallback_to_wildgs": True,
+        "path": "/tmp/06_geometry_lift/wildgs/exports/depth_maps/depth_maps/00000.npy",
+    }
+
+    support_depth, support_info = select_support_observed_depth(wildgs_depth, depth_info, args)
+
+    assert support_depth is None
+    assert support_info["support_enabled"] is False
+    assert support_info["support_source"] == "depth_anything3"
+    assert support_info["reason"] == "wildgs_depth_disallowed"
+
+
 def test_depth_render_face_limit_samples_deterministically() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import select_depth_render_faces
 
@@ -132,6 +284,32 @@ def test_support_plane_normal_is_oriented_toward_object_points() -> None:
     signed_centroid = float(np.dot(plane["normal"], object_points.mean(axis=0)) + plane["offset"])
     assert plane["available"]
     assert signed_centroid > 0.0
+
+
+def test_support_plane_ransac_rejects_low_quality_plane() -> None:
+    from process.pose_optimizer.priors.support_plane_prior import (
+        SupportPlaneConfig,
+        fit_support_plane_ransac,
+    )
+
+    rng = np.random.default_rng(42)
+    points = rng.normal(size=(240, 3)).astype(np.float64)
+
+    plane = fit_support_plane_ransac(
+        points,
+        config=SupportPlaneConfig(
+            min_points=150,
+            ransac_iters=24,
+            ransac_threshold_m=0.02,
+            min_confidence=0.0,
+            min_inlier_ratio=0.35,
+            max_plane_fit_rmse=0.10,
+        ),
+    )
+
+    assert plane["available"] is False
+    assert plane["reason"] == "low_plane_quality"
+    assert plane["support_plane_inlier_ratio"] < 0.35 or plane["support_plane_rmse_m"] > 0.10
 
 
 def test_support_contact_score_reports_floating_and_penetration_penalties() -> None:

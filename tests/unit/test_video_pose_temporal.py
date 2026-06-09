@@ -338,6 +338,40 @@ def test_generic_phase_switches_to_free_motion_on_moderate_bbox_area_shrink() ->
     assert phase == "free_motion"
 
 
+def test_generic_phase_switches_to_free_motion_when_gripper_occludes_target() -> None:
+    contact_records = []
+    for frame_id in range(1, 11):
+        record = _pose_record(frame_id=frame_id, scale=1.0, mask_iou=0.90, bbox_iou=0.90)
+        record["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+                "support_plane_confidence": 0.95,
+                "support_floating_distance_m": 0.0,
+                "support_penetration_distance_m": 0.0,
+                "depth_confidence": 1.0,
+                "depth_score": 0.92,
+                "detection_bbox": [150.0, 138.0, 184.0, 176.0],
+            }
+        )
+        contact_records.append(record)
+    scale_prior = ProjectExecutor._generic_contact_scale_prior(contact_records)
+
+    phase = ProjectExecutor._generic_pose_phase_for_frame(
+        frame_id=16,
+        track_scale_prior=scale_prior,
+        previous_records=contact_records,
+        inst={"object_id": "obj_000001", "label": "egg", "bbox": [157.0, 140.0, 182.0, 174.0]},
+        frame_instances=[
+            {"object_id": "obj_000001", "label": "egg", "bbox": [157.0, 140.0, 182.0, 174.0]},
+            {"object_id": "obj_000004", "label": "robotic gripper", "bbox": [63.0, 0.0, 213.0, 174.0]},
+        ],
+    )
+
+    assert scale_prior is not None
+    assert phase == "free_motion"
+
+
 def test_generic_static_pose_reuse_decision_reuses_stable_bbox_and_mask() -> None:
     previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
     previous["metrics"].update(

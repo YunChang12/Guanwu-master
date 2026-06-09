@@ -4883,6 +4883,7 @@ def parse_args() -> argparse.Namespace:
     )
     add_fast_arguments(parser)
     add_temporal_arguments(parser)
+    fast.add_depth_compat_arguments(parser)
     return parser.parse_args()
 
 

@@ -5,7 +5,7 @@ import pytest
 from pathlib import Path
 
 from guanwu.core.config import WorkspaceConfig, load_config, StorageConfig
-from process.pose_optimizer.config import config_to_argv
+from process.pose_optimizer.config import config_to_argv, parse_simple_yaml
 
 
 def test_default_config():
@@ -113,3 +113,66 @@ def test_pose_optimizer_config_to_argv_keeps_negative_axis_values() -> None:
 
 def test_pose_optimizer_config_to_argv_can_disable_support_aligned_seed() -> None:
     assert config_to_argv({"support_aligned_seed_enabled": False}) == ["--no-support_aligned_seed_enabled"]
+
+
+def test_pose_optimizer_nested_depth_config_flattens_to_legacy_args() -> None:
+    cfg = parse_simple_yaml(
+        """
+variant: generic_appearance_temporal
+depth:
+  source: depth_anything3
+  fallback_to_wildgs: false
+  depth_sigma: 0.75
+  generic_depth_weight: 0.15
+  use_mask_erode: false
+support:
+  source: depth_anything3
+  fallback_to_wildgs: false
+  support_plane_weight: 0.12
+  fit_from_current_frame_depth: false
+  exclude_object_masks: false
+  exclude_other_instance_masks: false
+""".strip()
+    )
+
+    argv = config_to_argv(cfg)
+
+    assert "--depth_source" in argv
+    assert argv[argv.index("--depth_source") + 1] == "depth_anything3"
+    assert "--no-depth_fallback_to_wildgs" in argv
+    assert "--support_depth_source" in argv
+    assert argv[argv.index("--support_depth_source") + 1] == "depth_anything3"
+    assert "--no-support_fallback_to_wildgs" in argv
+    assert "--depth_sigma" in argv
+    assert argv[argv.index("--depth_sigma") + 1] == "0.75"
+    assert "--generic_depth_weight" in argv
+    assert argv[argv.index("--generic_depth_weight") + 1] == "0.15"
+    assert "--no-depth_use_mask_erode" in argv
+    assert "--no-support_fit_from_current_frame_depth" in argv
+    assert "--no-support_exclude_object_masks" in argv
+    assert "--no-support_exclude_other_instance_masks" in argv
+
+
+def test_fast_variant_accepts_depth_compat_config_args() -> None:
+    from process.pose_optimizer.strategies import fast
+
+    argv = config_to_argv(parse_simple_yaml(
+        """
+variant: fast
+depth_source: wildgs
+depth_type: metric
+depth_unit: meter
+depth_fallback_to_wildgs: true
+support_depth_source: wildgs
+support_fallback_to_wildgs: true
+""".strip()
+    ))
+
+    parser = fast.argparse.ArgumentParser()
+    fast.add_depth_compat_arguments(parser)
+    parsed = parser.parse_args(argv)
+
+    assert parsed.depth_source == "wildgs"
+    assert parsed.depth_fallback_to_wildgs is True
+    assert parsed.support_depth_source == "wildgs"
+    assert parsed.support_fallback_to_wildgs is True

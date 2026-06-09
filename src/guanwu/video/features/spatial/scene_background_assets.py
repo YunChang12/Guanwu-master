@@ -2000,13 +2000,7 @@ def _try_generate_depth_background_asset_from_estimator(
         depth_path, source, extra_quality = _normalize_depth_estimate_result(estimate)
         if depth_path is None:
             return None
-        depth_path, calibration_quality = _calibrate_depth_to_metric_reference(
-            depth_path=depth_path,
-            output_dir=output_dir / "depth_mesh",
-            target_frame_id=target_frame_id,
-            depth_maps_dir=depth_maps_dir,
-            calibration_mask=calibration_mask,
-        )
+        calibration_quality = {"depth_calibration_source": "da3_metric_direct"}
         result = generate_depth_background_mesh_assets(
             clean_rgb_path=clean_rgb_path,
             depth_path=depth_path,
@@ -2022,8 +2016,6 @@ def _try_generate_depth_background_asset_from_estimator(
     quality = dict(manifest.get("quality", {}))
     quality["depth_background_source"] = source
     quality["depth_background_manifest"] = result["manifest_path"]
-    quality["depth_background_reference_frame_mapping"] = "pipeline_frame_id_minus_1"
-    quality["wildgs_depth_index"] = _wildgs_depth_index_for_pipeline_frame(target_frame_id)
     quality.update(calibration_quality)
     quality.update(extra_quality)
     return {

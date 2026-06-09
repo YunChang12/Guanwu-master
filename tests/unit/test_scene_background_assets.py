@@ -96,7 +96,7 @@ def test_resolve_depth_for_frame_maps_pipeline_frame_to_zero_based_wildgs_depth(
     assert _resolve_depth_for_frame(depth_dir, 3) == expected
 
 
-def test_generate_background_assets_defaults_to_first_frame_and_zero_based_wildgs_depth(tmp_path: Path) -> None:
+def test_generate_background_assets_defaults_to_first_frame_and_uses_da3_clean_depth_directly(tmp_path: Path) -> None:
     rgb = np.full((24, 32, 3), 96, dtype=np.uint8)
     mask = np.zeros((24, 32), dtype=bool)
     mask[10:18, 12:20] = True
@@ -155,9 +155,10 @@ def test_generate_background_assets_defaults_to_first_frame_and_zero_based_wildg
 
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["target_frame_id"] == 1
-    assert manifest["quality"]["depth_calibration_reference"].endswith("00000.npy")
-    assert manifest["quality"]["depth_calibration_reference_frame_mapping"] == "pipeline_frame_id_minus_1"
-    assert manifest["quality"]["wildgs_depth_index"] == 0
+    assert manifest["quality"]["depth_calibration_source"] == "da3_metric_direct"
+    assert "depth_calibration_reference" not in manifest["quality"]
+    assert "wildgs_depth_index" not in manifest["quality"]
+    assert float(np.load(manifest["assets"]["clean_depth"])[0, 0]) == 9.0
 
 
 def test_openai_image_cleaner_uses_api_size_and_saves_original_dimensions(tmp_path: Path) -> None:
@@ -2520,12 +2521,12 @@ def test_generate_target_frame_background_assets_prefers_clean_depth_estimator(t
     assert manifest["quality"]["depth_background_source"] == "depth_anything3_clean_rgb"
     assert manifest["quality"]["depth_service"] == "fake_depth_anything3"
     depth = np.load(manifest["assets"]["clean_depth"])
-    assert float(depth[0, 0]) == 6.0
-    assert manifest["quality"]["depth_calibration_source"] == "wildgs_metric_depth_affine"
+    assert float(depth[0, 0]) == 9.0
+    assert manifest["quality"]["depth_calibration_source"] == "da3_metric_direct"
     assert load_background_asset_meshes(result["manifest_path"])[0][0] == "depth_background"
 
 
-def test_clean_depth_estimator_depth_is_calibrated_to_wildgs_metric_depth(tmp_path: Path) -> None:
+def test_clean_depth_estimator_depth_uses_da3_metric_directly_without_wildgs_calibration(tmp_path: Path) -> None:
     rgb = np.zeros((24, 32, 3), dtype=np.uint8)
     rgb[:, :] = (92, 100, 108)
     mask = np.zeros((24, 32), dtype=bool)
@@ -2593,8 +2594,7 @@ def test_clean_depth_estimator_depth_is_calibrated_to_wildgs_metric_depth(tmp_pa
     )
 
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    calibrated = np.load(manifest["assets"]["clean_depth"])
+    clean_depth = np.load(manifest["assets"]["clean_depth"])
     assert manifest["quality"]["depth_background_source"] == "depth_anything3_clean_rgb"
-    assert manifest["quality"]["depth_calibration_source"] == "wildgs_metric_depth_affine"
-    road_mask = cv2.imread(manifest["assets"]["road_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert float(np.median(np.abs(calibrated[road_mask] - wildgs_metric_depth[road_mask]))) < 0.05
+    assert manifest["quality"]["depth_calibration_source"] == "da3_metric_direct"
+    assert np.allclose(clean_depth, external_depth_values)

@@ -39,3 +39,12 @@ max_translation_delta: 0.8
 max_rotation_delta_deg: 45.0
 scale_min_factor: 0.5
 scale_max_factor: 2.2
+
+# Compatibility fields accepted by fast.py. They keep the historical fast
+# behavior unless a caller explicitly switches to a strategy that consumes them.
+depth_source: wildgs
+depth_type: metric
+depth_unit: meter
+depth_fallback_to_wildgs: true
+support_depth_source: wildgs
+support_fallback_to_wildgs: true

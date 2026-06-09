@@ -44,6 +44,15 @@ max_rotation_delta_deg: 45.0
 scale_min_factor: 0.5
 scale_max_factor: 2.2
 
+# Compatibility fields accepted by edge_contour_fast.py. They keep the
+# historical WildGS/road-depth behavior unless a caller explicitly overrides them.
+depth_source: wildgs
+depth_type: metric
+depth_unit: meter
+depth_fallback_to_wildgs: true
+support_depth_source: wildgs
+support_fallback_to_wildgs: true
+
 temporal_enabled: true
 temporal_lookback: 5
 temporal_seed_enabled: true

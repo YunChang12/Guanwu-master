@@ -1097,6 +1097,7 @@ def parse_args() -> argparse.Namespace:
     temporal_fast.add_fast_arguments(parser)
     temporal_fast.add_temporal_arguments(parser)
     add_grabcut_arguments(parser)
+    fast.add_depth_compat_arguments(parser)
     return parser.parse_args()
 
 

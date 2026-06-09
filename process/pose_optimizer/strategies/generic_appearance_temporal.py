@@ -651,31 +651,127 @@ def select_depth_render_faces(faces: np.ndarray, max_faces: int | None) -> np.nd
     return faces_arr[indices]
 
 
+def _bool_arg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _depth_context_from_task(task: dict[str, Any]) -> dict[str, Any]:
+    for key in ("generic_pose_context", "vehicle_pose_context"):
+        context = task.get(key)
+        if isinstance(context, dict):
+            return context
+    return {}
+
+
+def _path_looks_like_wildgs_depth(path: Path | None) -> bool:
+    if path is None:
+        return False
+    parts = {part.lower() for part in path.parts}
+    return "wildgs" in parts
+
+
 def load_observed_depth_for_task(sample_dir: Path, task: dict[str, Any], args: argparse.Namespace) -> tuple[np.ndarray | None, dict[str, Any]]:
-    path_text = str(getattr(args, "observed_depth_map_path", "") or "").strip()
+    requested_source = str(getattr(args, "depth_source", "depth_anything3") or "depth_anything3").strip().lower()
+    requested_source = requested_source.replace("-", "_")
+    fallback_to_wildgs = _bool_arg(getattr(args, "depth_fallback_to_wildgs", False), default=False)
+    context = _depth_context_from_task(task)
+    depth_sources = context.get("depth_sources") if isinstance(context.get("depth_sources"), dict) else {}
+    if not depth_sources and isinstance(task.get("depth_sources"), dict):
+        depth_sources = task["depth_sources"]
+
     source = "argument"
-    depth_path: Path | None = Path(path_text) if path_text else None
-    if depth_path is None:
-        context = task.get("generic_pose_context") if isinstance(task.get("generic_pose_context"), dict) else {}
-        if not context:
-            context = task.get("vehicle_pose_context") if isinstance(task.get("vehicle_pose_context"), dict) else {}
-        path_text = str(context.get("depth_map_path") or context.get("observed_depth_map_path") or "").strip()
-        if path_text:
-            depth_path = Path(path_text)
-            source = "task_context"
-    if depth_path is None:
-        try:
-            _, frame_idx = temporal_fast.parse_task_id_from_sample_dir(sample_dir)
-            depth_path = fast.find_depth_map_for_task(sample_dir, frame_idx)
-            source = "auto"
-        except Exception:
-            depth_path = None
+    depth_path: Path | None = None
+    path_text = str(getattr(args, "observed_depth_map_path", "") or "").strip()
+    if path_text:
+        depth_path = Path(path_text)
+    else:
+        task_depth_path = (
+            depth_sources.get("primary_depth_path")
+            or task.get("depth_path")
+            or task.get("depth_map_path")
+            or context.get("depth_path")
+            or context.get("depth_map_path")
+            or context.get("observed_depth_map_path")
+        )
+        if task_depth_path:
+            depth_path = Path(str(task_depth_path))
+            source = str(depth_sources.get("primary_depth_source") or task.get("depth_source") or context.get("depth_source") or "task_context")
+
+    wildgs_depth_path = depth_sources.get("wildgs_depth_path") or context.get("wildgs_depth_path") or task.get("wildgs_depth_path")
+    wildgs_path = Path(str(wildgs_depth_path)) if wildgs_depth_path else None
+    source_key = str(source or "").strip().lower().replace("-", "_")
+    if (
+        depth_path is not None
+        and path_text == ""
+        and requested_source != "wildgs"
+        and not fallback_to_wildgs
+        and (
+            source_key in {"wildgs", "wildgs_depth", "wildgs_depth_map", "wildgs_fallback"}
+            or _path_looks_like_wildgs_depth(depth_path)
+        )
+    ):
+        info = {
+            "available": False,
+            "requested_source": requested_source,
+            "depth_source": str(task.get("depth_source") or context.get("depth_source") or requested_source),
+            "depth_type": str(task.get("depth_type") or context.get("depth_type") or getattr(args, "depth_type", "metric") or "metric"),
+            "depth_unit": str(task.get("depth_unit") or context.get("depth_unit") or getattr(args, "depth_unit", "meter") or "meter"),
+            "fallback_to_wildgs": bool(fallback_to_wildgs),
+            "wildgs_depth_path": str(wildgs_path or depth_path),
+            "path": str(depth_path),
+            "reason": "wildgs_depth_disallowed",
+        }
+        return None, info
+    if (depth_path is None or not depth_path.exists()) and requested_source == "wildgs":
+        if wildgs_path is None:
+            try:
+                _, frame_idx = temporal_fast.parse_task_id_from_sample_dir(sample_dir)
+                wildgs_path = fast.find_depth_map_for_task(sample_dir, frame_idx)
+            except Exception:
+                wildgs_path = None
+        depth_path = wildgs_path
+        source = "wildgs"
+    elif (depth_path is None or not depth_path.exists()) and fallback_to_wildgs:
+        if wildgs_path is None:
+            try:
+                _, frame_idx = temporal_fast.parse_task_id_from_sample_dir(sample_dir)
+                wildgs_path = fast.find_depth_map_for_task(sample_dir, frame_idx)
+            except Exception:
+                wildgs_path = None
+        if wildgs_path is not None and wildgs_path.exists():
+            depth_path = wildgs_path
+            source = "wildgs_fallback"
+
+    info = {
+        "available": False,
+        "requested_source": requested_source,
+        "depth_source": source if source in {"wildgs", "wildgs_fallback", "depth_anything3"} else str(task.get("depth_source") or context.get("depth_source") or requested_source),
+        "depth_type": str(task.get("depth_type") or context.get("depth_type") or getattr(args, "depth_type", "metric") or "metric"),
+        "depth_unit": str(task.get("depth_unit") or context.get("depth_unit") or getattr(args, "depth_unit", "meter") or "meter"),
+        "fallback_to_wildgs": bool(fallback_to_wildgs),
+        "wildgs_depth_path": str(wildgs_path) if wildgs_path else None,
+    }
     if depth_path is None or not depth_path.exists():
-        return None, {"available": False, "reason": "depth_map_not_found"}
+        info.update({"reason": "depth_map_not_found", "path": str(depth_path) if depth_path else None})
+        return None, info
     try:
-        return load_depth_map(depth_path), {"available": True, "path": str(depth_path), "source": source}
+        loaded = load_depth_map(depth_path)
+        info.update(
+            {
+                "available": True,
+                "path": str(depth_path),
+                "source": source,
+                "depth_source": "wildgs" if source in {"wildgs", "wildgs_fallback"} else str(task.get("depth_source") or context.get("depth_source") or requested_source),
+            }
+        )
+        return loaded, info
     except Exception as exc:
-        return None, {"available": False, "path": str(depth_path), "reason": str(exc), "source": source}
+        info.update({"path": str(depth_path), "reason": str(exc), "source": source})
+        return None, info
 
 
 def depth_points_cam_from_region(
@@ -796,14 +892,29 @@ def estimate_support_plane_from_observed_depth(
     args: argparse.Namespace,
     other_instance_masks: list[np.ndarray] | tuple[np.ndarray, ...] | None = None,
 ) -> dict[str, Any]:
+    support_source = str(getattr(args, "support_depth_source", getattr(args, "depth_source", "observed_depth")) or "observed_depth")
     if observed_depth is None:
-        return {"available": False, "support_plane_confidence": 0.0, "reason": "depth_unavailable"}
+        return {
+            "available": False,
+            "support_enabled": False,
+            "support_source": support_source,
+            "support_plane_confidence": 0.0,
+            "reason": "depth_unavailable",
+        }
     if str(getattr(args, "support_plane_enabled", "auto")).lower() in {"0", "false", "off", "disabled", "none"}:
-        return {"available": False, "support_plane_confidence": 0.0, "reason": "disabled"}
+        return {
+            "available": False,
+            "support_enabled": False,
+            "support_source": support_source,
+            "support_plane_confidence": 0.0,
+            "reason": "disabled",
+        }
     support_region, sample_debug = _support_sample_region(detection_mask, bbox_xyxy, args, other_instance_masks)
     if int(support_region.sum()) <= 0:
         return {
             "available": False,
+            "support_enabled": False,
+            "support_source": support_source,
             "support_plane_confidence": 0.0,
             "reason": "empty_support_region",
             "support_sample_debug": sample_debug,
@@ -813,14 +924,25 @@ def estimate_support_plane_from_observed_depth(
     plane = fit_support_plane_ransac(
         points,
         config=SupportPlaneConfig(
-            min_points=int(getattr(args, "support_plane_min_points", 120)),
+            min_points=int(getattr(args, "support_min_points", getattr(args, "support_plane_min_points", 120))),
             ransac_iters=int(getattr(args, "support_plane_ransac_iters", 96)),
             ransac_threshold_m=float(getattr(args, "support_plane_ransac_threshold_m", 0.05)),
             min_confidence=float(getattr(args, "support_plane_min_confidence", 0.70)),
             residual_scale_m=float(getattr(args, "support_plane_residual_scale_m", 0.08)),
+            min_inlier_ratio=float(getattr(args, "support_min_ransac_inlier_ratio", 0.0)),
+            max_plane_fit_rmse=(
+                None
+                if getattr(args, "support_max_plane_fit_rmse", None) is None
+                else float(getattr(args, "support_max_plane_fit_rmse"))
+            ),
         ),
         object_points_cam=object_points,
     )
+    plane["support_enabled"] = bool(plane.get("available"))
+    plane["support_source"] = support_source
+    plane["support_num_points"] = int(plane.get("num_points") or 0)
+    plane["support_inlier_ratio"] = plane.get("support_plane_inlier_ratio", plane.get("inlier_ratio"))
+    plane["support_plane_rmse"] = plane.get("support_plane_rmse_m", plane.get("plane_rmse_m"))
     if plane.get("normal") is not None and plane.get("offset") is not None:
         depth_arr = np.asarray(observed_depth, dtype=np.float32)
         valid = support_region & np.isfinite(depth_arr) & (depth_arr > 0.0)
@@ -837,6 +959,73 @@ def estimate_support_plane_from_observed_depth(
     plane["support_sample_debug"] = sample_debug
     plane["support_sample_region"] = support_region
     return plane
+
+
+def select_support_observed_depth(
+    observed_depth: np.ndarray | None,
+    depth_info: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    support_source = str(
+        getattr(args, "support_depth_source", getattr(args, "depth_source", "observed_depth"))
+        or "observed_depth"
+    ).strip().lower().replace("-", "_")
+    if support_source in {"da3", "depth_anything", "zaiwu_depth_anything3"}:
+        support_source = "depth_anything3"
+    support_fallback_to_wildgs = _bool_arg(getattr(args, "support_fallback_to_wildgs", False), default=False)
+    info = {
+        "available": False,
+        "support_enabled": False,
+        "support_source": support_source,
+        "support_fallback_to_wildgs": bool(support_fallback_to_wildgs),
+        "support_plane_confidence": 0.0,
+    }
+    if observed_depth is None:
+        info["reason"] = "depth_unavailable"
+        return None, info
+
+    actual_source = str(
+        depth_info.get("depth_source")
+        or depth_info.get("source")
+        or getattr(args, "depth_source", "")
+        or ""
+    ).strip().lower().replace("-", "_")
+    if actual_source == "wildgs_fallback":
+        actual_source = "wildgs"
+    depth_path = Path(str(depth_info.get("path"))) if depth_info.get("path") else None
+    actual_is_wildgs = actual_source in {"wildgs", "wildgs_depth", "wildgs_depth_map"} or _path_looks_like_wildgs_depth(depth_path)
+
+    if support_source == "depth_anything3" and actual_is_wildgs and not support_fallback_to_wildgs:
+        info.update(
+            {
+                "reason": "wildgs_depth_disallowed",
+                "depth_source": actual_source or "wildgs",
+                "path": str(depth_path) if depth_path else None,
+            }
+        )
+        return None, info
+
+    if support_source == "wildgs" and not actual_is_wildgs:
+        info.update(
+            {
+                "reason": "support_depth_source_mismatch",
+                "depth_source": actual_source,
+                "path": str(depth_path) if depth_path else None,
+            }
+        )
+        return None, info
+
+    info.update(
+        {
+            "available": True,
+            "support_enabled": True,
+            "depth_source": "wildgs" if actual_is_wildgs else (actual_source or support_source),
+            "path": str(depth_path) if depth_path else None,
+        }
+    )
+    if actual_is_wildgs:
+        info["support_source"] = "wildgs" if support_fallback_to_wildgs else support_source
+    return observed_depth, info
 
 
 def _background_geometry_reference_from_task(task: dict[str, Any]) -> dict[str, Any] | None:
@@ -986,6 +1175,102 @@ def save_support_plane_debug(
     json_path = output_dir / "support_contact_debug.json"
     json_path.write_text(json.dumps(contact_debug, indent=2), encoding="utf-8")
     outputs["support_contact_debug"] = str(json_path)
+    return outputs
+
+
+def _depth_vis(depth: np.ndarray | None) -> np.ndarray:
+    if depth is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    arr = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(arr) & (arr > 0.0)
+    if not np.any(valid):
+        return np.zeros((*arr.shape[:2], 3), dtype=np.uint8)
+    lo, hi = np.percentile(arr[valid], [2.0, 98.0])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(arr[valid]))
+        hi = float(np.max(arr[valid]))
+    norm = np.zeros_like(arr, dtype=np.uint8)
+    if hi > lo:
+        norm[valid] = np.clip((arr[valid] - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+
+def save_depth_debug_outputs(
+    output_dir: Path,
+    *,
+    image: np.ndarray,
+    detection_mask: np.ndarray,
+    observed_depth: np.ndarray | None,
+    rendered_depth: np.ndarray | None,
+    best_result: dict[str, Any],
+    depth_info: dict[str, Any],
+    support_plane: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, str]:
+    debug_dir = output_dir / "debug_depth"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, str] = {}
+    rgb_path = debug_dir / "rgb.png"
+    mask_path = debug_dir / "detection_mask.png"
+    da3_path = debug_dir / "da3_depth_vis.png"
+    rendered_path = debug_dir / "rendered_depth_vis.png"
+    residual_path = debug_dir / "depth_residual_heatmap.png"
+    overlay_path = debug_dir / "final_overlay.png"
+    cv2.imwrite(str(rgb_path), image)
+    cv2.imwrite(str(mask_path), np.where(np.asarray(detection_mask) > 0, 255, 0).astype(np.uint8))
+    cv2.imwrite(str(da3_path), _depth_vis(observed_depth))
+    cv2.imwrite(str(rendered_path), _depth_vis(rendered_depth))
+    if observed_depth is not None and rendered_depth is not None and np.asarray(observed_depth).shape == np.asarray(rendered_depth).shape:
+        obs = np.asarray(observed_depth, dtype=np.float32)
+        ren = np.asarray(rendered_depth, dtype=np.float32)
+        valid = np.isfinite(obs) & np.isfinite(ren) & (obs > 0.0) & (ren > 0.0)
+        residual = np.zeros_like(obs, dtype=np.float32)
+        residual[valid] = np.abs(ren[valid] - obs[valid])
+        cv2.imwrite(str(residual_path), _depth_vis(residual))
+    else:
+        cv2.imwrite(str(residual_path), np.zeros_like(np.asarray(detection_mask), dtype=np.uint8))
+    overlay = image.copy()
+    rendered_mask = best_result.get("rendered_mask")
+    if rendered_mask is not None:
+        mask = np.asarray(rendered_mask).astype(bool)
+        if mask.shape == overlay.shape[:2]:
+            overlay[mask] = (0.55 * overlay[mask] + np.array([255, 80, 40]) * 0.45).astype(np.uint8)
+    cv2.imwrite(str(overlay_path), overlay)
+    score = {
+        "depth_source": depth_info.get("depth_source"),
+        "depth_type": depth_info.get("depth_type", getattr(args, "depth_type", "metric")),
+        "depth_unit": depth_info.get("depth_unit", getattr(args, "depth_unit", "meter")),
+        "depth_path": depth_info.get("path"),
+        "depth_fallback_to_wildgs": bool(depth_info.get("fallback_to_wildgs", False)),
+        "depth_enabled": bool(best_result.get("depth_enabled", False)),
+        "depth_valid_ratio": best_result.get("valid_depth_ratio"),
+        "valid_depth_ratio": best_result.get("valid_depth_ratio"),
+        "median_rendered_depth": best_result.get("median_rendered_depth"),
+        "median_observed_depth": best_result.get("median_observed_depth"),
+        "depth_error": best_result.get("depth_error"),
+        "depth_sigma": float(getattr(args, "depth_sigma", 0.75)),
+        "depth_score": best_result.get("depth_score"),
+        "depth_debug": best_result.get("depth_debug"),
+        "support_enabled": bool(support_plane.get("available")),
+        "support_source": support_plane.get("support_source"),
+        "support_num_points": support_plane.get("support_num_points", support_plane.get("num_points")),
+        "support_inlier_ratio": support_plane.get("support_inlier_ratio", support_plane.get("support_plane_inlier_ratio")),
+        "support_plane_rmse": support_plane.get("support_plane_rmse", support_plane.get("support_plane_rmse_m")),
+        "support_reason": support_plane.get("reason"),
+        "final_score": best_result.get("score", best_result.get("final_score")),
+    }
+    breakdown_json = debug_dir / "score_breakdown.json"
+    breakdown_json.write_text(json.dumps(fast.to_builtin(score), indent=2), encoding="utf-8")
+    for key, path in {
+        "depth_debug_rgb": rgb_path,
+        "depth_debug_detection_mask": mask_path,
+        "depth_debug_observed": da3_path,
+        "depth_debug_rendered": rendered_path,
+        "depth_debug_residual": residual_path,
+        "depth_debug_overlay": overlay_path,
+        "depth_debug_score_breakdown": breakdown_json,
+    }.items():
+        outputs[key] = str(path)
     return outputs
 
 
@@ -2636,33 +2921,57 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     observed_depth, depth_info = load_observed_depth_for_task(sample_dir, task, args)
+    if bool(args.depth_enabled) and observed_depth is None and str(getattr(args, "depth_source", "depth_anything3")).strip().lower() == "depth_anything3":
+        raise RuntimeError(
+            "Depth Anything3 metric depth is required for DA3-only pose.optimize but was not found: "
+            f"{depth_info.get('path') or depth_info.get('reason')}"
+        )
     depth_prior = None
     if bool(args.depth_enabled) and observed_depth is not None:
         try:
             if observed_depth.shape != full_mask.shape:
                 observed_depth = cv2.resize(observed_depth, (full_mask.shape[1], full_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            min_valid_ratio = float(getattr(args, "min_valid_depth_ratio", getattr(args, "depth_min_valid_ratio", 0.25)))
             depth_prior = DepthConsistencyPrior(
                 observed_depth,
                 full_mask,
                 config=DepthConsistencyConfig(
                     depth_sigma=args.depth_sigma,
-                    min_valid_ratio=args.depth_min_valid_ratio,
+                    min_valid_ratio=min_valid_ratio,
                     robust_stat=args.depth_robust_stat,
+                    mask_erode_px=(
+                        int(getattr(args, "depth_mask_erode_px", 0))
+                        if bool(getattr(args, "depth_use_mask_erode", True))
+                        else 0
+                    ),
+                    error_mode=str(getattr(args, "depth_error_mode", "pixel_abs")),
                 ),
             )
             depth_info["available"] = True
         except Exception as exc:
             depth_info = {"available": False, "reason": str(exc)}
 
-    support_plane = support_plane_from_background_geometry_reference(task, t_world_from_cam)
+    support_source = str(getattr(args, "support_depth_source", getattr(args, "depth_source", "observed_depth")) or "observed_depth").strip().lower()
+    support_depth, support_depth_info = select_support_observed_depth(observed_depth, depth_info, args)
+    support_plane = {
+        "available": False,
+        "support_plane_confidence": 0.0,
+        "reason": support_depth_info.get("reason", "not_evaluated"),
+        "support_source": support_depth_info.get("support_source", support_source),
+        "support_enabled": False,
+    }
+    if support_source not in {"depth_anything3", "da3", "zaiwu_depth_anything3"}:
+        support_plane = support_plane_from_background_geometry_reference(task, t_world_from_cam)
     if not support_plane.get("available"):
         support_plane = estimate_support_plane_from_observed_depth(
-            observed_depth,
+            support_depth,
             full_mask,
             json_bbox,
             intrinsics,
             args,
         )
+        support_plane.setdefault("reason", support_depth_info.get("reason"))
+        support_plane.setdefault("support_source", support_depth_info.get("support_source", support_source))
     support_debug_outputs = save_support_plane_debug(output_dir, support_plane, full_mask)
 
     temporal_prior, temporal_report = _load_temporal_prior(sample_dir, output_dir, task, t_world_from_cam, args)
@@ -2935,6 +3244,32 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
                     pass
                 appearance_debug_outputs.pop("fg_bg_samples", None)
     breakdown_path = save_generic_breakdown(output_dir, [item[0] for item in refined_results]) if bool(args.save_score_breakdown) else None
+    best_rendered_depth = None
+    if observed_depth is not None:
+        try:
+            best_rendered_depth = render_depth_for_pose(
+                vertices=vertices,
+                faces=faces,
+                translation_cam=np.asarray(best_result["translation_cam"], dtype=np.float64),
+                rotation_cam=np.asarray(best_result["rotation_cam"], dtype=np.float64),
+                scale=np.asarray(best_result["scale"], dtype=np.float64),
+                intrinsics=intrinsics,
+                image_size=image_size,
+                max_faces=int(getattr(args, "depth_render_face_limit", 8000)),
+            )
+        except Exception as exc:
+            best_result.setdefault("depth_debug", {})["final_render_depth_error"] = str(exc)
+    depth_debug_outputs = save_depth_debug_outputs(
+        output_dir,
+        image=image,
+        detection_mask=full_mask,
+        observed_depth=observed_depth,
+        rendered_depth=best_rendered_depth,
+        best_result=best_result,
+        depth_info=depth_info,
+        support_plane=support_plane,
+        args=args,
+    )
 
     optimized_task = json.loads(json.dumps(task))
     optimized_task.setdefault("corrected_pose", {})
@@ -2958,8 +3293,14 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "enabled": bool(args.depth_enabled),
             "depth_score": best_result.get("depth_score"),
             "depth_confidence": best_result.get("depth_confidence"),
+            "depth_enabled": best_result.get("depth_enabled"),
             "depth_error": best_result.get("depth_error"),
             "valid_depth_ratio": best_result.get("valid_depth_ratio"),
+            "median_rendered_depth": best_result.get("median_rendered_depth"),
+            "median_observed_depth": best_result.get("median_observed_depth"),
+            "depth_sigma": float(getattr(args, "depth_sigma", 0.75)),
+            "depth_error_mode": str(getattr(args, "depth_error_mode", "median_z")),
+            "depth_mask_erode_px": int(getattr(args, "depth_mask_erode_px", 0)),
         }
     )
     appearance_report.update(
@@ -3061,6 +3402,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "score_breakdown": str(breakdown_path) if breakdown_path else None,
             **appearance_debug_outputs,
             **support_debug_outputs,
+            **depth_debug_outputs,
         },
         "refined_pose_candidates": [
             candidate_summary(item[0], t_world_from_cam=t_world_from_cam)
@@ -3095,9 +3437,17 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
 
     parser.add_argument("--depth_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--observed_depth_map_path", default="")
-    parser.add_argument("--depth_min_valid_ratio", type=float, default=0.25)
-    parser.add_argument("--depth_sigma", type=float, default=0.50)
+    parser.add_argument("--depth_source", default="depth_anything3")
+    parser.add_argument("--depth_type", default="metric")
+    parser.add_argument("--depth_unit", default="meter")
+    parser.add_argument("--depth_fallback_to_wildgs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--depth_min_valid_ratio", type=float, default=0.10)
+    parser.add_argument("--min_valid_depth_ratio", type=float, default=0.10)
+    parser.add_argument("--depth_sigma", type=float, default=0.75)
     parser.add_argument("--depth_robust_stat", choices=["median", "mean"], default="median")
+    parser.add_argument("--depth_use_mask_erode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--depth_mask_erode_px", type=int, default=5)
+    parser.add_argument("--depth_error_mode", choices=["pixel_abs", "median_z"], default="median_z")
     parser.add_argument("--depth_render_face_limit", type=int, default=8000)
     parser.add_argument("--depth_outlier_score_threshold", type=float, default=0.10)
     parser.add_argument("--depth_outlier_penalty", type=float, default=0.0)
@@ -3106,7 +3456,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_bbox_weight", type=float, default=0.15)
     parser.add_argument("--generic_contour_weight", type=float, default=0.35)
     parser.add_argument("--generic_edge_weight", type=float, default=0.20)
-    parser.add_argument("--generic_depth_weight", type=float, default=0.35)
+    parser.add_argument("--generic_depth_weight", type=float, default=0.15)
     parser.add_argument("--generic_appearance_weight", type=float, default=0.25)
     parser.add_argument("--generic_temporal_weight", type=float, default=0.55)
     parser.add_argument("--generic_scale_prior_weight", type=float, default=0.30)
@@ -3133,11 +3483,19 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_lightweight_search_scoring", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--support_plane_enabled", default="auto")
+    parser.add_argument("--support_depth_source", default="depth_anything3")
+    parser.add_argument("--support_fallback_to_wildgs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--support_fit_from_current_frame_depth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_exclude_object_masks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_exclude_other_instance_masks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--support_plane_min_confidence", type=float, default=0.70)
-    parser.add_argument("--support_plane_min_points", type=int, default=120)
+    parser.add_argument("--support_min_points", type=int, default=150)
+    parser.add_argument("--support_plane_min_points", type=int, default=150)
     parser.add_argument("--support_plane_ransac_iters", type=int, default=96)
     parser.add_argument("--support_plane_ransac_threshold_m", type=float, default=0.05)
     parser.add_argument("--support_plane_residual_scale_m", type=float, default=0.08)
+    parser.add_argument("--support_min_ransac_inlier_ratio", type=float, default=0.35)
+    parser.add_argument("--support_max_plane_fit_rmse", type=float, default=0.10)
     parser.add_argument("--support_use_lower_band", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--support_lower_band_x_expand_ratio", type=float, default=0.20)
     parser.add_argument("--support_lower_band_y_extend_ratio", type=float, default=0.60)
@@ -3146,7 +3504,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--support_near_mask_outer_kernel", type=int, default=31)
     parser.add_argument("--support_bbox_expand_ratio", type=float, default=0.20)
     parser.add_argument("--support_exclude_target_mask_dilate_kernel", type=int, default=9)
-    parser.add_argument("--support_plane_weight", type=float, default=0.20)
+    parser.add_argument("--support_plane_weight", type=float, default=0.12)
     parser.add_argument("--support_penalty_weight", type=float, default=0.15)
     parser.add_argument("--support_bottom_percentile", type=float, default=3.0)
     parser.add_argument("--support_bottom_selection_mode", choices=["local_axis", "signed_distance", "plane_distance"], default="local_axis")

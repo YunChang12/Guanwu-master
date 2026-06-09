@@ -20,6 +20,8 @@ class SupportPlaneConfig:
     ransac_threshold_m: float = 0.05
     min_confidence: float = 0.70
     residual_scale_m: float = 0.08
+    min_inlier_ratio: float = 0.0
+    max_plane_fit_rmse: float | None = None
     random_seed: int = 17
 
 
@@ -92,22 +94,32 @@ def fit_support_plane_ransac(
             offset = -offset
     distances = np.abs(pts @ normal + offset)
     residual = float(np.median(distances[best_inliers]))
+    rmse = float(np.sqrt(np.mean(distances[best_inliers] * distances[best_inliers])))
     inlier_ratio = float(best_inliers.sum() / max(1, len(pts)))
     residual_score = float(np.exp(-residual / max(1e-6, float(cfg.residual_scale_m))))
     confidence = float(np.clip(inlier_ratio * residual_score, 0.0, 1.0))
+    quality_failed = False
+    if inlier_ratio < float(getattr(cfg, "min_inlier_ratio", 0.0) or 0.0):
+        quality_failed = True
+    max_rmse = getattr(cfg, "max_plane_fit_rmse", None)
+    if max_rmse is not None and rmse > float(max_rmse):
+        quality_failed = True
     return {
-        "available": confidence >= float(cfg.min_confidence),
+        "available": (not quality_failed) and confidence >= float(cfg.min_confidence),
+        "reason": "low_plane_quality" if quality_failed else ("low_confidence" if confidence < float(cfg.min_confidence) else None),
         "normal": normal,
         "offset": offset,
         "point": centroid,
         "inlier_ratio": inlier_ratio,
         "plane_residual_m": residual,
+        "plane_rmse_m": rmse,
         "normal_stability": residual_score,
         "support_plane_confidence": confidence,
         "num_points": int(len(pts)),
         "num_inliers": int(best_inliers.sum()),
         "support_plane_inlier_ratio": inlier_ratio,
         "support_plane_residual_m": residual,
+        "support_plane_rmse_m": rmse,
     }
 
 

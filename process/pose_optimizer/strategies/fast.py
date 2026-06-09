@@ -4041,6 +4041,30 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def add_depth_compat_arguments(parser: argparse.ArgumentParser) -> None:
+    """Accept generic depth/support options without changing fast scoring."""
+
+    parser.add_argument("--observed_depth_map_path", default="")
+    parser.add_argument("--depth_source", default="wildgs")
+    parser.add_argument("--depth_type", default="metric")
+    parser.add_argument("--depth_unit", default="meter")
+    parser.add_argument("--depth_fallback_to_wildgs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--depth_min_valid_ratio", type=float, default=0.25)
+    parser.add_argument("--min_valid_depth_ratio", type=float, default=0.25)
+    parser.add_argument("--depth_sigma", type=float, default=0.50)
+    parser.add_argument("--depth_use_mask_erode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--depth_mask_erode_px", type=int, default=0)
+    parser.add_argument("--depth_error_mode", choices=["pixel_abs", "median_z"], default="pixel_abs")
+    parser.add_argument("--support_depth_source", default="wildgs")
+    parser.add_argument("--support_fallback_to_wildgs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_fit_from_current_frame_depth", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--support_exclude_object_masks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_exclude_other_instance_masks", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--support_min_points", type=int, default=120)
+    parser.add_argument("--support_min_ransac_inlier_ratio", type=float, default=0.0)
+    parser.add_argument("--support_max_plane_fit_rmse", type=float, default=None)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Estimate and refine corrected_pose with a uniform x/y/z scale constraint."
@@ -4223,6 +4247,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Also generate road-bottom initialization candidates for truncated objects.",
     )
+    add_depth_compat_arguments(parser)
     return parser.parse_args()
 
 

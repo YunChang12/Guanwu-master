@@ -15,6 +15,8 @@ class DepthConsistencyConfig:
     depth_sigma: float = 0.50
     min_valid_ratio: float = 0.25
     robust_stat: str = "median"
+    mask_erode_px: int = 0
+    error_mode: str = "pixel_abs"
     eps: float = 1e-6
 
 
@@ -85,13 +87,22 @@ class DepthConsistencyPrior:
         if rendered_depth.shape != self.observed_depth.shape:
             return self._disabled("shape_mismatch")
 
+        detection_mask = self.detection_mask.astype(bool)
+        erode_px = max(0, int(getattr(self.config, "mask_erode_px", 0)))
+        if erode_px > 0 and detection_mask.any():
+            kernel_size = erode_px * 2 + 1
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            eroded = cv2.erode(detection_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+            if eroded.any():
+                detection_mask = eroded
+
         valid_observed = np.isfinite(self.observed_depth) & (self.observed_depth > 0.0)
         valid_rendered = np.isfinite(rendered_depth) & (rendered_depth > 0.0)
-        valid = rendered_mask & self.detection_mask.astype(bool) & valid_observed & valid_rendered
+        valid = rendered_mask & detection_mask & valid_observed & valid_rendered
         if visible_region is not None:
             valid &= np.asarray(visible_region).astype(bool)
 
-        denom_mask = self.detection_mask.astype(bool)
+        denom_mask = detection_mask
         if visible_region is not None:
             denom_mask &= np.asarray(visible_region).astype(bool)
         denom = max(1, int(denom_mask.sum()))
@@ -99,6 +110,7 @@ class DepthConsistencyPrior:
         valid_ratio = float(valid_count / denom)
         if valid_count <= 0:
             return {
+                "depth_enabled": False,
                 "depth_score": 0.0,
                 "depth_confidence": 0.0,
                 "depth_error": None,
@@ -106,20 +118,29 @@ class DepthConsistencyPrior:
                 "debug": {"reason": "no_valid_depth", "valid_count": valid_count, "denominator": denom},
             }
 
-        errors = np.abs(rendered_depth[valid] - self.observed_depth[valid]).astype(np.float32)
-        if self.config.robust_stat == "mean":
-            depth_error = float(np.mean(errors))
+        rendered_valid = rendered_depth[valid].astype(np.float32)
+        observed_valid = self.observed_depth[valid].astype(np.float32)
+        median_rendered = float(np.median(rendered_valid))
+        median_observed = float(np.median(observed_valid))
+        if str(getattr(self.config, "error_mode", "pixel_abs")).strip().lower() == "median_z":
+            depth_error = float(abs(median_rendered - median_observed))
         else:
-            depth_error = float(np.median(errors))
+            errors = np.abs(rendered_valid - observed_valid).astype(np.float32)
+            if self.config.robust_stat == "mean":
+                depth_error = float(np.mean(errors))
+            else:
+                depth_error = float(np.median(errors))
         if valid_ratio < float(self.config.min_valid_ratio):
-            confidence = float(np.clip(valid_ratio / max(self.config.eps, self.config.min_valid_ratio), 0.0, 1.0))
             return {
+                "depth_enabled": False,
                 "depth_score": 0.0,
-                "depth_confidence": confidence,
+                "depth_confidence": 0.0,
                 "depth_error": depth_error,
                 "valid_depth_ratio": valid_ratio,
+                "median_rendered_depth": median_rendered,
+                "median_observed_depth": median_observed,
                 "debug": {
-                    "reason": "valid_ratio_below_threshold",
+                    "reason": "low_valid_depth_ratio",
                     "valid_count": valid_count,
                     "denominator": denom,
                     "min_valid_ratio": float(self.config.min_valid_ratio),
@@ -128,20 +149,26 @@ class DepthConsistencyPrior:
 
         depth_score = float(np.exp(-depth_error / max(self.config.eps, float(self.config.depth_sigma))))
         return {
+            "depth_enabled": True,
             "depth_score": depth_score,
             "depth_confidence": 1.0,
             "depth_error": depth_error,
             "valid_depth_ratio": valid_ratio,
+            "median_rendered_depth": median_rendered,
+            "median_observed_depth": median_observed,
             "debug": {"valid_count": valid_count, "denominator": denom},
         }
 
     @staticmethod
     def _disabled(reason: str) -> dict[str, Any]:
         return {
+            "depth_enabled": False,
             "depth_score": 0.0,
             "depth_confidence": 0.0,
             "depth_error": None,
             "valid_depth_ratio": 0.0,
+            "median_rendered_depth": None,
+            "median_observed_depth": None,
             "debug": {"reason": reason},
         }
 
@@ -203,4 +230,3 @@ def render_depth_by_triangle_zbuffer(
             depth[update] = float(tri_depth)
     depth[~np.isfinite(depth)] = 0.0
     return depth
-

@@ -158,6 +158,10 @@ class ZaiwuConfig(BaseModel):
     background_cleaner_config_path: str | None = None
     background_cleaner_model: str = "gpt-image-2"
     background_cleaner_reference_frame_id: int = 1
+    pose_depth_source: str = "depth_anything3"
+    pose_depth_fallback_to_wildgs: bool = False
+    pose_depth_type: str = "metric"
+    pose_depth_unit: str = "meter"
     depth_service: str = "services.depth_anything3"
     wildgs_slam_service: str = "services.wildgs_slam"
     gotrack_service: str = "services.gotrack"

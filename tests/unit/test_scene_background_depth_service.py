@@ -39,6 +39,34 @@ class _FakeGateway:
         return _depth_bytes(self.depth)
 
 
+class _FakeFrameDepthGateway:
+    def __init__(self, depth: np.ndarray, *, metadata: dict | None = None) -> None:
+        self.depth = depth
+        self.metadata = dict(metadata or {})
+        self.uploads: list[tuple[str, Path]] = []
+        self.jobs: list[tuple[str, str, dict]] = []
+
+    def upload_file(self, service_id: str, path: str | Path) -> str:
+        self.uploads.append((service_id, Path(path)))
+        return "uploads/frame_depth_video.mp4"
+
+    def run_service_job(self, service_id: str, operation: str, *, payload: dict, timeout_sec: float | None = None) -> dict:
+        _ = timeout_sec
+        self.jobs.append((service_id, operation, dict(payload)))
+        result = {
+            "output_file_id": "outputs/frame_depth.npy",
+            "depth_type": self.metadata.get("depth_type", "metric"),
+            "depth_unit": self.metadata.get("depth_unit", "meter"),
+            "model_name": self.metadata.get("model_name", "/models/DA3METRIC-LARGE"),
+        }
+        result.update(self.metadata)
+        return result
+
+    def download_bytes(self, service_id: str, file_id: str) -> bytes:
+        _ = (service_id, file_id)
+        return _depth_bytes(self.depth)
+
+
 class _FakeRoadGateway:
     def __init__(self, mask: np.ndarray) -> None:
         self.mask = mask.astype(np.uint8)
@@ -121,6 +149,169 @@ def test_clean_background_depth_estimator_calls_depth_anything_video_job(monkeyp
     saved = np.load(result["depth_path"])
     assert saved.shape == (24, 32)
     assert float(saved[0, 0]) == 7.5
+
+
+def test_geometry_lift_writes_depth_anything3_frame_depth_manifest(monkeypatch, tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    for frame_id in (1, 2):
+        image = np.full((18, 26, 3), frame_id * 20, dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / f"frame_{frame_id:06d}.jpg"), image)
+    fake_gateway = _FakeFrameDepthGateway(
+        np.stack(
+            [
+                np.full((18, 26), 3.1, dtype=np.float32),
+                np.full((18, 26), 3.2, dtype=np.float32),
+            ]
+        ),
+        metadata={
+            "depth_type": "metric",
+            "depth_unit": "meter",
+            "model_name": "/root/autodl-fs/models/depth-anything/DA3METRIC-LARGE",
+        },
+    )
+    monkeypatch.setattr(executor_module, "build_zaiwu_gateway_client", lambda settings: fake_gateway)
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = SimpleNamespace(
+        config=SimpleNamespace(
+            project=SimpleNamespace(provider_mode="zaiwu"),
+            settings=SimpleNamespace(
+                zaiwu=SimpleNamespace(
+                    enabled=True,
+                    depth_service="services.depth_anything3",
+                    job_timeout_sec=30.0,
+                    pose_depth_source="depth_anything3",
+                )
+            ),
+        )
+    )
+
+    result = executor._generate_depth_anything3_frame_depths(
+        frame_image_paths=[frames_dir / "frame_000001.jpg", frames_dir / "frame_000002.jpg"],
+        output_dir=tmp_path / "depth_anything3",
+        force=False,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["depth_source"] == "depth_anything3"
+    assert manifest["depth_type"] == "metric"
+    assert manifest["depth_unit"] == "meter"
+    assert manifest["frame_index_base"] == "0-based"
+    assert manifest["frame_count"] == 2
+    assert (tmp_path / "depth_anything3" / "depth_maps" / "00000.npy").exists()
+    assert (tmp_path / "depth_anything3" / "depth_maps" / "00001.npy").exists()
+    assert np.load(tmp_path / "depth_anything3" / "depth_maps" / "00000.npy").shape == (18, 26)
+
+
+def test_geometry_lift_names_depth_anything3_maps_by_pipeline_frame_id(monkeypatch, tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    for frame_id in (1, 3):
+        image = np.full((18, 26, 3), frame_id * 20, dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / f"frame_{frame_id:06d}.jpg"), image)
+    fake_gateway = _FakeFrameDepthGateway(
+        np.stack(
+            [
+                np.full((18, 26), 3.1, dtype=np.float32),
+                np.full((18, 26), 3.3, dtype=np.float32),
+            ]
+        )
+    )
+    monkeypatch.setattr(executor_module, "build_zaiwu_gateway_client", lambda settings: fake_gateway)
+
+    executor = object.__new__(ProjectExecutor)
+    executor.context = SimpleNamespace(
+        config=SimpleNamespace(
+            project=SimpleNamespace(provider_mode="zaiwu"),
+            settings=SimpleNamespace(
+                zaiwu=SimpleNamespace(
+                    enabled=True,
+                    depth_service="services.depth_anything3",
+                    job_timeout_sec=30.0,
+                    pose_depth_source="depth_anything3",
+                )
+            ),
+        )
+    )
+
+    result = executor._generate_depth_anything3_frame_depths(
+        frame_image_paths=[frames_dir / "frame_000001.jpg", frames_dir / "frame_000003.jpg"],
+        output_dir=tmp_path / "depth_anything3",
+        force=False,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert (tmp_path / "depth_anything3" / "depth_maps" / "00000.npy").exists()
+    assert (tmp_path / "depth_anything3" / "depth_maps" / "00002.npy").exists()
+    assert not (tmp_path / "depth_anything3" / "depth_maps" / "00001.npy").exists()
+    assert manifest["frames"][1]["pipeline_frame_id"] == 3
+    assert manifest["frames"][1]["depth_index"] == 2
+    assert np.load(tmp_path / "depth_anything3" / "depth_maps" / "00002.npy")[0, 0] == np.float32(3.3)
+
+
+def test_resolve_depth_anything3_depth_maps_uses_raw_da3_even_when_aligned_manifest_dir_exists(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "depth_anything3" / "depth_maps"
+    aligned_dir = tmp_path / "depth_anything3" / "depth_maps_metric_aligned"
+    raw_dir.mkdir(parents=True)
+    aligned_dir.mkdir(parents=True)
+    np.save(raw_dir / "00000.npy", np.ones((2, 2), dtype=np.float32))
+    np.save(aligned_dir / "00000.npy", np.ones((2, 2), dtype=np.float32) * 0.5)
+    manifest_path = tmp_path / "depth_anything3" / "depth_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "depth_maps_dir": str(raw_dir),
+                "metric_aligned_depth_maps_dir": str(aligned_dir),
+                "metric_alignment_source": "wildgs_metric_depth_affine",
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(
+        outputs={
+            "depth_anything3_depth_maps": str(raw_dir),
+            "depth_anything3_depth_manifest": str(manifest_path),
+        }
+    )
+
+    assert ProjectExecutor._resolve_depth_anything3_depth_maps_dir(geometry) == str(raw_dir)
+
+
+def test_generic_pose_context_prefers_depth_anything3_and_keeps_wildgs_metadata(tmp_path: Path) -> None:
+    da3 = tmp_path / "depth_anything3" / "depth_maps" / "00000.npy"
+    wildgs = tmp_path / "wildgs" / "depth_maps" / "00000.npy"
+    da3.parent.mkdir(parents=True)
+    wildgs.parent.mkdir(parents=True)
+    np.save(da3, np.ones((3, 4), dtype=np.float32))
+    np.save(wildgs, np.ones((3, 4), dtype=np.float32) * 2)
+
+    selection = ProjectExecutor._pose_depth_selection_for_frame(
+        frame_id=1,
+        depth_source="depth_anything3",
+        da3_depth_maps_dir=da3.parent,
+        wildgs_depth_maps_dir=wildgs.parent,
+        fallback_to_wildgs=False,
+    )
+    context = ProjectExecutor._generic_pose_context_for_frame(
+        base_context={},
+        obj_id="obj_000001",
+        frame_id=1,
+        generic_phase="auto",
+        depth_map_path=selection.primary_depth_path,
+        background_geometry_reference=None,
+        depth_selection=selection,
+    )
+
+    assert context["depth_path"] == str(da3)
+    assert context["depth_map_path"] == str(da3)
+    assert context["depth_source"] == "depth_anything3"
+    assert context["depth_type"] == "metric"
+    assert context["depth_unit"] == "meter"
+    assert context["fallback_to_wildgs"] is False
+    assert context["depth_sources"]["primary_depth_path"] == str(da3)
+    assert context["depth_sources"]["wildgs_depth_path"] == str(wildgs)
+    assert context["depth_sources"]["use_wildgs_depth"] is False
 
 
 def test_background_clean_depth_estimator_stays_enabled_for_tabletop_task(tmp_path: Path) -> None:

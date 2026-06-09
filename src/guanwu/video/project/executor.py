@@ -5,12 +5,14 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +77,17 @@ _ZAIWU_SAM3D_PER_OBJECT_TIMEOUT_SEC = 300.0
 _POSE_OPTIMIZE_MIN_BBOX_AREA_PX = 800.0
 _POSE_MATCH_MIN_BBOX_AREA_PX = 500.0
 _POSE_TRACK_SCALE_PRIOR_MIN_FRAMES = 2
+
+
+@dataclass(frozen=True)
+class PoseDepthSelection:
+    primary_depth_path: Path | None
+    wildgs_depth_path: Path | None
+    depth_source: str
+    depth_type: str = "metric"
+    depth_unit: str = "meter"
+    fallback_to_wildgs: bool = False
+    use_wildgs_depth: bool = False
 _EDGE_POSE_HEADING_METRIC_KEYS = (
     "heading_prior_score",
     "heading_prior_angle_error_deg",
@@ -278,7 +291,18 @@ class ProjectExecutor:
                     "outputs": record.outputs if record else {},
                 }
             runner = getattr(self, self._runner_name(stage))
-            result = runner(**kwargs)
+            previous_force = getattr(self, "_current_stage_force", None)
+            self._current_stage_force = bool(force)
+            try:
+                result = runner(**kwargs)
+            finally:
+                if previous_force is None:
+                    try:
+                        delattr(self, "_current_stage_force")
+                    except AttributeError:
+                        pass
+                else:
+                    self._current_stage_force = previous_force
             statuses[stage] = StageStatus(
                 stage=stage,
                 status="completed",
@@ -1396,6 +1420,27 @@ class ProjectExecutor:
             "object_trajectories": str(object_traj_path),
         }
         self._json_dump(summary_path, summary_payload)
+        depth_anything3_outputs: dict[str, Any] = {}
+        if (
+            self._pose_depth_source() == "depth_anything3"
+            and self._provider_mode() == "zaiwu"
+            and bool(getattr(self.context.config.settings.zaiwu, "enabled", False))
+        ):
+            frame_depth_images_dir = out_dir / "depth_anything3" / "frames"
+            frame_image_paths = self._write_geometry_lift_frame_images_for_depth(
+                frame_entries,
+                frame_depth_images_dir,
+            )
+            if frame_image_paths:
+                depth_anything3_outputs = self._generate_depth_anything3_frame_depths(
+                    frame_image_paths=frame_image_paths,
+                    output_dir=out_dir / "depth_anything3",
+                    force=bool(getattr(self, "_current_stage_force", False)),
+                )
+                _logger.info(
+                    "[geometry.lift] Generated DA3 frame depths: %s",
+                    depth_anything3_outputs.get("manifest_path"),
+                )
         background_assets: dict = {}
         try:
             zaiwu_settings = self.context.config.settings.zaiwu
@@ -1467,6 +1512,10 @@ class ProjectExecutor:
             outputs["wildgs_dynamic_prior"] = wildgs_outputs["dynamic_prior_dir"]
         if wildgs_outputs.get("depth_maps_dir"):
             outputs["wildgs_depth_maps"] = wildgs_outputs["depth_maps_dir"]
+        if depth_anything3_outputs.get("depth_maps_dir"):
+            outputs["depth_anything3_depth_maps"] = depth_anything3_outputs["depth_maps_dir"]
+        if depth_anything3_outputs.get("manifest_path"):
+            outputs["depth_anything3_depth_manifest"] = depth_anything3_outputs["manifest_path"]
         if wildgs_outputs.get("plots_dir"):
             outputs["wildgs_plots"] = wildgs_outputs["plots_dir"]
         if wildgs_outputs.get("static_map_dir"):
@@ -1484,6 +1533,7 @@ class ProjectExecutor:
             "wildgs_slam_quality": wildgs_outputs.get("slam_quality"),
             "background_assets_available": bool(background_assets.get("manifest_path")),
             "background_mode": background_mode if "background_mode" in locals() else "auto",
+            "depth_anything3_frame_depth_available": bool(depth_anything3_outputs.get("depth_maps_dir")),
         }
         return self._base_result("geometry.lift", result_summary, outputs)
 
@@ -1552,6 +1602,156 @@ class ProjectExecutor:
         except Exception as exc:
             _logger.warning("[geometry.lift] Depth Anything3 clean background depth failed; falling back to WildGS depth: %s", exc)
             return None
+
+    def _write_geometry_lift_frame_images_for_depth(
+        self,
+        frame_entries: list[dict],
+        output_dir: Path,
+    ) -> list[Path]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frame_paths: list[Path] = []
+        for entry in sorted(frame_entries, key=lambda item: int(item.get("frame_idx") or 0)):
+            try:
+                frame_id = int(entry.get("frame_idx") or 0)
+            except Exception:
+                frame_id = 0
+            if frame_id <= 0:
+                continue
+            image = None
+            detections_path = entry.get("detections")
+            if detections_path:
+                try:
+                    detections = FrameDetections.model_validate(self._json_load(detections_path))
+                    if detections.image_b64:
+                        image = cv2.imdecode(np_from_b64(str(detections.image_b64)), cv2.IMREAD_COLOR)
+                except Exception as exc:
+                    _logger.debug("[geometry.lift] Failed to decode frame image for DA3 depth frame %s: %s", frame_id, exc)
+            if image is None:
+                image = self._read_project_video_frame(frame_id)
+            if image is None:
+                _logger.warning("[geometry.lift] Missing RGB image for DA3 depth frame %s; skipping", frame_id)
+                continue
+            frame_path = output_dir / f"frame_{frame_id:06d}.jpg"
+            if not cv2.imwrite(str(frame_path), image):
+                raise RuntimeError(f"Failed to write DA3 depth frame image: {frame_path}")
+            frame_paths.append(frame_path)
+        return frame_paths
+
+    def _generate_depth_anything3_frame_depths(
+        self,
+        *,
+        frame_image_paths: list[Path],
+        output_dir: Path,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        frame_paths = [Path(path) for path in frame_image_paths]
+        if not frame_paths:
+            return {}
+        output_dir.mkdir(parents=True, exist_ok=True)
+        depth_maps_dir = output_dir / "depth_maps"
+        depth_maps_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "depth_manifest.json"
+        depth_indices = [self._depth_anything3_index_for_frame_path(path, fallback_index=index) for index, path in enumerate(frame_paths)]
+        expected_paths = [depth_maps_dir / f"{index:05d}.npy" for index in depth_indices]
+        if (
+            not force
+            and manifest_path.exists()
+            and all(path.exists() for path in expected_paths)
+        ):
+            return {"depth_maps_dir": str(depth_maps_dir), "manifest_path": str(manifest_path), "cached": True}
+        if self._provider_mode() != "zaiwu":
+            raise RuntimeError("Depth Anything3 frame depth generation requires provider_mode='zaiwu'")
+        settings = self.context.config.settings
+        if not getattr(settings.zaiwu, "enabled", False):
+            raise RuntimeError("Depth Anything3 frame depth generation requires zaiwu.enabled=true")
+        service_id = str(settings.zaiwu.depth_service or "services.depth_anything3")
+        video_path = output_dir / "_frame_depth_input.mp4"
+        try:
+            self._write_frame_sequence_depth_video(frame_paths, video_path, fps=30.0)
+            gateway = build_zaiwu_gateway_client(settings)
+            video_file_id = gateway.upload_file(service_id, video_path)
+            result = gateway.run_service_job(
+                service_id,
+                "estimate_from_video",
+                payload={"video_file_id": video_file_id, "sample_every_n": 1},
+                timeout_sec=max(1800.0, float(settings.zaiwu.job_timeout_sec or 0.0)),
+            )
+            output_file_id = str(result.get("output_file_id") or result.get("result_file_id") or "")
+            if not output_file_id:
+                raise RuntimeError(f"Depth Anything3 returned no depth artifact: {result}")
+            data = gateway.download_bytes(service_id, output_file_id)
+            depth_arr = self._decode_depth_anything_result(data, keep_frame_axis=True)
+            if depth_arr is None:
+                raise RuntimeError("Depth Anything3 frame depth artifact is not a valid depth array")
+            if depth_arr.ndim == 2:
+                depth_arr = depth_arr[np.newaxis, :, :]
+            if int(depth_arr.shape[0]) != len(frame_paths):
+                if int(depth_arr.shape[0]) == 1 and len(frame_paths) == 1:
+                    pass
+                else:
+                    raise RuntimeError(
+                        "Depth Anything3 returned an unexpected frame count: "
+                        f"{int(depth_arr.shape[0])} for {len(frame_paths)} input frames"
+                    )
+            frame_manifest_entries: list[dict[str, Any]] = []
+            for frame_path, depth_index, frame_depth in zip(frame_paths, depth_indices, depth_arr[: len(frame_paths)], strict=False):
+                target_depth_path = depth_maps_dir / f"{int(depth_index):05d}.npy"
+                np.save(target_depth_path, np.asarray(frame_depth, dtype=np.float32))
+                frame_manifest_entries.append(
+                    {
+                        "input_frame": str(frame_path),
+                        "pipeline_frame_id": int(self._pipeline_frame_id_from_frame_path(frame_path) or int(depth_index) + 1),
+                        "depth_index": int(depth_index),
+                        "depth_path": str(target_depth_path),
+                    }
+                )
+            depth_type = str(result.get("depth_type") or "metric")
+            depth_unit = str(result.get("depth_unit") or "meter")
+            model_name = str(result.get("model_name") or "")
+            manifest = {
+                "depth_source": "depth_anything3",
+                "depth_type": depth_type,
+                "depth_unit": depth_unit,
+                "model_name": model_name,
+                "frame_index_base": "0-based",
+                "depth_maps_dir": str(depth_maps_dir),
+                "frame_count": int(len(frame_paths)),
+                "depth_service": service_id,
+                "depth_artifact_file_id": output_file_id,
+                "input_video": str(video_path),
+                "input_frames": [str(path) for path in frame_paths],
+                "frames": frame_manifest_entries,
+            }
+            self._json_dump(manifest_path, manifest)
+            return {
+                "depth_maps_dir": str(depth_maps_dir),
+                "manifest_path": str(manifest_path),
+                "depth_type": depth_type,
+                "depth_unit": depth_unit,
+                "model_name": model_name,
+                "cached": False,
+            }
+        except Exception as exc:
+            _logger.error("[geometry.lift] Depth Anything3 frame depth generation failed: %s", exc)
+            raise
+
+    @staticmethod
+    def _pipeline_frame_id_from_frame_path(path: Path) -> int | None:
+        match = re.search(r"frame_(\d+)", Path(path).stem)
+        if not match:
+            return None
+        try:
+            frame_id = int(match.group(1))
+        except Exception:
+            return None
+        return frame_id if frame_id > 0 else None
+
+    @staticmethod
+    def _depth_anything3_index_for_frame_path(path: Path, *, fallback_index: int) -> int:
+        frame_id = ProjectExecutor._pipeline_frame_id_from_frame_path(path)
+        if frame_id is None:
+            return int(fallback_index)
+        return max(0, int(frame_id) - 1)
 
     def _estimate_semantic_road_with_zaiwu(
         self,
@@ -1704,7 +1904,33 @@ class ProjectExecutor:
             writer.release()
 
     @staticmethod
-    def _decode_depth_anything_result(data: bytes):
+    def _write_frame_sequence_depth_video(frame_image_paths: list[Path], video_path: Path, *, fps: float = 30.0) -> None:
+        frames: list[np.ndarray] = []
+        target_size: tuple[int, int] | None = None
+        for path in frame_image_paths:
+            rgb = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if rgb is None:
+                raise ValueError(f"Failed to read RGB frame for DA3 depth: {path}")
+            height, width = rgb.shape[:2]
+            if target_size is None:
+                target_size = (int(width), int(height))
+            elif (int(width), int(height)) != target_size:
+                rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_AREA)
+            frames.append(rgb)
+        if not frames or target_size is None:
+            raise ValueError("No RGB frames available for DA3 depth video")
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), target_size)
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open temporary DA3 depth video writer: {video_path}")
+        try:
+            for frame in frames:
+                writer.write(frame)
+        finally:
+            writer.release()
+
+    @staticmethod
+    def _decode_depth_anything_result(data: bytes, *, keep_frame_axis: bool = False):
         import io
 
         try:
@@ -1723,9 +1949,9 @@ class ProjectExecutor:
                     pass
                 tmp_path.unlink(missing_ok=True)
         arr = np.asarray(arr)
-        if arr.ndim == 3:
+        if arr.ndim == 3 and not keep_frame_axis:
             arr = arr[0]
-        if arr.ndim != 2:
+        if arr.ndim not in ({2, 3} if keep_frame_axis else {2}):
             return None
         return arr
 
@@ -1853,6 +2079,7 @@ class ProjectExecutor:
         geo_summary = self._json_load(geometry.outputs["summary"])
         detection_frames = geo_summary.get("frames", [])
         depth_maps_dir = self._resolve_wildgs_depth_maps_dir(geometry)
+        da3_depth_maps_dir = self._resolve_depth_anything3_depth_maps_dir(geometry)
         wildgs_poses, wildgs_K = self._load_wildgs_poses(geometry)
         road_geometry = estimate_road_geometry(
             depth_maps_dir=depth_maps_dir,
@@ -1878,6 +2105,7 @@ class ProjectExecutor:
                 obj_traj=obj_traj,
                 detection_frames=detection_frames,
                 depth_maps_dir=depth_maps_dir,
+                da3_depth_maps_dir=da3_depth_maps_dir,
                 wildgs_poses=wildgs_poses,
                 wildgs_K=wildgs_K,
                 road_geometry=road_geometry,
@@ -2144,6 +2372,38 @@ class ProjectExecutor:
             return "depth_icp_temporal"
         return "edge_contour_fast_temporal"
 
+    def _pose_depth_source(self) -> str:
+        raw = os.environ.get("GUANWU_POSE_DEPTH_SOURCE")
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(self.context.config.settings.zaiwu, "pose_depth_source", "depth_anything3")
+        value = str(raw or "depth_anything3").strip().lower().replace("-", "_")
+        if value in {"da3", "depth_anything", "depth_anything3", "zaiwu_depth_anything3"}:
+            return "depth_anything3"
+        if value in {"wildgs", "wildgs_depth", "wildgs_depth_map"}:
+            return "wildgs"
+        return value or "depth_anything3"
+
+    def _pose_depth_fallback_to_wildgs(self) -> bool:
+        raw = os.environ.get("GUANWU_POSE_DEPTH_FALLBACK_TO_WILDGS")
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(self.context.config.settings.zaiwu, "pose_depth_fallback_to_wildgs", False)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _pose_depth_type(self) -> str:
+        raw = os.environ.get("GUANWU_POSE_DEPTH_TYPE")
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(self.context.config.settings.zaiwu, "pose_depth_type", "metric")
+        return str(raw or "metric").strip().lower() or "metric"
+
+    def _pose_depth_unit(self) -> str:
+        raw = os.environ.get("GUANWU_POSE_DEPTH_UNIT")
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(self.context.config.settings.zaiwu, "pose_depth_unit", "meter")
+        value = str(raw or "meter").strip().lower()
+        return "meter" if value in {"m", "meter", "meters"} else value
+
     @staticmethod
     def _refined_trajectories_from_pose_tracks(object_pose_tracks: dict) -> dict[str, list[dict]]:
         refined: dict[str, list[dict]] = {}
@@ -2271,6 +2531,7 @@ class ProjectExecutor:
         obj_traj: dict,
         detection_frames: list[dict],
         depth_maps_dir: str | None,
+        da3_depth_maps_dir: str | None,
         wildgs_poses: list[dict],
         wildgs_K: dict | None,
         road_geometry: dict | None,
@@ -2285,6 +2546,16 @@ class ProjectExecutor:
 
         pose_strategy = str(pose_strategy or "edge_contour_fast_temporal")
         generic_mode = pose_strategy == "generic_appearance_temporal"
+        pose_depth_source = self._pose_depth_source()
+        pose_depth_fallback_to_wildgs = self._pose_depth_fallback_to_wildgs()
+        if generic_mode:
+            _logger.info(
+                "[pose.optimize] depth_source=%s depth_type=%s unit=%s fallback_to_wildgs=%s",
+                pose_depth_source,
+                self._pose_depth_type(),
+                self._pose_depth_unit(),
+                str(pose_depth_fallback_to_wildgs).lower(),
+            )
         target_frame_mode = self._pose_target_frame_mode()
         all_frames_mode = target_frame_mode == "all_frames"
         dynamic_window_enabled = self._pose_env_bool("GUANWU_POSE_DYNAMIC_WINDOW", default=all_frames_mode)
@@ -2624,13 +2895,24 @@ class ProjectExecutor:
                     target_window_radius=target_window_radius,
                 )
                 if generic_mode:
+                    frame_instances = self._get_instances_for_frame(int(frame_id), detection_frames)
                     generic_phase = self._generic_pose_phase_for_frame(
                         frame_id=int(frame_id),
                         track_scale_prior=track_scale_prior,
                         previous_records=all_frame_prior_records if all_frames_mode else accepted_records,
                         inst=inst,
+                        frame_instances=frame_instances,
                     )
-                    depth_map_path = self._resolve_depth_map_for_frame(depth_maps_dir, int(frame_id))
+                    depth_selection = self._pose_depth_selection_for_frame(
+                        frame_id=int(frame_id),
+                        depth_source=pose_depth_source,
+                        da3_depth_maps_dir=da3_depth_maps_dir,
+                        wildgs_depth_maps_dir=depth_maps_dir,
+                        fallback_to_wildgs=pose_depth_fallback_to_wildgs,
+                        depth_type=self._pose_depth_type(),
+                        depth_unit=self._pose_depth_unit(),
+                    )
+                    depth_map_path = depth_selection.primary_depth_path
                     vehicle_pose_context = self._generic_pose_context_for_frame(
                         base_context=vehicle_pose_context,
                         obj_id=obj_id,
@@ -2638,6 +2920,7 @@ class ProjectExecutor:
                         generic_phase=generic_phase,
                         depth_map_path=depth_map_path,
                         background_geometry_reference=background_geometry_reference,
+                        depth_selection=depth_selection,
                     )
                     reuse_decision = self._generic_static_pose_reuse_decision(
                         frame_id=int(frame_id),
@@ -6122,6 +6405,7 @@ class ProjectExecutor:
         track_scale_prior: dict | None,
         previous_records: list[dict] | None,
         inst: dict | None = None,
+        frame_instances: list[dict] | None = None,
         min_contact_frames: int = 10,
         lift_bbox_center_delta_px: float = 18.0,
         bbox_area_shrink_ratio: float = 0.88,
@@ -6143,6 +6427,8 @@ class ProjectExecutor:
         if int(frame_id) <= int(min_contact_frames):
             return "contact_calibration"
         current_bbox = None if inst is None else inst.get("bbox_xyxy") or inst.get("bbox")
+        if ProjectExecutor._generic_target_has_manipulator_occlusion(inst, frame_instances):
+            return "free_motion"
         current_center_y = ProjectExecutor._bbox_center_y(current_bbox)
         current_area = ProjectExecutor._bbox_area_px(current_bbox)
         contact_ref_area = ProjectExecutor._generic_contact_bbox_area_reference(
@@ -6166,6 +6452,107 @@ class ProjectExecutor:
             if anchor_center_y - current_center_y >= float(lift_bbox_center_delta_px):
                 return "free_motion"
         return "contact_calibration"
+
+    @staticmethod
+    def _generic_instance_label(inst: dict | None) -> str:
+        if not isinstance(inst, dict):
+            return ""
+        return str(
+            inst.get("concept_label")
+            or inst.get("label")
+            or inst.get("class_name")
+            or inst.get("category")
+            or ""
+        ).strip().lower()
+
+    @staticmethod
+    def _is_generic_manipulator_instance(inst: dict | None) -> bool:
+        label = ProjectExecutor._generic_instance_label(inst)
+        if not label:
+            return False
+        direct_terms = (
+            "robotic gripper",
+            "robot gripper",
+            "gripper",
+            "robotic arm",
+            "robot arm",
+            "end effector",
+            "end-effector",
+            "manipulator",
+            "claw",
+        )
+        if any(term in label for term in direct_terms):
+            return True
+        return ("robot" in label or "robotic" in label) and any(
+            term in label for term in ("arm", "hand", "finger", "clamp")
+        )
+
+    @staticmethod
+    def _bbox_xyxy_tuple(bbox: object) -> tuple[float, float, float, float] | None:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+            return None
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _bbox_intersection_area(a: object, b: object) -> float:
+        box_a = ProjectExecutor._bbox_xyxy_tuple(a)
+        box_b = ProjectExecutor._bbox_xyxy_tuple(b)
+        if box_a is None or box_b is None:
+            return 0.0
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        return max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+
+    @staticmethod
+    def _expand_bbox_xyxy(bbox: object, margin_px: float) -> list[float] | None:
+        box = ProjectExecutor._bbox_xyxy_tuple(bbox)
+        if box is None:
+            return None
+        x1, y1, x2, y2 = box
+        margin = max(0.0, float(margin_px))
+        return [x1 - margin, y1 - margin, x2 + margin, y2 + margin]
+
+    @staticmethod
+    def _generic_target_has_manipulator_occlusion(
+        inst: dict | None,
+        frame_instances: list[dict] | None,
+        *,
+        min_target_overlap: float = 0.08,
+        near_margin_px: float = 10.0,
+    ) -> bool:
+        if not isinstance(inst, dict) or not frame_instances:
+            return False
+        target_bbox = inst.get("bbox_xyxy") or inst.get("bbox")
+        target_area = ProjectExecutor._bbox_area_px(target_bbox)
+        if target_area <= 0.0:
+            return False
+        expanded_target_bbox = ProjectExecutor._expand_bbox_xyxy(target_bbox, near_margin_px)
+        target_id = str(inst.get("object_id") or "")
+        for other in frame_instances:
+            if not isinstance(other, dict):
+                continue
+            if target_id and str(other.get("object_id") or "") == target_id:
+                continue
+            if not ProjectExecutor._is_generic_manipulator_instance(other):
+                continue
+            other_bbox = other.get("bbox_xyxy") or other.get("bbox")
+            overlap_ratio = ProjectExecutor._bbox_intersection_area(target_bbox, other_bbox) / max(target_area, 1e-6)
+            near_overlap = (
+                ProjectExecutor._bbox_intersection_area(expanded_target_bbox, other_bbox) > 0.0
+                if expanded_target_bbox is not None
+                else False
+            )
+            if overlap_ratio >= float(min_target_overlap) or near_overlap:
+                return True
+        return False
 
     @staticmethod
     def _bbox_xyxy_stats(current_bbox: object, previous_bbox: object) -> dict:
@@ -7360,6 +7747,13 @@ class ProjectExecutor:
             task["mesh_proxy"] = proxy_info
         if vehicle_pose_context:
             task["vehicle_pose_context"] = vehicle_pose_context
+            depth_path = vehicle_pose_context.get("depth_path") or vehicle_pose_context.get("depth_map_path")
+            if depth_path:
+                task["depth_path"] = str(depth_path)
+                task["depth_map_path"] = str(depth_path)
+            for key in ("depth_source", "depth_type", "depth_unit", "fallback_to_wildgs", "depth_sources"):
+                if key in vehicle_pose_context:
+                    task[key] = vehicle_pose_context[key]
         if temporal_prior_pose:
             task["temporal_prior_pose"] = temporal_prior_pose
         task_path = task_dir / "task.json"
@@ -7960,6 +8354,37 @@ class ProjectExecutor:
         return str(raw) if raw else None
 
     @staticmethod
+    def _resolve_depth_anything3_depth_maps_dir(geometry) -> str | None:
+        outputs = getattr(geometry, "outputs", {}) or {}
+        raw = outputs.get("depth_anything3_depth_maps")
+        if raw and Path(str(raw)).exists():
+            return str(raw)
+        manifest_raw = outputs.get("depth_anything3_depth_manifest")
+        if manifest_raw and Path(str(manifest_raw)).exists():
+            try:
+                manifest = json.loads(Path(str(manifest_raw)).read_text(encoding="utf-8"))
+                depth_maps_dir = manifest.get("depth_maps_dir")
+                if depth_maps_dir and Path(str(depth_maps_dir)).exists():
+                    return str(depth_maps_dir)
+            except Exception:
+                pass
+        summary_path = outputs.get("summary")
+        if not summary_path:
+            return str(raw) if raw else None
+        gl_dir = Path(str(summary_path)).parent
+        candidates = [
+            gl_dir / "depth_anything3" / "depth_maps",
+            gl_dir / "depth_anything3",
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and any(candidate.glob("*.npy")):
+                    return str(candidate)
+            except OSError:
+                continue
+        return str(raw) if raw else None
+
+    @staticmethod
     def _resolve_depth_map_for_frame(depth_maps_dir: str | Path | None, frame_id: int) -> Path | None:
         if not depth_maps_dir:
             return None
@@ -7979,6 +8404,43 @@ class ProjectExecutor:
             except OSError:
                 continue
         return None
+
+    @staticmethod
+    def _pose_depth_selection_for_frame(
+        *,
+        frame_id: int,
+        depth_source: str,
+        da3_depth_maps_dir: str | Path | None,
+        wildgs_depth_maps_dir: str | Path | None,
+        fallback_to_wildgs: bool,
+        depth_type: str = "metric",
+        depth_unit: str = "meter",
+    ) -> PoseDepthSelection:
+        source = str(depth_source or "depth_anything3").strip().lower().replace("-", "_")
+        if source in {"da3", "depth_anything", "zaiwu_depth_anything3"}:
+            source = "depth_anything3"
+        wildgs_path = ProjectExecutor._resolve_depth_map_for_frame(wildgs_depth_maps_dir, int(frame_id))
+        da3_path = ProjectExecutor._resolve_depth_map_for_frame(da3_depth_maps_dir, int(frame_id))
+        if source == "wildgs":
+            return PoseDepthSelection(
+                primary_depth_path=wildgs_path,
+                wildgs_depth_path=wildgs_path,
+                depth_source="wildgs",
+                depth_type=str(depth_type or "metric"),
+                depth_unit=str(depth_unit or "meter"),
+                fallback_to_wildgs=bool(fallback_to_wildgs),
+                use_wildgs_depth=True,
+            )
+        use_wildgs = bool(fallback_to_wildgs and da3_path is None and wildgs_path is not None)
+        return PoseDepthSelection(
+            primary_depth_path=wildgs_path if use_wildgs else da3_path,
+            wildgs_depth_path=wildgs_path,
+            depth_source="wildgs" if use_wildgs else "depth_anything3",
+            depth_type=str(depth_type or "metric"),
+            depth_unit=str(depth_unit or "meter"),
+            fallback_to_wildgs=bool(fallback_to_wildgs),
+            use_wildgs_depth=use_wildgs,
+        )
 
     @staticmethod
     def _find_bg_mesh(bg_mesh_dir: str | None) -> "Path | None":
@@ -8321,6 +8783,7 @@ class ProjectExecutor:
         generic_phase: str,
         depth_map_path: Path | str | None,
         background_geometry_reference: dict | None,
+        depth_selection: PoseDepthSelection | None = None,
     ) -> dict:
         context: dict = {
             "schema": "generic_pose_context.v1",
@@ -8338,6 +8801,21 @@ class ProjectExecutor:
                     context["mesh_axis_prior"] = dict(mesh_axis_prior)
         if depth_map_path:
             context["depth_map_path"] = str(depth_map_path)
+            context["depth_path"] = str(depth_map_path)
+        if depth_selection is not None:
+            if depth_selection.primary_depth_path:
+                context["depth_map_path"] = str(depth_selection.primary_depth_path)
+                context["depth_path"] = str(depth_selection.primary_depth_path)
+            context["depth_source"] = depth_selection.depth_source
+            context["depth_type"] = depth_selection.depth_type
+            context["depth_unit"] = depth_selection.depth_unit
+            context["fallback_to_wildgs"] = bool(depth_selection.fallback_to_wildgs)
+            context["depth_sources"] = {
+                "primary_depth_path": str(depth_selection.primary_depth_path) if depth_selection.primary_depth_path else None,
+                "primary_depth_source": depth_selection.depth_source,
+                "wildgs_depth_path": str(depth_selection.wildgs_depth_path) if depth_selection.wildgs_depth_path else None,
+                "use_wildgs_depth": bool(depth_selection.use_wildgs_depth),
+            }
         return ProjectExecutor._generic_pose_context_with_background_geometry_reference(
             context,
             background_geometry_reference,
@@ -8659,6 +9137,24 @@ class ProjectExecutor:
                     return inst
             break
         return None
+
+    def _get_instances_for_frame(self, frame_id, detection_frames):
+        for entry in detection_frames:
+            if entry.get("frame_idx") != frame_id:
+                continue
+            instances = entry.get("instances")
+            if isinstance(instances, list):
+                return [inst for inst in instances if isinstance(inst, dict)]
+            det_path = entry.get("detections")
+            if not det_path or not Path(det_path).exists():
+                return []
+            try:
+                det = self._json_load(det_path)
+            except Exception:
+                return []
+            instances = det.get("instances", []) if isinstance(det, dict) else []
+            return [inst for inst in instances if isinstance(inst, dict)]
+        return []
 
     def _get_mask_rle_for_frame(self, obj_id, frame_id, detection_frames):
         inst = self._get_instance_for_frame(obj_id, frame_id, detection_frames)

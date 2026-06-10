@@ -95,6 +95,11 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "depth_snapped_candidate_used",
     "depth_snap_delta_m",
     "depth_snap_source_error_m",
+    "depth_prefilter_failed",
+    "depth_prefilter_reason",
+    "depth_hard_gate_failed",
+    "depth_hard_gate_reason",
+    "depth_hard_penalty",
     "support_bottom_point_count",
     "support_bottom_mean_abs_m",
     "support_bottom_max_abs_m",
@@ -192,9 +197,7 @@ def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[s
             float(getattr(args, "generic_acceptance_depth_confidence_high", 0.70)),
             0.70,
         )
-        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.35)), 0.45)
-        args.support_plane_weight = max(float(getattr(args, "support_plane_weight", 0.20)), 0.35)
-        args.support_penalty_weight = max(float(getattr(args, "support_penalty_weight", 0.15)), 0.60)
+        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.35)), 1.00)
     elif phase == "free_motion":
         args.depth_enabled = bool(getattr(args, "generic_free_motion_depth_enabled", True))
         if bool(args.depth_enabled):
@@ -1559,6 +1562,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
 
     def _acceptance(self, result: dict[str, Any]) -> dict[str, Any]:
         reject_reasons: list[str] = []
+        support_warnings: list[str] = []
         motion_phase = _normalize_generic_motion_phase(getattr(self.generic_args, "generic_pose_motion_phase", "auto"))
         visible_iou = float(result.get("visible_mask_iou") or result.get("soft_mask_iou") or result.get("mask_iou") or 0.0)
         mask_iou = float(result.get("mask_iou") or visible_iou)
@@ -1605,16 +1609,30 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             and depth_error is not None
             and depth_confidence >= float(getattr(self.generic_args, "generic_depth_gate_min_confidence", 0.70))
             and valid_depth_ratio >= float(getattr(self.generic_args, "generic_depth_min_overlap_ratio", 0.35))
-            and depth_error > float(getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.12))
+            and depth_error > float(getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.055))
         ):
             reject_reasons.append("target_depth_error_above_threshold")
-        if motion_phase != "free_motion":
+        depth_hard_failed = "target_depth_error_above_threshold" in reject_reasons
+        if not depth_hard_failed and (
+            bool(getattr(self.generic_args, "generic_free_motion_depth_enabled", True)) or motion_phase != "free_motion"
+        ):
             depth_threshold = float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.25))
             if motion_phase == "contact_calibration":
                 depth_threshold = max(depth_threshold, float(getattr(self.generic_args, "generic_contact_depth_min_score", 0.70)))
+            depth_score_hard_reject = True
+            if motion_phase == "contact_calibration":
+                contact_depth_error_max = float(
+                    getattr(
+                        self.generic_args,
+                        "generic_contact_acceptance_depth_error_max_m",
+                        getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.055),
+                    )
+                )
+                depth_score_hard_reject = depth_error is None or depth_error > contact_depth_error_max
             if (
                 depth_confidence >= float(getattr(self.generic_args, "generic_acceptance_depth_confidence_high", 0.70))
                 and depth_score < depth_threshold
+                and depth_score_hard_reject
             ):
                 reject_reasons.append(
                     "contact_depth_score_below_threshold" if motion_phase == "contact_calibration" else "depth_score_below_threshold"
@@ -1641,7 +1659,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 else float(getattr(self.generic_args, "support_acceptance_max_separation_m", 0.15))
             )
         ):
-            reject_reasons.append(
+            support_warnings.append(
                 "contact_support_separation_above_threshold"
                 if motion_phase == "contact_calibration"
                 else "support_separation_above_threshold"
@@ -1650,7 +1668,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             motion_phase == "contact_calibration"
             and (not support_enabled or support_confidence < float(getattr(self.generic_args, "support_acceptance_min_confidence", 0.70)))
         ):
-            reject_reasons.append("contact_support_plane_low_confidence")
+            support_warnings.append("contact_support_plane_low_confidence")
         locked_up_reject_reason = locked_up_axis_orientation_reject_reason(
             result,
             getattr(self, "mesh_axis_prior", None),
@@ -1662,6 +1680,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         return {
             "acceptance_status": "accepted" if not reject_reasons else "rejected",
             "reject_reasons": reject_reasons,
+            "support_acceptance_warnings": support_warnings,
             "projection_acceptance_threshold": float(projection_threshold),
             "projection_acceptance_exempt": bool(projection_exempt),
         }
@@ -1807,6 +1826,11 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         )
         result.update({key: value for key, value in depth.items() if key != "debug"})
         result["depth_debug"] = depth.get("debug")
+        result["depth_enabled"] = bool(
+            not coarse_scoring
+            and self.depth_prior is not None
+            and bool(getattr(self.generic_args, "depth_enabled", True))
+        )
 
         temporal_score = 0.0
         if (
@@ -1915,6 +1939,17 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         optional_prior_gate = clamp01((observation_quality - gate_start) / gate_range)
         invalid_projection_penalty = 0.0
         depth_outlier_penalty = 0.0
+        depth_hard_gate_reason = candidate_depth_gate_reason(
+            result,
+            self.generic_args,
+            max_error_m=float(getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.055)),
+            min_score=float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.40)),
+        )
+        depth_hard_penalty = (
+            float(getattr(self.generic_args, "generic_depth_hard_penalty", 2.0))
+            if bool(getattr(self.generic_args, "generic_depth_hard_gate_enabled", True)) and depth_hard_gate_reason is not None
+            else 0.0
+        )
         if (
             float(result.get("depth_confidence") or 0.0) >= 0.7
             and float(result.get("depth_score") or 0.0) < float(getattr(self.generic_args, "depth_outlier_score_threshold", 0.10))
@@ -1949,6 +1984,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             + optional_prior_gate * optional_prior_score
             - invalid_projection_penalty
             - depth_outlier_penalty
+            - depth_hard_penalty
             - temporal_jump_penalty
             - support_contact_penalty_eff
             - support_orientation_penalty_eff
@@ -1960,6 +1996,9 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 "optional_prior_gate": optional_prior_gate,
                 "invalid_projection_penalty": invalid_projection_penalty,
                 "depth_outlier_penalty": depth_outlier_penalty,
+                "depth_hard_gate_failed": bool(depth_hard_gate_reason),
+                "depth_hard_gate_reason": depth_hard_gate_reason,
+                "depth_hard_penalty": float(depth_hard_penalty),
                 "temporal_jump_penalty": temporal_jump_penalty,
                 "support_contact_penalty_eff": float(support_contact_penalty_eff),
                 "support_orientation_penalty_eff": float(support_orientation_penalty_eff),
@@ -2393,13 +2432,64 @@ def _depth_candidate_key(result: dict[str, Any]) -> tuple[float, float, float]:
 
 
 def _candidate_depth_is_reliable(result: dict[str, Any], args: argparse.Namespace) -> bool:
-    if not bool(result.get("depth_enabled", False)):
+    if not bool(result.get("depth_enabled", getattr(args, "depth_enabled", True))):
         return False
     if float(result.get("depth_confidence") or 0.0) < float(getattr(args, "generic_depth_gate_min_confidence", 0.70)):
         return False
     if float(result.get("valid_depth_ratio") or 0.0) < float(getattr(args, "generic_depth_min_overlap_ratio", 0.35)):
         return False
     return True
+
+
+def candidate_depth_gate_reason(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    max_error_m: float | None = None,
+    min_score: float | None = None,
+) -> str | None:
+    """Return a rejection reason only when reliable observed depth contradicts a candidate."""
+
+    if not bool(getattr(args, "depth_enabled", True)):
+        return None
+    if not _candidate_depth_is_reliable(result, args):
+        return None
+    depth_error = _finite_float(result.get("depth_error"))
+    if depth_error is not None:
+        max_error = (
+            float(max_error_m)
+            if max_error_m is not None
+            else float(getattr(args, "generic_candidate_depth_prefilter_max_error_m", 0.055))
+        )
+        if depth_error > max_error:
+            return "depth_error_above_prefilter_threshold"
+        return None
+    score = _finite_float(result.get("depth_score"))
+    threshold = (
+        float(min_score)
+        if min_score is not None
+        else float(getattr(args, "generic_candidate_depth_prefilter_min_score", 0.40))
+    )
+    if score is not None and score < threshold:
+        return "depth_score_below_prefilter_threshold"
+    return None
+
+
+def _candidate_depth_prefilter_reason(result: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if not bool(getattr(args, "generic_candidate_depth_prefilter_enabled", False)):
+        return None
+    return candidate_depth_gate_reason(result, args)
+
+
+def _temporal_seed_depth_gate_reason(result: dict[str, Any] | None, args: argparse.Namespace) -> str | None:
+    if result is None or not bool(getattr(args, "generic_temporal_prior_depth_gate_enabled", False)):
+        return None
+    return candidate_depth_gate_reason(
+        result,
+        args,
+        max_error_m=float(getattr(args, "generic_temporal_prior_depth_gate_max_error_m", 0.055)),
+        min_score=float(getattr(args, "generic_candidate_depth_prefilter_min_score", 0.40)),
+    )
 
 
 def make_depth_snapped_candidate(
@@ -2640,6 +2730,12 @@ def make_generic_temporal_seed(prior: dict[str, Any] | None, evaluator: GenericP
         "prior_output_dir": prior.get("output_dir"),
         "prior_pose_source": prior.get("pose_source"),
     }
+    gate_reason = _temporal_seed_depth_gate_reason(result, evaluator.generic_args)
+    if gate_reason is not None:
+        result["depth_prefilter_failed"] = True
+        result["depth_prefilter_reason"] = gate_reason
+        result["initializer_metadata"]["depth_gate_failed"] = True
+        result["initializer_metadata"]["depth_gate_reason"] = gate_reason
     return result
 
 
@@ -2923,18 +3019,65 @@ def select_generic_refine_candidates(
     prefer_temporal_first: bool = False,
     depth_bucket_top_k: int = 0,
     visual_bucket_top_k: int | None = None,
+    candidate_depth_prefilter_enabled: bool = False,
+    candidate_depth_prefilter_max_error_m: float = 0.055,
+    candidate_depth_prefilter_min_score: float = 0.40,
+    temporal_prior_depth_gate_enabled: bool = False,
+    temporal_prior_depth_gate_max_error_m: float = 0.055,
+    depth_enabled: bool = True,
+    depth_gate_min_confidence: float = 0.70,
+    depth_min_overlap_ratio: float = 0.35,
 ) -> list[dict[str, Any]]:
     """Select high-scoring generic candidates while preserving trusted seeds."""
 
     limit = max(1, int(refine_top_k))
+    depth_gate_args = argparse.Namespace(
+        depth_enabled=bool(depth_enabled),
+        generic_depth_gate_min_confidence=float(depth_gate_min_confidence),
+        generic_depth_min_overlap_ratio=float(depth_min_overlap_ratio),
+        generic_candidate_depth_prefilter_enabled=bool(candidate_depth_prefilter_enabled),
+        generic_candidate_depth_prefilter_max_error_m=float(candidate_depth_prefilter_max_error_m),
+        generic_candidate_depth_prefilter_min_score=float(candidate_depth_prefilter_min_score),
+        generic_temporal_prior_depth_gate_enabled=bool(temporal_prior_depth_gate_enabled),
+        generic_temporal_prior_depth_gate_max_error_m=float(temporal_prior_depth_gate_max_error_m),
+    )
+
+    def mark_depth_gate(item: dict[str, Any]) -> dict[str, Any]:
+        reason = _candidate_depth_prefilter_reason(item, depth_gate_args)
+        item["depth_prefilter_failed"] = bool(reason)
+        item["depth_prefilter_reason"] = reason
+        if item is temporal_seed:
+            temporal_reason = _temporal_seed_depth_gate_reason(item, depth_gate_args)
+            if temporal_reason is not None:
+                item["depth_prefilter_failed"] = True
+                item["depth_prefilter_reason"] = temporal_reason
+                meta = dict(item.get("initializer_metadata") or {})
+                meta["depth_gate_failed"] = True
+                meta["depth_gate_reason"] = temporal_reason
+                item["initializer_metadata"] = meta
+        return item
+
     combined = [item for item in candidates if item is not None]
     for seed in (corrected_seed, temporal_seed, support_aligned_seed):
         if seed is not None:
             combined.append(seed)
     if not combined:
         return []
+    for item in combined:
+        mark_depth_gate(item)
+
+    depth_prefilter_active = bool(candidate_depth_prefilter_enabled)
+    depth_passing_candidates = [item for item in combined if not bool(item.get("depth_prefilter_failed", False))]
+    has_depth_passing_candidate = any(_candidate_depth_is_reliable(item, depth_gate_args) for item in depth_passing_candidates)
+    if depth_prefilter_active and has_depth_passing_candidate:
+        candidates_for_ranking = depth_passing_candidates
+    else:
+        candidates_for_ranking = combined
 
     if limit == 1 and temporal_seed is not None:
+        if bool(temporal_seed.get("depth_prefilter_failed", False)) and depth_prefilter_active and has_depth_passing_candidate:
+            best = max(candidates_for_ranking, key=lambda row: float(row.get("score", -1e9)), default=None)
+            return [best] if best is not None else []
         if support_aligned_seed is not None:
             temporal_angle = temporal_seed.get("support_normal_angle_deg")
             alignment_before_angle = support_aligned_seed.get("support_normal_angle_deg_before_alignment")
@@ -2960,7 +3103,7 @@ def select_generic_refine_candidates(
 
     unique: list[dict[str, Any]] = []
     seen: set[tuple[float, ...]] = set()
-    for item in sorted(combined, key=lambda row: float(row.get("score", -1e9)), reverse=True):
+    for item in sorted(candidates_for_ranking, key=lambda row: float(row.get("score", -1e9)), reverse=True):
         signature = fast.pose_signature(item)
         if signature in seen:
             continue
@@ -2988,7 +3131,8 @@ def select_generic_refine_candidates(
         required.append(source_item)
 
     add_required("task_json_corrected_pose", corrected_seed)
-    add_required("temporal_prior", temporal_seed)
+    if temporal_seed is None or not bool(temporal_seed.get("depth_prefilter_failed", False)) or not has_depth_passing_candidate:
+        add_required("temporal_prior", temporal_seed)
     add_required("support_aligned_seed", support_aligned_seed)
     if len(required) >= limit:
         if prefer_temporal_first:
@@ -3443,6 +3587,14 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         prefer_temporal_first=bool(getattr(args, "generic_prefer_temporal_refine_first", True)),
         depth_bucket_top_k=int(getattr(args, "generic_depth_refine_bucket_top_k", 1)),
         visual_bucket_top_k=int(getattr(args, "generic_visual_refine_bucket_top_k", max(1, int(args.refine_top_k) - 1))),
+        candidate_depth_prefilter_enabled=bool(getattr(args, "generic_candidate_depth_prefilter_enabled", False)),
+        candidate_depth_prefilter_max_error_m=float(getattr(args, "generic_candidate_depth_prefilter_max_error_m", 0.055)),
+        candidate_depth_prefilter_min_score=float(getattr(args, "generic_candidate_depth_prefilter_min_score", 0.40)),
+        temporal_prior_depth_gate_enabled=bool(getattr(args, "generic_temporal_prior_depth_gate_enabled", False)),
+        temporal_prior_depth_gate_max_error_m=float(getattr(args, "generic_temporal_prior_depth_gate_max_error_m", 0.055)),
+        depth_enabled=bool(getattr(args, "depth_enabled", True)),
+        depth_gate_min_confidence=float(getattr(args, "generic_depth_gate_min_confidence", 0.70)),
+        depth_min_overlap_ratio=float(getattr(args, "generic_depth_min_overlap_ratio", 0.35)),
     )
     refined_results: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     best_result: dict[str, Any] | None = None
@@ -3776,7 +3928,13 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_depth_min_overlap_ratio", type=float, default=0.35)
     parser.add_argument("--generic_depth_gate_min_confidence", type=float, default=0.70)
     parser.add_argument("--generic_depth_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--generic_depth_hard_gate_max_error_m", type=float, default=0.12)
+    parser.add_argument("--generic_depth_hard_gate_max_error_m", type=float, default=0.055)
+    parser.add_argument("--generic_depth_hard_penalty", type=float, default=2.0)
+    parser.add_argument("--generic_candidate_depth_prefilter_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_candidate_depth_prefilter_max_error_m", type=float, default=0.055)
+    parser.add_argument("--generic_candidate_depth_prefilter_min_score", type=float, default=0.40)
+    parser.add_argument("--generic_temporal_prior_depth_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_temporal_prior_depth_gate_max_error_m", type=float, default=0.055)
 
     parser.add_argument("--generic_mask_weight", type=float, default=1.00)
     parser.add_argument("--generic_bbox_weight", type=float, default=0.15)
@@ -3790,6 +3948,7 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_contour_sigma_px", type=float, default=4.0)
     parser.add_argument("--generic_pose_motion_phase", default="auto")
     parser.add_argument("--generic_contact_depth_min_score", type=float, default=0.70)
+    parser.add_argument("--generic_contact_acceptance_depth_error_max_m", type=float, default=0.055)
     parser.add_argument("--generic_contact_support_max_separation_m", type=float, default=0.05)
     parser.add_argument("--generic_locked_scale_init_factors", default="0.95,1.0,1.05")
 

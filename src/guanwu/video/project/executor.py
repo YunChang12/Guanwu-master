@@ -1456,10 +1456,9 @@ class ProjectExecutor:
                     for object_id in (getattr(zaiwu_settings, "mesh_reconstruct_object_ids", []) or [])
                     if str(object_id).strip()
                 ]
-            disable_road_semantics = bool(getattr(zaiwu_settings, "background_disable_road_semantics", False))
             tabletop_task_mode = background_mode in {"tabletop_task", "task", "manipulation", "robot_task"}
-            if tabletop_task_mode:
-                disable_road_semantics = True
+            if not tabletop_task_mode:
+                background_mode = "road_clean_background"
             background_cleaner_config = {
                 "config_path": getattr(zaiwu_settings, "background_cleaner_config_path", None),
                 "model": getattr(zaiwu_settings, "background_cleaner_model", "gpt-image-2"),
@@ -1475,16 +1474,14 @@ class ProjectExecutor:
                     out_dir / "background_assets",
                     background_mode=background_mode,
                 ),
-                semantic_road_estimator=(
-                    None
-                    if disable_road_semantics
-                    else self._build_semantic_road_estimator(out_dir / "background_assets")
-                ),
                 grid_stride=4,
                 background_mode=background_mode,
                 task_foreground_object_ids=task_foreground_ids,
-                disable_road_semantics=disable_road_semantics,
-                background_cleaner=getattr(zaiwu_settings, "background_cleaner", "temporal"),
+                background_cleaner=(
+                    getattr(zaiwu_settings, "background_cleaner", "temporal")
+                    if tabletop_task_mode
+                    else "openai_image_edit"
+                ),
                 background_cleaner_config=background_cleaner_config,
                 background_cleaner_reference_frame_id=getattr(
                     zaiwu_settings,
@@ -1552,18 +1549,6 @@ class ProjectExecutor:
     def _build_background_clean_depth_estimator(self, output_dir: Path, *, background_mode: str):
         _ = str(background_mode or "auto").strip().lower()
         return self._build_clean_background_depth_estimator(output_dir)
-
-    def _build_semantic_road_estimator(self, output_dir: Path):
-        if self._provider_mode() != "zaiwu":
-            return None
-        settings = self.context.config.settings
-        if not getattr(settings.zaiwu, "enabled", False):
-            return None
-
-        def estimate(clean_rgb_path: Path, *, frame_id: int) -> dict[str, Any] | None:
-            return self._estimate_semantic_road_with_zaiwu(clean_rgb_path, frame_id=frame_id, output_dir=output_dir)
-
-        return estimate
 
     def _estimate_clean_background_depth_with_zaiwu(self, clean_rgb_path: Path, *, output_dir: Path) -> dict[str, Any] | None:
         service_id = str(self.context.config.settings.zaiwu.depth_service or "services.depth_anything3")
@@ -1752,142 +1737,6 @@ class ProjectExecutor:
         if frame_id is None:
             return int(fallback_index)
         return max(0, int(frame_id) - 1)
-
-    def _estimate_semantic_road_with_zaiwu(
-        self,
-        clean_rgb_path: Path,
-        *,
-        frame_id: int,
-        output_dir: Path,
-    ) -> dict[str, Any] | None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        service_id = str(self.context.config.settings.zaiwu.grounded_sam2_service or "services.grounding_dino_sam2")
-        mask_path = output_dir / "road_gsam2_mask.png"
-        raw_path = output_dir / "road_gsam2_raw.json"
-        try:
-            image = cv2.imread(str(clean_rgb_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Failed to read clean background RGB for road segmentation: {clean_rgb_path}")
-            ok, encoded = cv2.imencode(".jpg", image)
-            if not ok:
-                raise ValueError(f"Failed to encode clean background RGB for road segmentation: {clean_rgb_path}")
-            image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-            payload = {
-                "frame_idx": int(frame_id),
-                "timestamp": 0.0,
-                "image_base64": image_b64,
-                "text_prompt": "road. roadway. asphalt road. driving lane. lane marking.",
-            }
-            gateway = build_zaiwu_gateway_client(self.context.config.settings)
-            result = gateway.run_service_job(
-                service_id,
-                "gsam2_parse_frame",
-                payload=payload,
-                timeout_sec=max(1800.0, float(self.context.config.settings.zaiwu.job_timeout_sec or 0.0)),
-            )
-            raw_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            mask = self._road_mask_from_grounded_sam2_payload(result, image.shape[:2])
-            if mask is None or not mask.any():
-                _logger.warning("[geometry.lift] GroundedSAM2 returned no usable road mask for clean background")
-                return None
-            cv2.imwrite(str(mask_path), mask.astype(np.uint8) * 255)
-            return {
-                "mask": mask,
-                "mask_path": str(mask_path),
-                "source": "grounding_dino_sam2_clean_target_rgb",
-                "quality": {
-                    "road_service": service_id,
-                    "road_mask_fraction": float(np.mean(mask)),
-                    "raw_result_path": str(raw_path),
-                },
-            }
-        except Exception as exc:
-            _logger.warning("[geometry.lift] GroundedSAM2 clean road segmentation failed; falling back to detection road masks: %s", exc)
-            return None
-
-    @staticmethod
-    def _road_mask_from_grounded_sam2_payload(payload: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        road_masks: list[np.ndarray] = []
-        decoded_masks: list[np.ndarray] = []
-        for inst in payload.get("instances", []) or []:
-            if not isinstance(inst, dict):
-                continue
-            label = str(inst.get("concept_label") or inst.get("label") or "").lower()
-            mask = ProjectExecutor._decode_grounded_sam2_mask(inst, shape)
-            if mask is None:
-                continue
-            decoded_masks.append(mask)
-            if any(token in label for token in ("road", "roadway", "asphalt", "lane", "street", "pavement", "driveway")):
-                road_masks.append(mask)
-        masks = road_masks or decoded_masks
-        if not masks:
-            return None
-        return np.logical_or.reduce(masks).astype(bool)
-
-    @staticmethod
-    def _decode_grounded_sam2_mask(inst: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        raw = inst.get("mask_rle") or inst.get("mask")
-        if raw:
-            try:
-                rle = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                if isinstance(rle.get("counts"), list):
-                    return ProjectExecutor._decode_uncompressed_rle_mask(rle, shape)
-                counts = rle.get("counts")
-                if isinstance(counts, str):
-                    rle["counts"] = counts.encode("ascii")
-                from pycocotools import mask as mask_utils
-
-                decoded = mask_utils.decode(rle)
-                if decoded.ndim == 3:
-                    decoded = decoded[:, :, 0]
-                mask = decoded.astype(bool)
-                if mask.shape == shape:
-                    return mask
-            except Exception:
-                pass
-        bbox = inst.get("bbox")
-        if isinstance(bbox, list) and len(bbox) >= 4:
-            try:
-                height, width = shape
-                x1, y1, x2, y2 = [int(round(float(v))) for v in bbox[:4]]
-                x1 = max(0, min(width, x1))
-                x2 = max(0, min(width, x2))
-                y1 = max(0, min(height, y1))
-                y2 = max(0, min(height, y2))
-            except Exception:
-                return None
-            if x2 > x1 and y2 > y1:
-                mask = np.zeros((height, width), dtype=bool)
-                mask[y1:y2, x1:x2] = True
-                return mask
-        return None
-
-    @staticmethod
-    def _decode_uncompressed_rle_mask(rle: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        size = rle.get("size")
-        counts = rle.get("counts")
-        if not (isinstance(size, list) and len(size) >= 2 and isinstance(counts, list)):
-            return None
-        height, width = int(size[0]), int(size[1])
-        if (height, width) != shape:
-            return None
-        values: list[int] = []
-        fill = 0
-        for count in counts:
-            try:
-                run = int(count)
-            except (TypeError, ValueError):
-                return None
-            if run < 0:
-                return None
-            values.extend([fill] * run)
-            fill = 1 - fill
-        expected = height * width
-        if len(values) < expected:
-            values.extend([0] * (expected - len(values)))
-        if len(values) > expected:
-            values = values[:expected]
-        return np.asarray(values, dtype=np.uint8).reshape((height, width), order="F").astype(bool)
 
     @staticmethod
     def _write_single_frame_depth_video(image_path: Path, video_path: Path, *, fps: float = 1.0) -> None:
@@ -4593,15 +4442,7 @@ class ProjectExecutor:
 
         wildgs_poses, wildgs_K = self._load_wildgs_poses(geometry)
         bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh"))
-        pose_opt_artifact = self.context.artifacts.get("pose.optimize")
-        pose_road_geometry_path = None if pose_opt_artifact is None else pose_opt_artifact.outputs.get("road_geometry")
-        bg_meshes = load_background_asset_meshes(
-            geometry.outputs.get("background_assets_manifest"),
-            road_geometry_path=pose_road_geometry_path,
-            camera_trajectory_path=geometry.outputs.get("camera_trajectory"),
-        )
-        if not bg_meshes:
-            bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
+        bg_meshes = load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
 
         geo_summary = self._json_load(geometry.outputs["summary"])
         detection_frames = geo_summary.get("frames", [])
@@ -8456,21 +8297,6 @@ class ProjectExecutor:
         return None
 
     @staticmethod
-    def _find_bg_meshes(bg_mesh_dir: str | None) -> list[tuple[str, "Path"]]:
-        if not bg_mesh_dir:
-            return []
-        raw = Path(bg_mesh_dir)
-        if not raw.exists() or raw.is_file():
-            return []
-        ordered = [
-            ("road", raw / "road_mesh.obj"),
-            ("structures", raw / "structures_mesh.obj"),
-            ("far", raw / "far_mesh.obj"),
-        ]
-        out = [(name, path) for name, path in ordered if path.exists()]
-        return out if len(out) >= 2 else []
-
-    @staticmethod
     def _background_assets_target_frame_id(geometry) -> int | None:
         manifest = None if geometry is None else geometry.outputs.get("background_assets_manifest")
         if not manifest:
@@ -11307,16 +11133,10 @@ class ProjectExecutor:
             pose_opt_artifact = self.context.artifacts.get("pose.optimize")
             pose_road_geometry_path = None if pose_opt_artifact is None else pose_opt_artifact.outputs.get("road_geometry")
             bg_meshes = (
-                load_background_asset_meshes(
-                    geometry.outputs.get("background_assets_manifest"),
-                    road_geometry_path=pose_road_geometry_path,
-                    camera_trajectory_path=geometry.outputs.get("camera_trajectory"),
-                )
+                load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
                 if geometry
                 else []
             )
-            if geometry and not bg_meshes:
-                bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
             cam_traj = self._json_load(geometry.outputs["camera_trajectory"]) if geometry else []
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
             object_visibility_frames = self._object_visibility_frames_from_index()

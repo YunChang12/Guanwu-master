@@ -97,9 +97,6 @@ class VideoProjectExecutor:
             if str(object_id).strip()
         ]
         context.config.settings.zaiwu.background_mode = workspace.video_pipeline.background_mode
-        context.config.settings.zaiwu.background_disable_road_semantics = (
-            workspace.video_pipeline.background_disable_road_semantics
-        )
         context.config.settings.zaiwu.task_foreground_object_ids = [
             str(object_id).strip()
             for object_id in workspace.video_pipeline.task_foreground_object_ids

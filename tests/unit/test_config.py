@@ -20,7 +20,6 @@ def test_default_config():
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is True
     assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
     assert cfg.video_pipeline.background_mode == "auto"
-    assert cfg.video_pipeline.background_disable_road_semantics is False
     assert cfg.video_pipeline.task_foreground_object_ids == []
     assert cfg.video_pipeline.background_target_frame_id == 1
     assert cfg.video_pipeline.background_cleaner == "temporal"
@@ -55,7 +54,6 @@ video_pipeline:
   mesh_proxy_use_for_pose: false
   mesh_proxy_keep_original_for_export: true
   background_mode: tabletop_task
-  background_disable_road_semantics: true
   task_foreground_object_ids:
     - obj_000009
   background_target_frame_id: 1
@@ -84,7 +82,6 @@ datasets:
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is False
     assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
     assert cfg.video_pipeline.background_mode == "tabletop_task"
-    assert cfg.video_pipeline.background_disable_road_semantics is True
     assert cfg.video_pipeline.task_foreground_object_ids == ["obj_000009"]
     assert cfg.video_pipeline.background_target_frame_id == 1
     assert cfg.video_pipeline.background_cleaner == "openai_image_edit"

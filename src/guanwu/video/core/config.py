@@ -151,7 +151,6 @@ class ZaiwuConfig(BaseModel):
     mesh_proxy_use_for_pose: bool = True
     mesh_proxy_keep_original_for_export: bool = True
     background_mode: str = "auto"
-    background_disable_road_semantics: bool = False
     task_foreground_object_ids: list[str] = Field(default_factory=list)
     background_target_frame_id: int = 1
     background_cleaner: str = "temporal"

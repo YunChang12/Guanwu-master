@@ -1905,6 +1905,30 @@ def test_generic_motion_constraints_keep_target_depth_in_free_motion() -> None:
     assert task["corrected_pose"]["scale"] == [0.1, 0.1, 0.1]
 
 
+def test_generic_motion_constraints_strengthen_contact_depth_without_hardening_support() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import apply_generic_task_motion_constraints
+
+    args = argparse.Namespace(
+        generic_pose_motion_phase="auto",
+        depth_enabled=True,
+        generic_depth_weight=0.40,
+        generic_acceptance_depth_confidence_high=0.70,
+        support_plane_enabled="auto",
+        support_plane_weight=0.12,
+        support_penalty_weight=0.15,
+        support_orientation_penalty_weight=0.35,
+    )
+    task = {"vehicle_pose_context": {"generic_pose_motion_phase": "contact_calibration"}}
+
+    report = apply_generic_task_motion_constraints(args, task)
+
+    assert report["phase"] == "contact_calibration"
+    assert args.depth_enabled is True
+    assert args.generic_depth_weight >= 1.0
+    assert args.support_plane_weight == 0.12
+    assert args.support_penalty_weight == 0.15
+
+
 def test_depth_snapped_candidate_shifts_camera_z_by_median_depth_error() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import (
         make_depth_snapped_candidate,
@@ -2133,13 +2157,13 @@ def test_generic_pose_acceptance_rejects_free_motion_depth_outlier() -> None:
         generic_acceptance_projection_exempt_min_mask_iou=0.90,
         generic_acceptance_projection_exempt_min_bbox_iou=0.60,
         generic_acceptance_projection_exempt_min_temporal_score=0.50,
-        generic_acceptance_depth_min_threshold=0.0,
+        generic_acceptance_depth_min_threshold=0.40,
         generic_contact_depth_min_score=0.70,
-        generic_acceptance_depth_confidence_high=999.0,
+        generic_acceptance_depth_confidence_high=0.70,
         generic_depth_hard_gate_enabled=True,
         generic_depth_gate_min_confidence=0.70,
         generic_depth_min_overlap_ratio=0.35,
-        generic_depth_hard_gate_max_error_m=0.12,
+        generic_depth_hard_gate_max_error_m=0.055,
         generic_contact_support_max_separation_m=0.05,
         support_acceptance_min_confidence=0.70,
         support_acceptance_max_separation_m=0.15,
@@ -2154,7 +2178,7 @@ def test_generic_pose_acceptance_rejects_free_motion_depth_outlier() -> None:
             "projection_valid_ratio": 0.95,
             "depth_confidence": 1.0,
             "depth_score": 0.05,
-            "depth_error": 0.18,
+            "depth_error": 0.0767,
             "valid_depth_ratio": 0.72,
             "support_plane_enabled": False,
             "support_plane_confidence": 0.0,
@@ -2300,6 +2324,89 @@ def test_select_generic_refine_candidates_keeps_corrected_and_temporal_seeds() -
     assert len(selected) == 4
     assert "task_json_corrected_pose" in sources
     assert "temporal_prior" in sources
+
+
+def test_select_generic_refine_candidates_does_not_protect_depth_failed_temporal_seed() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    def candidate(score: float, tx: float, source: str, *, depth_error: float, depth_score: float) -> dict[str, object]:
+        return {
+            "score": score,
+            "depth_enabled": True,
+            "depth_score": depth_score,
+            "depth_confidence": 1.0,
+            "depth_error": depth_error,
+            "valid_depth_ratio": 0.8,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": {"source": source},
+        }
+
+    visual_good = candidate(10.0, 0.0, "generic_grid", depth_error=0.015, depth_score=0.85)
+    visual_second = candidate(9.0, 1.0, "generic_grid", depth_error=0.020, depth_score=0.75)
+    temporal_seed = candidate(100.0, 5.0, "temporal_prior", depth_error=0.0767, depth_score=0.28)
+
+    selected = select_generic_refine_candidates(
+        [visual_good, visual_second],
+        refine_top_k=2,
+        temporal_seed=temporal_seed,
+        prefer_temporal_first=True,
+        candidate_depth_prefilter_enabled=True,
+        candidate_depth_prefilter_max_error_m=0.055,
+        candidate_depth_prefilter_min_score=0.40,
+        temporal_prior_depth_gate_enabled=True,
+        temporal_prior_depth_gate_max_error_m=0.055,
+    )
+    sources = [item.get("initializer_metadata", {}).get("source") for item in selected]
+
+    assert sources == ["generic_grid", "generic_grid"]
+
+
+def test_candidate_depth_gate_uses_args_when_result_has_no_depth_enabled_flag() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import candidate_depth_gate_reason
+
+    reason = candidate_depth_gate_reason(
+        {
+            "depth_confidence": 0.9,
+            "valid_depth_ratio": 0.8,
+            "depth_error": 0.07,
+            "depth_score": 0.30,
+        },
+        argparse.Namespace(
+            depth_enabled=True,
+            generic_depth_gate_min_confidence=0.70,
+            generic_depth_min_overlap_ratio=0.35,
+            generic_candidate_depth_prefilter_max_error_m=0.055,
+            generic_candidate_depth_prefilter_min_score=0.40,
+        ),
+    )
+
+    assert reason == "depth_error_above_prefilter_threshold"
+
+
+def test_candidate_depth_gate_prefers_metric_error_over_low_depth_score() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import candidate_depth_gate_reason
+
+    args = argparse.Namespace(
+        depth_enabled=True,
+        generic_depth_gate_min_confidence=0.70,
+        generic_depth_min_overlap_ratio=0.35,
+        generic_candidate_depth_prefilter_max_error_m=0.055,
+        generic_candidate_depth_prefilter_min_score=0.70,
+    )
+
+    reason = candidate_depth_gate_reason(
+        {
+            "depth_confidence": 0.9,
+            "valid_depth_ratio": 0.8,
+            "depth_error": 0.018,
+            "depth_score": 0.62,
+        },
+        args,
+    )
+
+    assert reason is None
 
 
 def test_select_generic_refine_candidates_uses_temporal_seed_when_single_refine() -> None:
@@ -2696,7 +2803,7 @@ def test_generic_acceptance_still_rejects_low_projection_non_truncated_candidate
     assert decision["reject_reasons"] == ["projection_valid_ratio_below_threshold"]
 
 
-def test_generic_acceptance_rejects_high_confidence_support_separation() -> None:
+def test_generic_acceptance_warns_high_confidence_support_separation_without_rejecting() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
     evaluator = object.__new__(GenericPoseEvaluator)
@@ -2734,11 +2841,12 @@ def test_generic_acceptance_rejects_high_confidence_support_separation() -> None
         }
     )
 
-    assert decision["acceptance_status"] == "rejected"
-    assert decision["reject_reasons"] == ["support_separation_above_threshold"]
+    assert decision["acceptance_status"] == "accepted"
+    assert decision["reject_reasons"] == []
+    assert decision["support_acceptance_warnings"] == ["support_separation_above_threshold"]
 
 
-def test_generic_acceptance_contact_phase_requires_tight_support() -> None:
+def test_generic_acceptance_contact_phase_warns_tight_support_without_rejecting_when_depth_aligned() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
     evaluator = object.__new__(GenericPoseEvaluator)
@@ -2772,6 +2880,8 @@ def test_generic_acceptance_contact_phase_requires_tight_support() -> None:
             "projection_valid_ratio": 1.0,
             "depth_confidence": 1.0,
             "depth_score": 0.82,
+            "depth_error": 0.015,
+            "valid_depth_ratio": 0.82,
             "support_plane_enabled": True,
             "support_plane_confidence": 0.95,
             "support_floating_distance_m": 0.0,
@@ -2779,11 +2889,63 @@ def test_generic_acceptance_contact_phase_requires_tight_support() -> None:
         }
     )
 
+    assert decision["acceptance_status"] == "accepted"
+    assert decision["reject_reasons"] == []
+    assert decision["support_acceptance_warnings"] == ["contact_support_separation_above_threshold"]
+
+
+def test_generic_acceptance_contact_phase_keeps_depth_error_hard_reject() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = object.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 180.0
+    evaluator.truncation_info = {"is_truncated": False, "truncation_sides": []}
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="contact_calibration",
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_confidence_high=0.70,
+        generic_acceptance_depth_min_threshold=0.25,
+        generic_contact_depth_min_score=0.70,
+        generic_depth_hard_gate_enabled=True,
+        generic_depth_gate_min_confidence=0.70,
+        generic_depth_min_overlap_ratio=0.35,
+        generic_depth_hard_gate_max_error_m=0.055,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        generic_contact_support_max_separation_m=0.05,
+    )
+
+    decision = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.91,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.69,
+            "depth_error": 0.076,
+            "valid_depth_ratio": 0.82,
+            "support_plane_enabled": True,
+            "support_plane_confidence": 0.95,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.0,
+        }
+    )
+
     assert decision["acceptance_status"] == "rejected"
-    assert decision["reject_reasons"] == ["contact_support_separation_above_threshold"]
+    assert decision["reject_reasons"] == ["target_depth_error_above_threshold"]
 
 
-def test_generic_acceptance_free_motion_ignores_depth_and_support_contact() -> None:
+def test_generic_acceptance_free_motion_ignores_depth_only_when_disabled_and_support_contact() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
 
     evaluator = object.__new__(GenericPoseEvaluator)
@@ -2800,6 +2962,7 @@ def test_generic_acceptance_free_motion_ignores_depth_and_support_contact() -> N
         generic_acceptance_projection_exempt_min_mask_iou=0.90,
         generic_acceptance_projection_exempt_min_bbox_iou=0.60,
         generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_free_motion_depth_enabled=False,
         generic_acceptance_depth_confidence_high=0.70,
         generic_acceptance_depth_min_threshold=0.25,
         generic_contact_depth_min_score=0.70,

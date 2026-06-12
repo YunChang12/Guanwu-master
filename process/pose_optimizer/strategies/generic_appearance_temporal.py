@@ -52,6 +52,9 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "depth_score",
     "depth_confidence",
     "depth_error",
+    "depth_weight_effective",
+    "candidate_rank_score",
+    "rejected_by_depth_gate",
     "valid_depth_ratio",
     "appearance_score",
     "appearance_confidence",
@@ -186,24 +189,33 @@ def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[s
 
     if phase == "contact_calibration":
         args.depth_enabled = True
-        if str(getattr(args, "support_plane_enabled", "auto")).strip().lower() in {"0", "false", "off", "disabled", "none"}:
-            args.support_plane_enabled = "auto"
         args.generic_acceptance_depth_confidence_high = min(
             float(getattr(args, "generic_acceptance_depth_confidence_high", 0.70)),
             0.70,
         )
-        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.35)), 0.45)
-        args.support_plane_weight = max(float(getattr(args, "support_plane_weight", 0.20)), 0.35)
-        args.support_penalty_weight = max(float(getattr(args, "support_penalty_weight", 0.15)), 0.60)
+        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.55)) * 2.0, 1.10)
+        args.generic_mask_weight = float(getattr(args, "generic_mask_weight", 0.80)) * 0.9
+        args.generic_appearance_weight = float(getattr(args, "generic_appearance_weight", 0.25)) * 1.0
+        if str(getattr(args, "support_plane_enabled", "auto")).strip().lower() in {"0", "false", "off", "disabled", "none"}:
+            args.support_plane_enabled = "disabled"
+            args.support_plane_weight = 0.0
+            args.support_penalty_weight = 0.0
+            args.support_orientation_penalty_weight = 0.0
+            args.support_aligned_seed_enabled = False
+        else:
+            args.support_plane_weight = float(getattr(args, "support_plane_weight", 0.12)) * 0.7
+            args.support_penalty_weight = float(getattr(args, "support_penalty_weight", 0.15)) * 0.7
     elif phase == "free_motion":
         args.depth_enabled = bool(getattr(args, "generic_free_motion_depth_enabled", True))
         if bool(args.depth_enabled):
             args.generic_depth_weight = max(
-                float(getattr(args, "generic_depth_weight", 0.15)),
-                float(getattr(args, "generic_free_motion_depth_weight", 0.60)),
+                float(getattr(args, "generic_depth_weight", 0.55)) * 1.8,
+                float(getattr(args, "generic_free_motion_depth_weight", 0.99)),
             )
         else:
             args.generic_depth_weight = 0.0
+        args.generic_mask_weight = float(getattr(args, "generic_mask_weight", 0.80)) * 0.9
+        args.generic_appearance_weight = float(getattr(args, "generic_appearance_weight", 0.25)) * 1.0
         args.support_plane_enabled = "disabled"
         args.support_plane_weight = 0.0
         args.support_penalty_weight = 0.0
@@ -218,6 +230,12 @@ def apply_generic_task_motion_constraints(args: argparse.Namespace, task: dict[s
             args.generic_scale_prior_sigma_log = min(float(getattr(args, "generic_scale_prior_sigma_log", 0.20)), 0.06)
             args.generic_scale_lock_applied = True
             report["scale_lock_applied"] = True
+    else:
+        args.generic_depth_weight = max(float(getattr(args, "generic_depth_weight", 0.55)) * 1.6, 0.88)
+        args.generic_mask_weight = float(getattr(args, "generic_mask_weight", 0.80)) * 0.9
+        args.generic_appearance_weight = float(getattr(args, "generic_appearance_weight", 0.25)) * 1.0
+        args.support_plane_weight = float(getattr(args, "support_plane_weight", 0.12)) * 0.5
+        args.support_penalty_weight = float(getattr(args, "support_penalty_weight", 0.15)) * 0.5
     if not hasattr(args, "generic_scale_lock_applied"):
         args.generic_scale_lock_applied = False
     return report
@@ -229,6 +247,64 @@ def _finite_float(value: Any) -> float | None:
     except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def candidate_depth_gate_status(result: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    enabled = bool(getattr(args, "depth_gate_enabled", getattr(args, "generic_depth_hard_gate_enabled", True)))
+    depth_error = _finite_float(result.get("depth_error"))
+    depth_confidence = float(result.get("depth_confidence") or 0.0)
+    valid_depth_ratio = float(result.get("valid_depth_ratio") or 0.0)
+    min_confidence = float(getattr(args, "generic_depth_gate_min_confidence", 0.70))
+    min_overlap = float(getattr(args, "generic_depth_min_overlap_ratio", 0.35))
+    max_error = float(getattr(args, "depth_gate_max_depth_error_m", getattr(args, "generic_depth_hard_gate_max_error_m", 0.18)))
+    strict_error = float(getattr(args, "depth_gate_strict_depth_error_m", min(max_error, 0.12)))
+    soft_start = float(getattr(args, "depth_gate_soft_penalty_start_m", 0.08))
+    soft_weight = float(getattr(args, "depth_gate_soft_penalty_weight", 0.5))
+    active = (
+        enabled
+        and depth_error is not None
+        and depth_confidence >= min_confidence
+        and valid_depth_ratio >= min_overlap
+    )
+    rejected = bool(active and depth_error > max_error)
+    if active and depth_error > soft_start:
+        denom = max(1e-6, max_error - soft_start)
+        soft_penalty = soft_weight * clamp01((depth_error - soft_start) / denom)
+    else:
+        soft_penalty = 0.0
+    return {
+        "depth_gate_enabled": bool(enabled),
+        "depth_gate_active": bool(active),
+        "rejected_by_depth_gate": rejected,
+        "depth_gate_max_depth_error_m": float(max_error),
+        "depth_gate_strict_depth_error_m": float(strict_error),
+        "depth_gate_soft_penalty_start_m": float(soft_start),
+        "depth_gate_soft_penalty_weight": float(soft_weight),
+        "depth_gate_soft_penalty": float(soft_penalty),
+    }
+
+
+def candidate_rank_score(result: dict[str, Any]) -> float:
+    depth_score = float(result.get("depth_score") or 0.0) * float(result.get("depth_confidence") or 0.0)
+    mask_score = float(
+        result.get("mask_blend_score")
+        or result.get("visible_soft_mask_iou")
+        or result.get("soft_mask_iou")
+        or result.get("mask_iou")
+        or 0.0
+    )
+    bbox_score = float(result.get("visible_bbox_iou") or result.get("bbox_iou") or 0.0)
+    contour_score = float(result.get("visible_contour_score") or result.get("contour_score") or 0.0)
+    appearance_score = float(result.get("appearance_score") or 0.0) * float(result.get("appearance_confidence") or 0.0)
+    rank_score = (
+        0.45 * depth_score
+        + 0.30 * mask_score
+        + 0.10 * bbox_score
+        + 0.10 * contour_score
+        + 0.05 * appearance_score
+    )
+    result["candidate_rank_score"] = float(rank_score)
+    return float(rank_score)
 
 
 def clamp01(value: float) -> float:
@@ -649,12 +725,27 @@ def render_depth_for_pose(
     intrinsics: dict[str, float],
     image_size: tuple[int, int],
     max_faces: int = 8000,
+    roi_xyxy: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray:
+    width, height = int(image_size[0]), int(image_size[1])
+    local_image_size = (width, height)
     depth_faces = select_depth_render_faces(np.asarray(faces, dtype=np.int32), max_faces)
     scaled_vertices = np.asarray(vertices, dtype=np.float64) * np.asarray(scale, dtype=np.float64).reshape(1, 3)
     points_cam = scaled_vertices @ np.asarray(rotation_cam, dtype=np.float64).T + np.asarray(translation_cam, dtype=np.float64).reshape(1, 3)
     projected_uv, valid_z = fast.project_points(points_cam, **intrinsics)
-    return render_depth_by_triangle_zbuffer(projected_uv, points_cam[:, 2], depth_faces, image_size)
+    if roi_xyxy is not None:
+        x1, y1, x2, y2 = [int(v) for v in roi_xyxy]
+        x1 = max(0, min(width, x1))
+        y1 = max(0, min(height, y1))
+        x2 = max(x1, min(width, x2))
+        y2 = max(y1, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            return np.zeros((0, 0), dtype=np.float32)
+        projected_uv = np.asarray(projected_uv, dtype=np.float64).copy()
+        projected_uv[:, 0] -= float(x1)
+        projected_uv[:, 1] -= float(y1)
+        local_image_size = (x2 - x1, y2 - y1)
+    return render_depth_by_triangle_zbuffer(projected_uv, points_cam[:, 2], depth_faces, local_image_size)
 
 
 def select_depth_render_faces(faces: np.ndarray, max_faces: int | None) -> np.ndarray:
@@ -1376,7 +1467,16 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         except Exception:
             return {"scale_prior_score": 0.0, "scale_prior_delta_log": None}
 
-    def _render_depth_if_needed(self, result: dict[str, Any]) -> np.ndarray | None:
+    def _depth_score_roi(self, result: dict[str, Any]) -> tuple[int, int, int, int] | None:
+        margin = max(0, int(getattr(self.generic_args, "roi_iou_margin", 30)))
+        return fast.get_union_roi(result.get("projected_bbox"), self.json_bbox, self.image_size, margin)
+
+    def _render_depth_if_needed(
+        self,
+        result: dict[str, Any],
+        *,
+        roi_xyxy: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray | None:
         if self.depth_prior is None or not bool(getattr(self.generic_args, "depth_enabled", True)):
             return None
         try:
@@ -1389,10 +1489,65 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 intrinsics=self.intrinsics,
                 image_size=self.image_size,
                 max_faces=int(getattr(self.generic_args, "depth_render_face_limit", 8000)),
+                roi_xyxy=roi_xyxy,
             )
         except Exception as exc:
             print(f"[warn] render depth failed; disabling depth score for candidate: {exc}")
             return None
+
+    def _score_depth_for_result(
+        self,
+        result: dict[str, Any],
+        rendered_mask: np.ndarray,
+        visible_region: np.ndarray | None,
+    ) -> dict[str, Any]:
+        if self.depth_prior is None or not bool(getattr(self.generic_args, "depth_enabled", True)):
+            return {
+                "depth_score": 0.0,
+                "depth_confidence": 0.0,
+                "depth_error": None,
+                "valid_depth_ratio": 0.0,
+                "debug": {"reason": "disabled"},
+            }
+
+        roi = self._depth_score_roi(result)
+        if roi is None:
+            render_depth = self._render_depth_if_needed(result)
+            depth = self.depth_prior.score(render_depth, rendered_mask, visible_region=visible_region)
+            debug = dict(depth.get("debug") or {})
+            debug.setdefault("roi_mode", "full_image")
+            depth["debug"] = debug
+            return depth
+
+        x1, y1, x2, y2 = roi
+        render_depth = self._render_depth_if_needed(result, roi_xyxy=roi)
+        if render_depth is None or render_depth.shape != (y2 - y1, x2 - x1):
+            return self.depth_prior.score(None, rendered_mask, visible_region=visible_region)
+
+        config = self.depth_prior.config
+        roi_prior = DepthConsistencyPrior(
+            self.depth_prior.observed_depth[y1:y2, x1:x2],
+            self.depth_prior.detection_mask[y1:y2, x1:x2],
+            config=config,
+        )
+        depth = roi_prior.score(
+            render_depth,
+            np.asarray(rendered_mask)[y1:y2, x1:x2],
+            visible_region=None if visible_region is None else np.asarray(visible_region)[y1:y2, x1:x2],
+        )
+        debug = dict(depth.get("debug") or {})
+        debug.update(
+            {
+                "roi_mode": "union_bbox",
+                "roi_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+                "roi_width": int(x2 - x1),
+                "roi_height": int(y2 - y1),
+                "full_width": int(self.image_size[0]),
+                "full_height": int(self.image_size[1]),
+            }
+        )
+        depth["debug"] = debug
+        return depth
 
     def _support_contact(self, result: dict[str, Any]) -> dict[str, Any]:
         if str(getattr(self.generic_args, "support_plane_enabled", "auto")).strip().lower() in {"0", "false", "off", "disabled", "none"}:
@@ -1600,13 +1755,8 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         depth_score = float(result.get("depth_score") or 0.0)
         depth_error = _finite_float(result.get("depth_error"))
         valid_depth_ratio = float(result.get("valid_depth_ratio") or 0.0)
-        if (
-            bool(getattr(self.generic_args, "generic_depth_hard_gate_enabled", True))
-            and depth_error is not None
-            and depth_confidence >= float(getattr(self.generic_args, "generic_depth_gate_min_confidence", 0.70))
-            and valid_depth_ratio >= float(getattr(self.generic_args, "generic_depth_min_overlap_ratio", 0.35))
-            and depth_error > float(getattr(self.generic_args, "generic_depth_hard_gate_max_error_m", 0.12))
-        ):
+        depth_gate = candidate_depth_gate_status(result, self.generic_args)
+        if depth_gate["rejected_by_depth_gate"]:
             reject_reasons.append("target_depth_error_above_threshold")
         if motion_phase != "free_motion":
             depth_threshold = float(getattr(self.generic_args, "generic_acceptance_depth_min_threshold", 0.25))
@@ -1646,11 +1796,6 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 if motion_phase == "contact_calibration"
                 else "support_separation_above_threshold"
             )
-        if (
-            motion_phase == "contact_calibration"
-            and (not support_enabled or support_confidence < float(getattr(self.generic_args, "support_acceptance_min_confidence", 0.70)))
-        ):
-            reject_reasons.append("contact_support_plane_low_confidence")
         locked_up_reject_reason = locked_up_axis_orientation_reject_reason(
             result,
             getattr(self, "mesh_axis_prior", None),
@@ -1664,6 +1809,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             "reject_reasons": reject_reasons,
             "projection_acceptance_threshold": float(projection_threshold),
             "projection_acceptance_exempt": bool(projection_exempt),
+            **depth_gate,
         }
 
     def _augment_result(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -1789,9 +1935,8 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         result.update({key: value for key, value in appearance.items() if key != "debug"})
         result["appearance_debug"] = appearance.get("debug")
 
-        render_depth = None if coarse_scoring else self._render_depth_if_needed(result)
         depth = (
-            self.depth_prior.score(render_depth, rendered_mask, visible_region=visible_region)
+            self._score_depth_for_result(result, rendered_mask, visible_region)
             if (
                 not coarse_scoring
                 and self.depth_prior is not None
@@ -1807,6 +1952,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         )
         result.update({key: value for key, value in depth.items() if key != "debug"})
         result["depth_debug"] = depth.get("debug")
+        result["depth_weight_effective"] = float(getattr(self.generic_args, "generic_depth_weight", 0.55))
 
         temporal_score = 0.0
         if (
@@ -1914,12 +2060,14 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         gate_range = max(1e-6, float(getattr(self.generic_args, "optional_prior_gate_range", 0.45)))
         optional_prior_gate = clamp01((observation_quality - gate_start) / gate_range)
         invalid_projection_penalty = 0.0
-        depth_outlier_penalty = 0.0
+        depth_gate = candidate_depth_gate_status(result, self.generic_args)
+        result.update(depth_gate)
+        depth_outlier_penalty = float(depth_gate.get("depth_gate_soft_penalty") or 0.0)
         if (
             float(result.get("depth_confidence") or 0.0) >= 0.7
             and float(result.get("depth_score") or 0.0) < float(getattr(self.generic_args, "depth_outlier_score_threshold", 0.10))
         ):
-            depth_outlier_penalty = float(getattr(self.generic_args, "depth_outlier_penalty", 0.0))
+            depth_outlier_penalty += float(getattr(self.generic_args, "depth_outlier_penalty", 0.0))
         temporal_jump_penalty = 0.0
         support_contact_penalty_eff = (
             support_plane_confidence
@@ -1970,6 +2118,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 "final_score": float(generic_score),
             }
         )
+        candidate_rank_score(result)
         result.update(self._acceptance(result))
         if self.current_initializer_metadata:
             result["initializer_metadata"] = dict(self.current_initializer_metadata)
@@ -2392,6 +2541,14 @@ def _depth_candidate_key(result: dict[str, Any]) -> tuple[float, float, float]:
     return depth_score, valid_ratio, visual_score
 
 
+def _candidate_rank_key(result: dict[str, Any]) -> tuple[float, float, float]:
+    return (
+        candidate_rank_score(result),
+        float(result.get("depth_score") or 0.0) * float(result.get("depth_confidence") or 0.0),
+        float(result.get("score") or -1e9),
+    )
+
+
 def _candidate_depth_is_reliable(result: dict[str, Any], args: argparse.Namespace) -> bool:
     if not bool(result.get("depth_enabled", False)):
         return False
@@ -2570,7 +2727,7 @@ def merge_protected_initial_candidates(
     visual = merge_pose_candidates(
         initial_candidates,
         limit=visual_limit,
-        sort_key=lambda item: float(item.get("score", -1e9)),
+        sort_key=_candidate_rank_key,
     )
     merged = list(visual)
     seen = {fast.pose_signature(item) for item in merged}
@@ -2748,7 +2905,7 @@ def make_support_aligned_seeds(
             continue
         seen.add(signature)
         aligned.append(seed)
-    return sorted(aligned, key=lambda item: float(item.get("score", -1e9)), reverse=True)
+    return sorted(aligned, key=_candidate_rank_key, reverse=True)
 
 
 def parse_angle_list(value: str | list[Any] | tuple[Any, ...]) -> list[float]:
@@ -2821,7 +2978,7 @@ def augment_generic_rotation_candidates(
             seen.add(sig)
             result["initializer_metadata"] = dict(spec["initializer_metadata"])
             augmented.append(result)
-    return sorted(augmented, key=lambda item: float(item.get("score", -1e9)), reverse=True)[: max(len(candidates), int(args.top_k_candidates))]
+    return sorted(augmented, key=_candidate_rank_key, reverse=True)[: max(len(candidates), int(args.top_k_candidates))]
 
 
 def generate_generic_grid_candidates(
@@ -2858,12 +3015,22 @@ def generate_generic_grid_candidates(
     scale_factors = fast.parse_comma_floats(str(getattr(args, "init_scale_factors", "0.75,0.90,1.00,1.10,1.25")))
     depth_factors = fast.parse_comma_floats(str(getattr(args, "init_depth_factors", "0.8,1.0,1.2")))
 
-    heap: list[tuple[float, int, dict[str, Any]]] = []
     seen: set[tuple[float, ...]] = set()
+    results: list[dict[str, Any]] = []
     batch_candidate_specs: list[dict[str, Any]] = []
-    counter = 0
+
+    def add_candidate(candidate: dict[str, Any] | None) -> None:
+        if candidate is None:
+            return
+        signature = fast.pose_signature(candidate)
+        if signature in seen:
+            return
+        seen.add(signature)
+        candidate_rank_score(candidate)
+        results.append(candidate)
+
     if corrected_seed is not None:
-        counter = fast.keep_top_k_results(heap, seen, corrected_seed, int(args.top_k_candidates), counter)
+        add_candidate(corrected_seed)
 
     for yaw in yaw_values:
         for pitch in pitch_values:
@@ -2903,12 +3070,11 @@ def generate_generic_grid_candidates(
                                 batch_candidate_specs.append(spec)
                                 continue
                             candidate = fast.evaluate_coarse_candidate_spec(evaluator, spec)
-                            if candidate is not None:
-                                counter = fast.keep_top_k_results(heap, seen, candidate, int(args.top_k_candidates), counter)
+                            add_candidate(candidate)
     if bool(getattr(args, "enable_batch_gpu_eval", False)):
         for candidate in fast.batch_prefilter_initial_candidates(evaluator, batch_candidate_specs, args):
-            counter = fast.keep_top_k_results(heap, seen, candidate, int(args.top_k_candidates), counter)
-    return [item[2] for item in sorted(heap, key=lambda item: item[0], reverse=True)]
+            add_candidate(candidate)
+    return sorted(results, key=_candidate_rank_key, reverse=True)[: int(args.top_k_candidates)]
 
 
 def select_generic_refine_candidates(
@@ -2960,7 +3126,7 @@ def select_generic_refine_candidates(
 
     unique: list[dict[str, Any]] = []
     seen: set[tuple[float, ...]] = set()
-    for item in sorted(combined, key=lambda row: float(row.get("score", -1e9)), reverse=True):
+    for item in sorted(combined, key=_candidate_rank_key, reverse=True):
         signature = fast.pose_signature(item)
         if signature in seen:
             continue
@@ -3235,7 +3401,10 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     if bool(args.depth_enabled) and observed_depth is not None:
         try:
             if observed_depth.shape != full_mask.shape:
-                observed_depth = cv2.resize(observed_depth, (full_mask.shape[1], full_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+                raise ValueError(
+                    f"Depth/mask size mismatch: depth={observed_depth.shape}, mask={full_mask.shape}. "
+                    "Please use aligned depth."
+                )
             min_valid_ratio = float(getattr(args, "min_valid_depth_ratio", getattr(args, "depth_min_valid_ratio", 0.25)))
             depth_prior = DepthConsistencyPrior(
                 observed_depth,
@@ -3378,7 +3547,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
     merged_candidates = list(generic_grid_candidates) + list(initial_candidates)
     seen_candidates: set[tuple[float, ...]] = set()
     deduped_candidates: list[dict[str, Any]] = []
-    for candidate in sorted(merged_candidates, key=lambda item: float(item.get("score", -1e9)), reverse=True):
+    for candidate in sorted(merged_candidates, key=_candidate_rank_key, reverse=True):
         signature = fast.pose_signature(candidate)
         if signature in seen_candidates:
             continue
@@ -3452,6 +3621,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         print(
             f"[generic-candidate {rank:02d}] init score={candidate['score']:.6f} "
             f"mask={candidate.get('mask_iou', 0.0):.6f} bbox={candidate.get('bbox_iou', 0.0):.6f} "
+            f"depth={candidate.get('depth_score', 0.0):.6f} "
+            f"rank={candidate.get('candidate_rank_score', 0.0):.6f} "
             f"app={candidate.get('appearance_score', 0.0):.6f} source={meta.get('source', 'unknown')}"
         )
         refined_result, history = refine_candidate_stages(candidate, proxy_evaluator, full_evaluator, args)
@@ -3471,6 +3642,8 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         print(
             f"[generic-candidate {rank:02d}] refined score={refined_result['score']:.6f} "
             f"mask={refined_result.get('mask_iou', 0.0):.6f} bbox={refined_result.get('bbox_iou', 0.0):.6f} "
+            f"depth={refined_result.get('depth_score', 0.0):.6f} "
+            f"err={refined_result.get('depth_error')} "
             f"app={refined_result.get('appearance_score', 0.0):.6f} status={refined_result.get('acceptance_status')}"
         )
         if best_result is None or float(refined_result["score"]) > float(best_result["score"]):
@@ -3757,14 +3930,19 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--depth_fallback_to_wildgs", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--depth_min_valid_ratio", type=float, default=0.10)
     parser.add_argument("--min_valid_depth_ratio", type=float, default=0.10)
-    parser.add_argument("--depth_sigma", type=float, default=0.75)
+    parser.add_argument("--depth_sigma", type=float, default=0.08)
     parser.add_argument("--depth_robust_stat", choices=["median", "mean"], default="median")
     parser.add_argument("--depth_use_mask_erode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--depth_mask_erode_px", type=int, default=5)
-    parser.add_argument("--depth_error_mode", choices=["pixel_abs", "median_z"], default="median_z")
+    parser.add_argument("--depth_error_mode", choices=["pixel_abs", "median_z", "distribution"], default="distribution")
     parser.add_argument("--depth_render_face_limit", type=int, default=8000)
     parser.add_argument("--depth_outlier_score_threshold", type=float, default=0.10)
     parser.add_argument("--depth_outlier_penalty", type=float, default=0.0)
+    parser.add_argument("--depth_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--depth_gate_max_depth_error_m", type=float, default=0.18)
+    parser.add_argument("--depth_gate_strict_depth_error_m", type=float, default=0.12)
+    parser.add_argument("--depth_gate_soft_penalty_start_m", type=float, default=0.08)
+    parser.add_argument("--depth_gate_soft_penalty_weight", type=float, default=0.5)
     parser.add_argument("--generic_free_motion_depth_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generic_free_motion_depth_weight", type=float, default=0.60)
     parser.add_argument("--generic_depth_refine_fine_full_scoring", action=argparse.BooleanOptionalAction, default=True)
@@ -3776,15 +3954,15 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_depth_min_overlap_ratio", type=float, default=0.35)
     parser.add_argument("--generic_depth_gate_min_confidence", type=float, default=0.70)
     parser.add_argument("--generic_depth_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--generic_depth_hard_gate_max_error_m", type=float, default=0.12)
+    parser.add_argument("--generic_depth_hard_gate_max_error_m", type=float, default=0.18)
 
-    parser.add_argument("--generic_mask_weight", type=float, default=1.00)
-    parser.add_argument("--generic_bbox_weight", type=float, default=0.15)
-    parser.add_argument("--generic_contour_weight", type=float, default=0.35)
-    parser.add_argument("--generic_edge_weight", type=float, default=0.20)
-    parser.add_argument("--generic_depth_weight", type=float, default=0.15)
+    parser.add_argument("--generic_mask_weight", type=float, default=0.80)
+    parser.add_argument("--generic_bbox_weight", type=float, default=0.10)
+    parser.add_argument("--generic_contour_weight", type=float, default=0.25)
+    parser.add_argument("--generic_edge_weight", type=float, default=0.15)
+    parser.add_argument("--generic_depth_weight", type=float, default=0.55)
     parser.add_argument("--generic_appearance_weight", type=float, default=0.25)
-    parser.add_argument("--generic_temporal_weight", type=float, default=0.55)
+    parser.add_argument("--generic_temporal_weight", type=float, default=0.45)
     parser.add_argument("--generic_scale_prior_weight", type=float, default=0.30)
     parser.add_argument("--generic_scale_prior_sigma_log", type=float, default=0.20)
     parser.add_argument("--generic_contour_sigma_px", type=float, default=4.0)

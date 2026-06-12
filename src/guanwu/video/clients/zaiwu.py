@@ -165,9 +165,13 @@ class ZaiwuGatewayClient:
         url = f"{self.gateway_url}{path}"
         timeout = max(120.0, float(timeout_sec or self.request_timeout_sec))
         with httpx.Client(verify=False, timeout=timeout) as client:
-            response = client.get(url)
-        response.raise_for_status()
-        return response.content
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                chunks = bytearray()
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        chunks.extend(chunk)
+                return bytes(chunks)
 
     def _remember_gateway_api(self, payload: dict[str, Any]) -> None:
         api = payload.get("api")

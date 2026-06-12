@@ -46,13 +46,13 @@ max_rotation_delta_deg: 45.0
 scale_min_factor: 0.5
 scale_max_factor: 2.2
 
-generic_mask_weight: 1.00
-generic_bbox_weight: 0.15
-generic_contour_weight: 0.35
-generic_edge_weight: 0.20
-generic_depth_weight: 0.15
+generic_mask_weight: 0.80
+generic_bbox_weight: 0.10
+generic_contour_weight: 0.25
+generic_edge_weight: 0.15
+generic_depth_weight: 0.55
 generic_appearance_weight: 0.25
-generic_temporal_weight: 0.55
+generic_temporal_weight: 0.45
 generic_scale_prior_weight: 0.30
 generic_scale_prior_sigma_log: 0.20
 generic_contour_sigma_px: 4.0
@@ -80,16 +80,16 @@ depth_unit: meter
 depth_fallback_to_wildgs: false
 depth_min_valid_ratio: 0.10
 min_valid_depth_ratio: 0.10
-depth_sigma: 0.06
+depth_sigma: 0.08
 depth_robust_stat: median
 depth_use_mask_erode: true
 depth_mask_erode_px: 5
-depth_error_mode: median_z
+depth_error_mode: distribution
 depth_render_face_limit: 8000
 depth_outlier_score_threshold: 0.10
 depth_outlier_penalty: 0.0
 generic_free_motion_depth_enabled: true
-generic_free_motion_depth_weight: 0.60
+generic_free_motion_depth_weight: 0.99
 generic_depth_refine_fine_full_scoring: true
 generic_depth_refine_bucket_top_k: 1
 generic_visual_refine_bucket_top_k: 2
@@ -99,7 +99,12 @@ generic_depth_snap_candidate_max_delta_m: 0.60
 generic_depth_min_overlap_ratio: 0.35
 generic_depth_gate_min_confidence: 0.70
 generic_depth_hard_gate_enabled: true
-generic_depth_hard_gate_max_error_m: 0.12
+generic_depth_hard_gate_max_error_m: 0.18
+depth_gate_enabled: true
+depth_gate_max_depth_error_m: 0.18
+depth_gate_strict_depth_error_m: 0.12
+depth_gate_soft_penalty_start_m: 0.08
+depth_gate_soft_penalty_weight: 0.5
 
 edge_score_enabled: true
 edge_weight: 0.20
@@ -167,7 +172,7 @@ non_truncated_visual_ground_rescue_enabled: false
 truncated_final_visual_selection_enabled: false
 severe_truncation_final_gate_enabled: false
 
-support_plane_enabled: auto
+support_plane_enabled: disabled
 support_depth_source: depth_anything3
 support_fallback_to_wildgs: false
 support_fit_from_current_frame_depth: true
@@ -189,8 +194,8 @@ support_near_mask_inner_kernel: 9
 support_near_mask_outer_kernel: 31
 support_bbox_expand_ratio: 0.20
 support_exclude_target_mask_dilate_kernel: 9
-support_plane_weight: 0.12
-support_penalty_weight: 0.15
+support_plane_weight: 0.0
+support_penalty_weight: 0.0
 support_bottom_percentile: 3.0
 support_bottom_selection_mode: local_axis
 support_contact_sigma_m: 0.08
@@ -201,16 +206,16 @@ support_contact_distance_score_weight: 0.70
 support_contact_coverage_score_weight: 0.30
 support_floating_penalty_weight: 0.60
 support_penetration_penalty_weight: 1.00
-support_orientation_penalty_weight: 0.35
+support_orientation_penalty_weight: 0.0
 support_orientation_sigma_deg: 8.0
 support_orientation_tolerance_deg: 2.0
 support_locked_up_max_angle_deg: 50.0
-support_aligned_seed_enabled: true
+support_aligned_seed_enabled: false
 support_alignment_trigger_deg: 6.0
 support_aligned_seed_score_margin: 0.20
 support_aligned_seed_source_top_k: 2
-support_contact_snap_enabled: true
-generic_contact_snap_rescue_enabled: true
+support_contact_snap_enabled: false
+generic_contact_snap_rescue_enabled: false
 generic_contact_snap_rescue_iters: 0
 generic_contact_snap_rescue_min_mask_iou: 0.12
 generic_contact_snap_rescue_min_bbox_iou: 0.10

@@ -399,6 +399,49 @@ def test_zaiwu_gateway_uses_advertised_file_routes(tmp_path: Path) -> None:
     assert client.artifact_paths == ["/api/v1/files/outputs%2Fresult.json"]
 
 
+def test_zaiwu_gateway_download_streams_large_artifacts(monkeypatch) -> None:
+    calls: list[tuple[str, str, float]] = []
+
+    class _StreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_bytes(self):
+            yield b"depth-"
+            yield b"payload"
+
+    class _Client:
+        def __init__(self, *, verify: bool, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url: str):
+            raise AssertionError("large artifact downloads should use streaming")
+
+        def stream(self, method: str, url: str):
+            calls.append((method, url, self.timeout))
+            return _StreamResponse()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+    client = ZaiwuGatewayClient(gateway_url="http://zaiwu.local:8181", request_timeout_sec=5.0)
+
+    payload = client._download_via_gateway("/download/outputs%2Fdepth_maps.tar.gz")
+
+    assert payload == b"depth-payload"
+    assert calls == [("GET", "http://zaiwu.local:8181/download/outputs%2Fdepth_maps.tar.gz", 120.0)]
+
+
 def test_zaiwu_gateway_does_not_treat_stopped_worker_as_ready() -> None:
     client = ZaiwuGatewayClient(
         gateway_url="http://zaiwu.local:8181",

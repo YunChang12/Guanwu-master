@@ -178,6 +178,43 @@ def test_smoothing_snaps_contact_frames_to_tabletop_reference() -> None:
     assert report["objects"]["obj_000009"]["tabletop_contact_snapped_frames"] == 3
 
 
+def test_smoothing_does_not_snap_generic_appearance_temporal_tracks_to_tabletop() -> None:
+    frames = [
+        _frame(1, 0.00),
+        _frame(2, 0.02),
+        _frame(3, 0.04),
+    ]
+    for frame in frames:
+        frame["centroid_world"] = [frame["centroid_world"][0], -0.120, 0.64]
+        frame["quality"]["metrics"].update(
+            {
+                "generic_pose_motion_phase": "contact_calibration",
+                "support_plane_enabled": True,
+            }
+        )
+        frame["tabletop_contact"] = {"bottom_offset_m": -0.020}
+    trajectories = {
+        "obj_000003": {
+            "frames": frames,
+            "pose_source": "generic_appearance_temporal",
+            "tabletop_contact": {
+                "bottom_offset_m": -0.080,
+            },
+        }
+    }
+
+    smoothed, report = smooth_object_trajectories(
+        trajectories,
+        tabletop_reference={"normal_world": [0.0, -1.0, 0.0], "offset": 0.0},
+    )
+
+    out = smoothed["obj_000003"]["frames"]
+    assert [frame["centroid_world"] for frame in out] == [frame["centroid_world"] for frame in frames]
+    assert all("snapped" not in frame.get("tabletop_contact", {}) for frame in out)
+    assert report["objects"]["obj_000003"]["tabletop_contact_snapped_frames"] == 0
+    assert report["objects"]["obj_000003"]["tabletop_contact_skip_reason"] == "generic_appearance_temporal"
+
+
 def test_smoothing_prefers_frame_tabletop_contact_offset_over_track_default() -> None:
     frames = [
         _frame(1, 0.00),

@@ -105,9 +105,9 @@ def test_generic_temporal_speedup_args_use_stable_first_frame_settings_without_p
         "--stage3_iters",
         "6",
         "--top_k_candidates",
-        "16",
+        "20",
         "--refine_top_k",
-        "4",
+        "5",
     ]
     assert "--proxy_face_count" not in args
 
@@ -142,10 +142,34 @@ def test_generic_temporal_speedup_args_apply_after_prior_exists(tmp_path: Path) 
         "--stage3_iters",
         "6",
         "--top_k_candidates",
-        "8",
+        "10",
         "--refine_top_k",
-        "2",
+        "3",
     ]
+
+
+def test_generic_seed_track_uses_aligned_da3_depth_for_da3_only_pose() -> None:
+    selected = ProjectExecutor._pose_seed_depth_maps_dir_for_strategy(
+        generic_mode=True,
+        pose_depth_source="depth_anything3",
+        da3_depth_maps_dir="/tmp/depth_anything3/depth_maps_aligned",
+        wildgs_depth_maps_dir="/tmp/wildgs/depth_maps",
+        fallback_to_wildgs=False,
+    )
+
+    assert selected == "/tmp/depth_anything3/depth_maps_aligned"
+
+
+def test_generic_seed_track_falls_back_to_wildgs_only_when_enabled() -> None:
+    selected = ProjectExecutor._pose_seed_depth_maps_dir_for_strategy(
+        generic_mode=True,
+        pose_depth_source="depth_anything3",
+        da3_depth_maps_dir=None,
+        wildgs_depth_maps_dir="/tmp/wildgs/depth_maps",
+        fallback_to_wildgs=True,
+    )
+
+    assert selected == "/tmp/wildgs/depth_maps"
 
 
 def test_pose_track_scale_prior_excludes_low_observability_severe_truncation() -> None:
@@ -707,6 +731,36 @@ def test_generic_executor_acceptance_uses_motion_phase_depth_support_rules() -> 
     contact_decision = ProjectExecutor._generic_pose_optimizer_acceptance(contact)
     assert contact_decision["accepted"] is False
     assert "contact_support_separation_above_threshold" in contact_decision["reason"]
+
+
+def test_generic_executor_acceptance_does_not_require_support_when_disabled() -> None:
+    report = {
+        "json_bbox": [414.0, 370.0, 478.0, 459.0],
+        "optimized_corrected_pose_world": {
+            "translation_world": [-0.02, 0.10, 0.53],
+            "rotation_matrix": np.eye(3).tolist(),
+            "scale": [0.057, 0.057, 0.057],
+        },
+        "metrics": {
+            "acceptance_status": "accepted",
+            "reject_reasons": [],
+            "generic_pose_motion_phase": "contact_calibration",
+            "mask_iou": 0.91,
+            "soft_mask_iou": 0.88,
+            "bbox_iou": 0.92,
+            "bbox_center_error_px": 3.0,
+            "projection_valid_ratio": 1.0,
+            "depth_confidence": 1.0,
+            "depth_score": 0.90,
+            "support_plane_enabled": False,
+            "support_plane_disable_reason": "disabled",
+            "support_plane_confidence": 0.0,
+        },
+    }
+
+    decision = ProjectExecutor._generic_pose_optimizer_acceptance(report)
+
+    assert decision == {"accepted": True, "reason": "accepted"}
 
 
 def test_pose_temporal_anchor_excludes_low_observability_severe_truncation() -> None:

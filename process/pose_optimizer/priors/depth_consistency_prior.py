@@ -17,6 +17,8 @@ class DepthConsistencyConfig:
     robust_stat: str = "median"
     mask_erode_px: int = 0
     error_mode: str = "pixel_abs"
+    trim_lower_percentile: float = 5.0
+    trim_upper_percentile: float = 95.0
     eps: float = 1e-6
 
 
@@ -120,9 +122,40 @@ class DepthConsistencyPrior:
 
         rendered_valid = rendered_depth[valid].astype(np.float32)
         observed_valid = self.observed_depth[valid].astype(np.float32)
+        trim_lower = float(getattr(self.config, "trim_lower_percentile", 5.0))
+        trim_upper = float(getattr(self.config, "trim_upper_percentile", 95.0))
+        trim_debug: dict[str, Any] = {"trim_percentiles": [trim_lower, trim_upper]}
+        if (
+            observed_valid.size >= 20
+            and np.isfinite(trim_lower)
+            and np.isfinite(trim_upper)
+            and 0.0 <= trim_lower < trim_upper <= 100.0
+        ):
+            lo, hi = np.percentile(observed_valid, [trim_lower, trim_upper])
+            trimmed = (observed_valid >= float(lo)) & (observed_valid <= float(hi))
+            if np.any(trimmed):
+                rendered_valid = rendered_valid[trimmed]
+                observed_valid = observed_valid[trimmed]
+                trim_debug.update(
+                    {
+                        "trim_observed_min": float(lo),
+                        "trim_observed_max": float(hi),
+                        "trimmed_valid_count": int(observed_valid.size),
+                    }
+                )
+
         median_rendered = float(np.median(rendered_valid))
         median_observed = float(np.median(observed_valid))
-        if str(getattr(self.config, "error_mode", "pixel_abs")).strip().lower() == "median_z":
+        p25_rendered, p75_rendered = [float(v) for v in np.percentile(rendered_valid, [25, 75])]
+        p25_observed, p75_observed = [float(v) for v in np.percentile(observed_valid, [25, 75])]
+        error_mode = str(getattr(self.config, "error_mode", "pixel_abs")).strip().lower()
+        if error_mode in {"distribution", "robust_distribution", "quantile_distribution"}:
+            depth_error = float(
+                0.60 * abs(median_rendered - median_observed)
+                + 0.20 * abs(p25_rendered - p25_observed)
+                + 0.20 * abs(p75_rendered - p75_observed)
+            )
+        elif error_mode == "median_z":
             depth_error = float(abs(median_rendered - median_observed))
         else:
             errors = np.abs(rendered_valid - observed_valid).astype(np.float32)
@@ -139,11 +172,16 @@ class DepthConsistencyPrior:
                 "valid_depth_ratio": valid_ratio,
                 "median_rendered_depth": median_rendered,
                 "median_observed_depth": median_observed,
+                "p25_rendered_depth": p25_rendered,
+                "p25_observed_depth": p25_observed,
+                "p75_rendered_depth": p75_rendered,
+                "p75_observed_depth": p75_observed,
                 "debug": {
                     "reason": "low_valid_depth_ratio",
                     "valid_count": valid_count,
                     "denominator": denom,
                     "min_valid_ratio": float(self.config.min_valid_ratio),
+                    **trim_debug,
                 },
             }
 
@@ -156,7 +194,11 @@ class DepthConsistencyPrior:
             "valid_depth_ratio": valid_ratio,
             "median_rendered_depth": median_rendered,
             "median_observed_depth": median_observed,
-            "debug": {"valid_count": valid_count, "denominator": denom},
+            "p25_rendered_depth": p25_rendered,
+            "p25_observed_depth": p25_observed,
+            "p75_rendered_depth": p75_rendered,
+            "p75_observed_depth": p75_observed,
+            "debug": {"valid_count": valid_count, "denominator": denom, **trim_debug},
         }
 
     @staticmethod

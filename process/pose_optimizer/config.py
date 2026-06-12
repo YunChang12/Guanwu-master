@@ -64,6 +64,7 @@ NEGATED_BOOLEAN_OPTIONS = {
     "save_score_breakdown",
     "support_aligned_seed_enabled",
     "depth_fallback_to_wildgs",
+    "depth_gate_enabled",
     "depth_use_mask_erode",
     "support_fallback_to_wildgs",
     "support_fit_from_current_frame_depth",
@@ -106,6 +107,13 @@ NESTED_KEY_PREFIXES = {
         "depth_mask_erode_px": "depth_mask_erode_px",
         "min_valid_depth_ratio": "min_valid_depth_ratio",
         "depth_error_mode": "depth_error_mode",
+    },
+    "depth_gate": {
+        "enabled": "depth_gate_enabled",
+        "max_depth_error_m": "depth_gate_max_depth_error_m",
+        "strict_depth_error_m": "depth_gate_strict_depth_error_m",
+        "soft_penalty_start_m": "depth_gate_soft_penalty_start_m",
+        "soft_penalty_weight": "depth_gate_soft_penalty_weight",
     },
     "support": {
         "source": "support_depth_source",

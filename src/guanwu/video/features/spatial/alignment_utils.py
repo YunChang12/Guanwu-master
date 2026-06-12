@@ -114,12 +114,10 @@ def build_depth_point_cloud(
     mask_h, mask_w = binary_mask.shape
     depth_h, depth_w = depth.shape
     if binary_mask.shape != (depth_h, depth_w):
-        try:
-            from PIL import Image as _PILImage
-            img = _PILImage.fromarray(binary_mask.astype(np.uint8) * 255)
-            binary_mask = np.asarray(img.resize((depth_w, depth_h), _PILImage.NEAREST)) > 127
-        except Exception:
-            return None
+        raise ValueError(
+            f"Depth/mask size mismatch: depth={depth.shape}, mask={binary_mask.shape}. "
+            "Please use aligned depth."
+        )
 
     if wildgs_K:
         fx, fy = float(wildgs_K["fx"]), float(wildgs_K["fy"])
@@ -133,13 +131,6 @@ def build_depth_point_cloud(
         else:
             fx = fy = max(depth_h, depth_w) * 0.8
             cx, cy = depth_w / 2.0, depth_h / 2.0
-
-    scale_x = float(depth_w) / max(float(mask_w), 1.0)
-    scale_y = float(depth_h) / max(float(mask_h), 1.0)
-    fx *= scale_x
-    fy *= scale_y
-    cx *= scale_x
-    cy *= scale_y
 
     R, t = np.eye(3), np.zeros(3)
     if wildgs_poses:

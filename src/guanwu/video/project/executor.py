@@ -1514,6 +1514,10 @@ class ProjectExecutor:
             outputs["wildgs_depth_maps"] = wildgs_outputs["depth_maps_dir"]
         if depth_anything3_outputs.get("depth_maps_dir"):
             outputs["depth_anything3_depth_maps"] = depth_anything3_outputs["depth_maps_dir"]
+        if depth_anything3_outputs.get("aligned_depth_maps_dir"):
+            outputs["depth_anything3_aligned_depth_maps"] = depth_anything3_outputs["aligned_depth_maps_dir"]
+        if depth_anything3_outputs.get("raw_depth_maps_dir"):
+            outputs["depth_anything3_raw_depth_maps"] = depth_anything3_outputs["raw_depth_maps_dir"]
         if depth_anything3_outputs.get("manifest_path"):
             outputs["depth_anything3_depth_manifest"] = depth_anything3_outputs["manifest_path"]
         if wildgs_outputs.get("plots_dir"):
@@ -1649,16 +1653,26 @@ class ProjectExecutor:
             return {}
         output_dir.mkdir(parents=True, exist_ok=True)
         depth_maps_dir = output_dir / "depth_maps"
+        aligned_depth_maps_dir = output_dir / "depth_maps_aligned"
         depth_maps_dir.mkdir(parents=True, exist_ok=True)
+        aligned_depth_maps_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = output_dir / "depth_manifest.json"
         depth_indices = [self._depth_anything3_index_for_frame_path(path, fallback_index=index) for index, path in enumerate(frame_paths)]
         expected_paths = [depth_maps_dir / f"{index:05d}.npy" for index in depth_indices]
+        expected_aligned_paths = [aligned_depth_maps_dir / f"{index:05d}.npy" for index in depth_indices]
         if (
             not force
             and manifest_path.exists()
             and all(path.exists() for path in expected_paths)
+            and all(path.exists() for path in expected_aligned_paths)
         ):
-            return {"depth_maps_dir": str(depth_maps_dir), "manifest_path": str(manifest_path), "cached": True}
+            return {
+                "depth_maps_dir": str(aligned_depth_maps_dir),
+                "aligned_depth_maps_dir": str(aligned_depth_maps_dir),
+                "raw_depth_maps_dir": str(depth_maps_dir),
+                "manifest_path": str(manifest_path),
+                "cached": True,
+            }
         if self._provider_mode() != "zaiwu":
             raise RuntimeError("Depth Anything3 frame depth generation requires provider_mode='zaiwu'")
         settings = self.context.config.settings
@@ -1696,13 +1710,22 @@ class ProjectExecutor:
             frame_manifest_entries: list[dict[str, Any]] = []
             for frame_path, depth_index, frame_depth in zip(frame_paths, depth_indices, depth_arr[: len(frame_paths)], strict=False):
                 target_depth_path = depth_maps_dir / f"{int(depth_index):05d}.npy"
-                np.save(target_depth_path, np.asarray(frame_depth, dtype=np.float32))
+                target_aligned_depth_path = aligned_depth_maps_dir / f"{int(depth_index):05d}.npy"
+                raw_depth = np.asarray(frame_depth, dtype=np.float32)
+                aligned_depth, image_size = self._align_depth_to_frame_image(raw_depth, frame_path)
+                np.save(target_depth_path, raw_depth)
+                np.save(target_aligned_depth_path, aligned_depth)
                 frame_manifest_entries.append(
                     {
                         "input_frame": str(frame_path),
                         "pipeline_frame_id": int(self._pipeline_frame_id_from_frame_path(frame_path) or int(depth_index) + 1),
                         "depth_index": int(depth_index),
-                        "depth_path": str(target_depth_path),
+                        "depth_path": str(target_aligned_depth_path),
+                        "aligned_depth_path": str(target_aligned_depth_path),
+                        "raw_depth_path": str(target_depth_path),
+                        "image_size": [int(image_size[0]), int(image_size[1])],
+                        "raw_depth_shape": [int(raw_depth.shape[0]), int(raw_depth.shape[1])],
+                        "aligned_depth_shape": [int(aligned_depth.shape[0]), int(aligned_depth.shape[1])],
                     }
                 )
             depth_type = str(result.get("depth_type") or "metric")
@@ -1714,7 +1737,9 @@ class ProjectExecutor:
                 "depth_unit": depth_unit,
                 "model_name": model_name,
                 "frame_index_base": "0-based",
-                "depth_maps_dir": str(depth_maps_dir),
+                "depth_maps_dir": str(aligned_depth_maps_dir),
+                "aligned_depth_maps_dir": str(aligned_depth_maps_dir),
+                "raw_depth_maps_dir": str(depth_maps_dir),
                 "frame_count": int(len(frame_paths)),
                 "depth_service": service_id,
                 "depth_artifact_file_id": output_file_id,
@@ -1724,7 +1749,9 @@ class ProjectExecutor:
             }
             self._json_dump(manifest_path, manifest)
             return {
-                "depth_maps_dir": str(depth_maps_dir),
+                "depth_maps_dir": str(aligned_depth_maps_dir),
+                "aligned_depth_maps_dir": str(aligned_depth_maps_dir),
+                "raw_depth_maps_dir": str(depth_maps_dir),
                 "manifest_path": str(manifest_path),
                 "depth_type": depth_type,
                 "depth_unit": depth_unit,
@@ -1734,6 +1761,23 @@ class ProjectExecutor:
         except Exception as exc:
             _logger.error("[geometry.lift] Depth Anything3 frame depth generation failed: %s", exc)
             raise
+
+    @staticmethod
+    def _align_depth_to_frame_image(depth: np.ndarray, frame_path: Path) -> tuple[np.ndarray, tuple[int, int]]:
+        frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError(f"Could not read RGB frame for DA3 depth alignment: {frame_path}")
+        orig_h, orig_w = frame.shape[:2]
+        depth_arr = np.asarray(depth, dtype=np.float32)
+        if depth_arr.ndim != 2:
+            raise RuntimeError(f"Expected 2D DA3 depth for {frame_path}, got shape {depth_arr.shape}")
+        if depth_arr.shape != (orig_h, orig_w):
+            depth_arr = cv2.resize(
+                depth_arr,
+                (int(orig_w), int(orig_h)),
+                interpolation=cv2.INTER_LINEAR,
+            ).astype(np.float32)
+        return np.asarray(depth_arr, dtype=np.float32), (int(orig_w), int(orig_h))
 
     @staticmethod
     def _pipeline_frame_id_from_frame_path(path: Path) -> int | None:
@@ -2522,6 +2566,55 @@ class ProjectExecutor:
             return None
         return max(0, value)
 
+    @staticmethod
+    def _pose_frame_id_bound(env_name: str) -> int | None:
+        raw = os.environ.get(env_name, "")
+        if str(raw).strip() == "":
+            return None
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _pose_filter_frame_ids_by_env(cls, frame_ids: list[int]) -> tuple[list[int], dict]:
+        start_frame_id = cls._pose_frame_id_bound("GUANWU_POSE_START_FRAME_ID")
+        end_frame_id = cls._pose_frame_id_bound("GUANWU_POSE_END_FRAME_ID")
+        filtered = [int(fid) for fid in frame_ids]
+        if start_frame_id is not None:
+            filtered = [fid for fid in filtered if fid >= start_frame_id]
+        if end_frame_id is not None:
+            filtered = [fid for fid in filtered if fid <= end_frame_id]
+        return sorted(set(filtered)), {
+            "start_frame_id": start_frame_id,
+            "end_frame_id": end_frame_id,
+            "input_count": len(frame_ids),
+            "output_count": len(filtered),
+        }
+
+    @staticmethod
+    def _pose_seed_depth_maps_dir_for_strategy(
+        *,
+        generic_mode: bool,
+        pose_depth_source: str,
+        da3_depth_maps_dir: str | Path | None,
+        wildgs_depth_maps_dir: str | Path | None,
+        fallback_to_wildgs: bool,
+    ) -> str | None:
+        if not generic_mode:
+            return str(wildgs_depth_maps_dir) if wildgs_depth_maps_dir else None
+        source = str(pose_depth_source or "depth_anything3").strip().lower().replace("-", "_")
+        if source in {"da3", "depth_anything", "zaiwu_depth_anything3"}:
+            source = "depth_anything3"
+        if source == "wildgs":
+            return str(wildgs_depth_maps_dir) if wildgs_depth_maps_dir else None
+        if da3_depth_maps_dir:
+            return str(da3_depth_maps_dir)
+        if fallback_to_wildgs and wildgs_depth_maps_dir:
+            return str(wildgs_depth_maps_dir)
+        return None
+
     def _run_edge_contour_temporal_pose_optimize(
         self,
         *,
@@ -2556,6 +2649,13 @@ class ProjectExecutor:
                 self._pose_depth_unit(),
                 str(pose_depth_fallback_to_wildgs).lower(),
             )
+        seed_depth_maps_dir = self._pose_seed_depth_maps_dir_for_strategy(
+            generic_mode=generic_mode,
+            pose_depth_source=pose_depth_source,
+            da3_depth_maps_dir=da3_depth_maps_dir,
+            wildgs_depth_maps_dir=depth_maps_dir,
+            fallback_to_wildgs=pose_depth_fallback_to_wildgs,
+        )
         target_frame_mode = self._pose_target_frame_mode()
         all_frames_mode = target_frame_mode == "all_frames"
         dynamic_window_enabled = self._pose_env_bool("GUANWU_POSE_DYNAMIC_WINDOW", default=all_frames_mode)
@@ -2593,6 +2693,10 @@ class ProjectExecutor:
                 "enabled": dynamic_window_enabled,
                 "min_radius": dynamic_window_min_radius,
                 "max_radius": dynamic_window_max_radius,
+            },
+            "frame_id_filter": {
+                "start_frame_id": self._pose_frame_id_bound("GUANWU_POSE_START_FRAME_ID"),
+                "end_frame_id": self._pose_frame_id_bound("GUANWU_POSE_END_FRAME_ID"),
             },
             "target_object_ids": sorted(target_object_ids) if target_object_ids else None,
             "max_target_objects": max_target_objects,
@@ -2717,11 +2821,13 @@ class ProjectExecutor:
                 if int(target_frame_id) not in frame_ids:
                     frame_ids.append(int(target_frame_id))
                     frame_ids = sorted(set(frame_ids))
+            frame_ids, frame_filter = self._pose_filter_frame_ids_by_env(frame_ids)
             if not frame_ids:
                 manifest["objects"][obj_id] = {
                     "status": "skipped",
-                    "reason": "empty_temporal_window",
+                    "reason": "empty_temporal_window_after_frame_filter",
                     "target_frame_id": target_frame_id,
+                    "frame_filter": frame_filter,
                 }
                 skipped_objects += 1
                 continue
@@ -2759,7 +2865,7 @@ class ProjectExecutor:
                 verts=verts,
                 obj_traj=obj_traj,
                 detection_frames=detection_frames,
-                depth_maps_dir=depth_maps_dir,
+                depth_maps_dir=seed_depth_maps_dir,
                 cam_traj=cam_traj,
                 wildgs_poses=wildgs_poses,
                 wildgs_K=wildgs_K,
@@ -2870,7 +2976,7 @@ class ProjectExecutor:
                         verts=verts,
                         obj_traj=obj_traj,
                         detection_frames=detection_frames,
-                        depth_maps_dir=depth_maps_dir,
+                        depth_maps_dir=seed_depth_maps_dir,
                         cam_traj=cam_traj,
                         wildgs_poses=wildgs_poses,
                         wildgs_K=wildgs_K,
@@ -7962,11 +8068,11 @@ class ProjectExecutor:
             task = {}
         temporal_prior = task.get("temporal_prior_pose")
         if isinstance(temporal_prior, dict) and temporal_prior:
-            top_k_candidates = "8"
-            refine_top_k = "2"
+            top_k_candidates = "10"
+            refine_top_k = "3"
         else:
-            top_k_candidates = "16"
-            refine_top_k = "4"
+            top_k_candidates = "20"
+            refine_top_k = "5"
         return [
             "--batch_gpu_size",
             "64",
@@ -8128,25 +8234,28 @@ class ProjectExecutor:
                 return {"accepted": False, "reason": f"{reason}:{depth_score:.3f}"}
         try:
             support_enabled = bool(metrics.get("support_plane_enabled"))
+            support_disable_reason = str(metrics.get("support_plane_disable_reason") or "").strip().lower()
             support_confidence = float(metrics.get("support_plane_confidence") or 0.0)
             support_floating = abs(float(metrics.get("support_floating_distance_m") or 0.0))
             support_penetration = abs(float(metrics.get("support_penetration_distance_m") or 0.0))
         except Exception:
             support_enabled = False
+            support_disable_reason = ""
             support_confidence = 0.0
             support_floating = 0.0
             support_penetration = 0.0
+        support_constraint_active = support_enabled and support_disable_reason not in {"disabled", "off", "false", "0"}
         support_separation = max(support_floating, support_penetration)
         if motion_phase != "free_motion":
             support_threshold = 0.05 if motion_phase == "contact_calibration" else 0.15
-            if support_enabled and support_confidence >= 0.70 and support_separation > support_threshold:
+            if support_constraint_active and support_confidence >= 0.70 and support_separation > support_threshold:
                 reason = (
                     "contact_support_separation_above_threshold"
                     if motion_phase == "contact_calibration"
                     else "support_separation_above_threshold"
                 )
                 return {"accepted": False, "reason": f"{reason}:{support_separation:.3f}"}
-            if motion_phase == "contact_calibration" and (not support_enabled or support_confidence < 0.70):
+            if motion_phase == "contact_calibration" and support_enabled and support_confidence < 0.70:
                 return {"accepted": False, "reason": "contact_support_plane_low_confidence"}
         pose = report.get("optimized_corrected_pose_world", {})
         if not ProjectExecutor._valid_vec3_like(pose.get("translation_world")):
@@ -8357,22 +8466,27 @@ class ProjectExecutor:
     def _resolve_depth_anything3_depth_maps_dir(geometry) -> str | None:
         outputs = getattr(geometry, "outputs", {}) or {}
         raw = outputs.get("depth_anything3_depth_maps")
-        if raw and Path(str(raw)).exists():
-            return str(raw)
+        explicit_aligned = outputs.get("depth_anything3_aligned_depth_maps")
+        if explicit_aligned and Path(str(explicit_aligned)).exists():
+            return str(explicit_aligned)
         manifest_raw = outputs.get("depth_anything3_depth_manifest")
         if manifest_raw and Path(str(manifest_raw)).exists():
             try:
                 manifest = json.loads(Path(str(manifest_raw)).read_text(encoding="utf-8"))
-                depth_maps_dir = manifest.get("depth_maps_dir")
-                if depth_maps_dir and Path(str(depth_maps_dir)).exists():
-                    return str(depth_maps_dir)
+                for key in ("aligned_depth_maps_dir", "depth_maps_dir"):
+                    depth_maps_dir = manifest.get(key)
+                    if depth_maps_dir and Path(str(depth_maps_dir)).exists():
+                        return str(depth_maps_dir)
             except Exception:
                 pass
+        if raw and Path(str(raw)).exists():
+            return str(raw)
         summary_path = outputs.get("summary")
         if not summary_path:
             return str(raw) if raw else None
         gl_dir = Path(str(summary_path)).parent
         candidates = [
+            gl_dir / "depth_anything3" / "depth_maps_aligned",
             gl_dir / "depth_anything3" / "depth_maps",
             gl_dir / "depth_anything3",
         ]
@@ -8383,6 +8497,13 @@ class ProjectExecutor:
             except OSError:
                 continue
         return str(raw) if raw else None
+
+    @staticmethod
+    def _resolve_scene_alignment_depth_maps_dir(geometry) -> str | None:
+        da3_depth_maps_dir = ProjectExecutor._resolve_depth_anything3_depth_maps_dir(geometry)
+        if da3_depth_maps_dir:
+            return da3_depth_maps_dir
+        return ProjectExecutor._resolve_wildgs_depth_maps_dir(geometry)
 
     @staticmethod
     def _resolve_depth_map_for_frame(depth_maps_dir: str | Path | None, frame_id: int) -> Path | None:
@@ -11235,8 +11356,10 @@ class ProjectExecutor:
                     "points_path": ply_path,
                     "source": "wildgs",
                 }
-        if geometry.outputs.get("wildgs_depth_maps"):
-            pit_snapshot["wildgs_depth_maps_dir"] = geometry.outputs["wildgs_depth_maps"]
+        alignment_depth_maps_dir = self._resolve_scene_alignment_depth_maps_dir(geometry)
+        if alignment_depth_maps_dir:
+            pit_snapshot["wildgs_depth_maps_dir"] = alignment_depth_maps_dir
+            pit_snapshot["scene_alignment_depth_maps_dir"] = alignment_depth_maps_dir
         world_payload = {
             "timestamp": geometry_summary["frames"][-1]["timestamp"] if geometry_summary["frames"] else 0.0,
             "active_objects": [obj.model_dump(mode="json") for obj in objects],

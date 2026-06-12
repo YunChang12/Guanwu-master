@@ -213,8 +213,8 @@ def test_geometry_lift_names_depth_anything3_maps_by_pipeline_frame_id(monkeypat
     fake_gateway = _FakeFrameDepthGateway(
         np.stack(
             [
-                np.full((18, 26), 3.1, dtype=np.float32),
-                np.full((18, 26), 3.3, dtype=np.float32),
+                np.full((3, 5), 3.1, dtype=np.float32),
+                np.full((3, 5), 3.3, dtype=np.float32),
             ]
         )
     )
@@ -244,15 +244,26 @@ def test_geometry_lift_names_depth_anything3_maps_by_pipeline_frame_id(monkeypat
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
     assert (tmp_path / "depth_anything3" / "depth_maps" / "00000.npy").exists()
     assert (tmp_path / "depth_anything3" / "depth_maps" / "00002.npy").exists()
+    assert (tmp_path / "depth_anything3" / "depth_maps_aligned" / "00000.npy").exists()
+    assert (tmp_path / "depth_anything3" / "depth_maps_aligned" / "00002.npy").exists()
     assert not (tmp_path / "depth_anything3" / "depth_maps" / "00001.npy").exists()
+    assert not (tmp_path / "depth_anything3" / "depth_maps_aligned" / "00001.npy").exists()
     assert manifest["frames"][1]["pipeline_frame_id"] == 3
     assert manifest["frames"][1]["depth_index"] == 2
     assert np.load(tmp_path / "depth_anything3" / "depth_maps" / "00002.npy")[0, 0] == np.float32(3.3)
+    assert np.load(tmp_path / "depth_anything3" / "depth_maps" / "00002.npy").shape == (3, 5)
+    assert np.load(tmp_path / "depth_anything3" / "depth_maps_aligned" / "00002.npy").shape == (18, 26)
+    assert manifest["depth_maps_dir"] == str(tmp_path / "depth_anything3" / "depth_maps_aligned")
+    assert manifest["raw_depth_maps_dir"] == str(tmp_path / "depth_anything3" / "depth_maps")
+    assert manifest["aligned_depth_maps_dir"] == str(tmp_path / "depth_anything3" / "depth_maps_aligned")
+    assert manifest["frames"][1]["raw_depth_shape"] == [3, 5]
+    assert manifest["frames"][1]["aligned_depth_shape"] == [18, 26]
+    assert manifest["frames"][1]["image_size"] == [26, 18]
 
 
-def test_resolve_depth_anything3_depth_maps_uses_raw_da3_even_when_aligned_manifest_dir_exists(tmp_path: Path) -> None:
+def test_resolve_depth_anything3_depth_maps_prefers_aligned_da3_when_manifest_dir_exists(tmp_path: Path) -> None:
     raw_dir = tmp_path / "depth_anything3" / "depth_maps"
-    aligned_dir = tmp_path / "depth_anything3" / "depth_maps_metric_aligned"
+    aligned_dir = tmp_path / "depth_anything3" / "depth_maps_aligned"
     raw_dir.mkdir(parents=True)
     aligned_dir.mkdir(parents=True)
     np.save(raw_dir / "00000.npy", np.ones((2, 2), dtype=np.float32))
@@ -262,8 +273,8 @@ def test_resolve_depth_anything3_depth_maps_uses_raw_da3_even_when_aligned_manif
         json.dumps(
             {
                 "depth_maps_dir": str(raw_dir),
-                "metric_aligned_depth_maps_dir": str(aligned_dir),
-                "metric_alignment_source": "wildgs_metric_depth_affine",
+                "aligned_depth_maps_dir": str(aligned_dir),
+                "raw_depth_maps_dir": str(raw_dir),
             }
         ),
         encoding="utf-8",
@@ -275,7 +286,39 @@ def test_resolve_depth_anything3_depth_maps_uses_raw_da3_even_when_aligned_manif
         }
     )
 
-    assert ProjectExecutor._resolve_depth_anything3_depth_maps_dir(geometry) == str(raw_dir)
+    assert ProjectExecutor._resolve_depth_anything3_depth_maps_dir(geometry) == str(aligned_dir)
+
+
+def test_resolve_scene_alignment_depth_maps_prefers_aligned_da3_over_wildgs(tmp_path: Path) -> None:
+    wildgs_dir = tmp_path / "wildgs" / "depth_maps"
+    raw_da3_dir = tmp_path / "depth_anything3" / "depth_maps"
+    aligned_da3_dir = tmp_path / "depth_anything3" / "depth_maps_aligned"
+    wildgs_dir.mkdir(parents=True)
+    raw_da3_dir.mkdir(parents=True)
+    aligned_da3_dir.mkdir(parents=True)
+    np.save(wildgs_dir / "00000.npy", np.ones((360, 640), dtype=np.float32))
+    np.save(raw_da3_dir / "00000.npy", np.ones((280, 504), dtype=np.float32))
+    np.save(aligned_da3_dir / "00000.npy", np.ones((1080, 1920), dtype=np.float32))
+    manifest_path = tmp_path / "depth_anything3" / "depth_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "depth_maps_dir": str(aligned_da3_dir),
+                "aligned_depth_maps_dir": str(aligned_da3_dir),
+                "raw_depth_maps_dir": str(raw_da3_dir),
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = SimpleNamespace(
+        outputs={
+            "wildgs_depth_maps": str(wildgs_dir),
+            "depth_anything3_depth_maps": str(raw_da3_dir),
+            "depth_anything3_depth_manifest": str(manifest_path),
+        }
+    )
+
+    assert ProjectExecutor._resolve_scene_alignment_depth_maps_dir(geometry) == str(aligned_da3_dir)
 
 
 def test_generic_pose_context_prefers_depth_anything3_and_keeps_wildgs_metadata(tmp_path: Path) -> None:

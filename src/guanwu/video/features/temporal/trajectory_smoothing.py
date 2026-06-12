@@ -79,7 +79,10 @@ def smooth_object_trajectories(
                 max_low_quality_adjust_m=max_low_quality_adjust_m,
                 rotation_spike_deg=rotation_spike_deg,
             )
-        _snap_contact_frames_to_tabletop(frames, value, tabletop_reference, obj_report)
+        if _is_generic_appearance_temporal_track(value):
+            obj_report["tabletop_contact_skip_reason"] = "generic_appearance_temporal"
+        else:
+            _snap_contact_frames_to_tabletop(frames, value, tabletop_reference, obj_report)
 
         report["objects"][obj_id] = obj_report
 
@@ -122,6 +125,20 @@ def _track_frames(value: Any) -> list[dict[str, Any]] | None:
     if not isinstance(frames, list):
         return None
     return [frame for frame in frames if isinstance(frame, dict)]
+
+
+def _is_generic_appearance_temporal_track(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    pose_source = str(value.get("pose_source") or "").strip().lower()
+    if pose_source == "generic_appearance_temporal":
+        return True
+    frames = _track_frames(value) or []
+    return any(
+        str(frame.get("source") or frame.get("pose_source") or "").strip().lower() == "generic_appearance_temporal"
+        or str(frame.get("geometry_status") or "").strip().lower() == "generic_appearance_temporal"
+        for frame in frames
+    )
 
 
 def _segments_from_indices(

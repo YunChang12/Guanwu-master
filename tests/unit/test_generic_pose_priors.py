@@ -139,6 +139,45 @@ def test_depth_prior_uses_eroded_mask_and_median_z_error_without_penalty() -> No
     assert score["depth_score"] == pytest.approx(np.exp(-0.2 / 0.75), abs=1e-4)
 
 
+def test_depth_prior_distribution_error_uses_inner_mask_and_trimmed_quantiles() -> None:
+    from process.pose_optimizer.priors.depth_consistency_prior import (
+        DepthConsistencyConfig,
+        DepthConsistencyPrior,
+    )
+
+    observed = np.full((48, 48), 8.0, dtype=np.float32)
+    detection = np.zeros((48, 48), dtype=np.uint8)
+    detection[8:40, 8:40] = 1
+    observed[8:40, 8:40] = 4.0
+    observed[8:40, 24:40] = 4.4
+    observed[8:12, 8:40] = 12.0
+    observed[36:40, 8:40] = 12.0
+    observed[8:40, 8:12] = 12.0
+    observed[8:40, 36:40] = 12.0
+    prior = DepthConsistencyPrior(
+        observed,
+        detection,
+        config=DepthConsistencyConfig(
+            depth_sigma=0.08,
+            min_valid_ratio=0.10,
+            mask_erode_px=5,
+            error_mode="distribution",
+        ),
+    )
+
+    render_mask = detection.copy()
+    render_depth = np.zeros_like(observed)
+    render_depth[render_mask > 0] = 4.0
+    score = prior.score(render_depth, render_mask)
+
+    assert score["depth_enabled"] is True
+    assert score["median_observed_depth"] == pytest.approx(4.2, abs=1e-4)
+    assert score["p25_observed_depth"] == pytest.approx(4.0, abs=1e-4)
+    assert score["p75_observed_depth"] == pytest.approx(4.4, abs=1e-4)
+    assert score["depth_error"] == pytest.approx(0.20, abs=1e-4)
+    assert score["debug"]["trim_percentiles"] == [5.0, 95.0]
+
+
 def test_depth_prior_disables_low_valid_ratio_without_penalizing_candidate() -> None:
     from process.pose_optimizer.priors.depth_consistency_prior import (
         DepthConsistencyConfig,
@@ -167,6 +206,82 @@ def test_depth_prior_disables_low_valid_ratio_without_penalizing_candidate() -> 
     assert score["depth_confidence"] == 0.0
     assert score["depth_score"] == 0.0
     assert score["debug"]["reason"] == "low_valid_depth_ratio"
+
+
+def test_depth_prior_scores_roi_cropped_depth_with_visible_region() -> None:
+    from process.pose_optimizer.priors.depth_consistency_prior import (
+        DepthConsistencyConfig,
+        DepthConsistencyPrior,
+    )
+
+    observed = np.full((40, 40), 9.0, dtype=np.float32)
+    detection = np.zeros((40, 40), dtype=np.uint8)
+    detection[12:28, 10:30] = 1
+    observed[detection > 0] = 1.5
+    rendered = np.zeros_like(observed)
+    rendered[detection > 0] = 1.55
+    visible = np.zeros_like(detection)
+    visible[14:26, 12:28] = 1
+
+    full_prior = DepthConsistencyPrior(
+        observed,
+        detection,
+        config=DepthConsistencyConfig(depth_sigma=0.25, min_valid_ratio=0.10, error_mode="median_z"),
+    )
+    full_score = full_prior.score(rendered, detection, visible_region=visible)
+
+    roi = (8, 10, 32, 30)
+    x1, y1, x2, y2 = roi
+    roi_prior = DepthConsistencyPrior(
+        observed[y1:y2, x1:x2],
+        detection[y1:y2, x1:x2],
+        config=DepthConsistencyConfig(depth_sigma=0.25, min_valid_ratio=0.10, error_mode="median_z"),
+    )
+    roi_score = roi_prior.score(
+        rendered[y1:y2, x1:x2],
+        detection[y1:y2, x1:x2],
+        visible_region=visible[y1:y2, x1:x2],
+    )
+
+    assert roi_score["depth_enabled"] is True
+    assert roi_score["depth_error"] == pytest.approx(full_score["depth_error"])
+    assert roi_score["valid_depth_ratio"] == pytest.approx(full_score["valid_depth_ratio"])
+
+
+def test_render_depth_for_pose_can_render_only_roi_matching_full_depth() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import render_depth_for_pose
+
+    vertices = np.array(
+        [
+            [-0.2, -0.2, 0.0],
+            [0.2, -0.2, 0.0],
+            [0.2, 0.2, 0.0],
+            [-0.2, 0.2, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    intrinsics = {"fx": 100.0, "fy": 100.0, "cx": 32.0, "cy": 32.0}
+    translation = np.array([0.0, 0.0, 2.0], dtype=np.float64)
+    rotation = np.eye(3, dtype=np.float64)
+    scale = np.ones(3, dtype=np.float64)
+
+    full = render_depth_for_pose(vertices, faces, translation, rotation, scale, intrinsics, (64, 64))
+    roi = (20, 20, 44, 44)
+    cropped = render_depth_for_pose(
+        vertices,
+        faces,
+        translation,
+        rotation,
+        scale,
+        intrinsics,
+        (64, 64),
+        roi_xyxy=roi,
+    )
+    x1, y1, x2, y2 = roi
+
+    assert cropped.shape == (y2 - y1, x2 - x1)
+    assert np.array_equal(cropped, full[y1:y2, x1:x2])
 
 
 def test_da3_only_depth_loader_rejects_wildgs_task_depth_without_fallback(tmp_path) -> None:
@@ -1817,7 +1932,7 @@ def test_generic_config_keeps_full_scoring_after_proxy_coarse_mode() -> None:
     assert cfg["generic_coarse_scoring"] is False
 
 
-def test_generic_config_enables_depth_support_defaults() -> None:
+def test_generic_config_enables_depth_and_disables_support_defaults() -> None:
     from process.pose_optimizer.config import load_config
     from process.pose_optimizer.variants import VARIANTS
 
@@ -1825,22 +1940,22 @@ def test_generic_config_enables_depth_support_defaults() -> None:
 
     assert cfg["depth_enabled"] is True
     assert cfg["generic_depth_weight"] > 0.0
-    assert cfg["support_plane_enabled"] == "auto"
-    assert cfg["support_plane_weight"] > 0.0
-    assert cfg["support_penalty_weight"] > 0.0
+    assert cfg["support_plane_enabled"] == "disabled"
+    assert cfg["support_plane_weight"] == 0.0
+    assert cfg["support_penalty_weight"] == 0.0
     assert cfg["support_contact_sigma_m"] == 0.08
     assert cfg["support_contact_tolerance_m"] == 0.06
     assert cfg["support_floating_tolerance_m"] == 0.15
     assert cfg["support_penetration_tolerance_m"] == 0.07
-    assert cfg["support_orientation_penalty_weight"] > 0.0
+    assert cfg["support_orientation_penalty_weight"] == 0.0
     assert cfg["support_orientation_sigma_deg"] == 8.0
     assert cfg["support_orientation_tolerance_deg"] == 2.0
-    assert cfg["support_aligned_seed_enabled"] is True
+    assert cfg["support_aligned_seed_enabled"] is False
     assert cfg["support_alignment_trigger_deg"] == 6.0
     assert cfg["support_aligned_seed_score_margin"] == 0.20
     assert cfg["support_aligned_seed_source_top_k"] == 2
-    assert cfg["support_contact_snap_enabled"] is True
-    assert cfg["generic_contact_snap_rescue_enabled"] is True
+    assert cfg["support_contact_snap_enabled"] is False
+    assert cfg["generic_contact_snap_rescue_enabled"] is False
     assert cfg["generic_contact_snap_rescue_iters"] == 0
     assert cfg["generic_contact_snap_rescue_min_mask_iou"] == 0.12
     assert cfg["generic_contact_snap_rescue_min_bbox_iou"] == 0.10
@@ -1903,6 +2018,40 @@ def test_generic_motion_constraints_keep_target_depth_in_free_motion() -> None:
     assert args.support_orientation_penalty_weight == 0.0
     assert args.generic_scale_lock_applied is True
     assert task["corrected_pose"]["scale"] == [0.1, 0.1, 0.1]
+
+
+def test_generic_motion_constraints_do_not_reenable_disabled_support_in_contact_calibration() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import apply_generic_task_motion_constraints
+
+    args = argparse.Namespace(
+        generic_pose_motion_phase="auto",
+        depth_enabled=True,
+        generic_acceptance_depth_confidence_high=999.0,
+        generic_depth_weight=0.55,
+        generic_mask_weight=0.80,
+        generic_appearance_weight=0.25,
+        support_plane_enabled="disabled",
+        support_plane_weight=0.0,
+        support_penalty_weight=0.0,
+        support_orientation_penalty_weight=0.0,
+        support_aligned_seed_enabled=False,
+    )
+    task = {
+        "vehicle_pose_context": {
+            "generic_pose_motion_phase": "contact_calibration",
+        }
+    }
+
+    report = apply_generic_task_motion_constraints(args, task)
+
+    assert report["phase"] == "contact_calibration"
+    assert args.depth_enabled is True
+    assert args.generic_depth_weight >= 1.10
+    assert args.support_plane_enabled == "disabled"
+    assert args.support_plane_weight == 0.0
+    assert args.support_penalty_weight == 0.0
+    assert args.support_orientation_penalty_weight == 0.0
+    assert args.support_aligned_seed_enabled is False
 
 
 def test_depth_snapped_candidate_shifts_camera_z_by_median_depth_error() -> None:
@@ -2015,7 +2164,7 @@ def test_depth_snapped_candidate_temporarily_full_scores_coarse_candidate() -> N
     assert np.allclose(snapped["translation_cam"], [0.2, -0.1, 3.0])
 
 
-def test_select_generic_refine_candidates_preserves_visual_and_depth_buckets() -> None:
+def test_select_generic_refine_candidates_prioritizes_depth_ranked_buckets() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
 
     def candidate(score: float, depth_score: float, tx: float, source: str) -> dict[str, object]:
@@ -2044,8 +2193,61 @@ def test_select_generic_refine_candidates_preserves_visual_and_depth_buckets() -
     )
     sources = [item.get("initializer_metadata", {}).get("source") for item in selected]
 
-    assert sources[:2] == ["visual_top", "visual_second"]
+    assert sources[:2] == ["depth_good", "depth_second"]
     assert "depth_good" in sources
+
+
+def test_select_generic_refine_candidates_depth_rank_beats_mask_only_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    def candidate(
+        *,
+        score: float,
+        depth_score: float,
+        mask_score: float,
+        bbox_score: float,
+        contour_score: float,
+        tx: float,
+        source: str,
+    ) -> dict[str, object]:
+        return {
+            "score": score,
+            "depth_score": depth_score,
+            "depth_confidence": 1.0,
+            "mask_blend_score": mask_score,
+            "bbox_iou": bbox_score,
+            "contour_score": contour_score,
+            "appearance_score": 0.5,
+            "appearance_confidence": 1.0,
+            "translation_cam": np.array([tx, 0.0, 2.0], dtype=np.float64),
+            "rotation_cam": np.eye(3, dtype=np.float64),
+            "scale": np.ones(3, dtype=np.float64),
+            "initializer_metadata": {"source": source},
+        }
+
+    mask_only = candidate(
+        score=10.0,
+        depth_score=0.05,
+        mask_score=0.98,
+        bbox_score=0.95,
+        contour_score=0.95,
+        tx=0.0,
+        source="mask_only",
+    )
+    depth_correct = candidate(
+        score=8.0,
+        depth_score=0.95,
+        mask_score=0.80,
+        bbox_score=0.82,
+        contour_score=0.70,
+        tx=1.0,
+        source="depth_correct",
+    )
+
+    selected = select_generic_refine_candidates([mask_only, depth_correct], refine_top_k=1)
+
+    assert selected[0]["initializer_metadata"]["source"] == "depth_correct"
+    assert selected[0]["candidate_rank_score"] > mask_only["candidate_rank_score"]
 
 
 def test_merge_depth_snapped_initial_candidates_preserves_low_visual_depth_seed() -> None:

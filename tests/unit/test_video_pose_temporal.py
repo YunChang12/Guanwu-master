@@ -422,6 +422,32 @@ def test_generic_static_pose_reuse_decision_reuses_stable_bbox_and_mask() -> Non
     assert decision["generic_pose_motion_phase"] == "static_supported"
 
 
+def test_generic_static_pose_reuse_decision_allows_reuse_without_explicit_scale_prior() -> None:
+    previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
+    previous["metrics"].update(
+        {
+            "generic_pose_motion_phase": "contact_calibration",
+            "detection_bbox": [430.0, 180.0, 583.0, 361.0],
+            "mask_area_px": 25000,
+        }
+    )
+
+    decision = ProjectExecutor._generic_static_pose_reuse_decision(
+        frame_id=43,
+        generic_phase="contact_calibration",
+        previous_accepted=previous,
+        inst={"bbox": [430.2, 180.1, 583.1, 361.0]},
+        current_mask_area_px=25020,
+        track_scale_prior=None,
+        last_optimizer_frame_id=42,
+        revalidation_interval=10,
+    )
+
+    assert decision["reuse"] is True
+    assert decision["reuse_reason"] == "bbox_and_mask_stable"
+    assert decision["scale_locked"] is True
+
+
 def test_generic_static_pose_reuse_decision_forces_periodic_revalidation() -> None:
     previous = _pose_record(frame_id=42, scale=1.0, mask_iou=0.88, bbox_iou=0.90)
     previous["metrics"].update(

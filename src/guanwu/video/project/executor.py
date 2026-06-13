@@ -5775,8 +5775,11 @@ class ProjectExecutor:
         )
         if isinstance(track_scale_prior, dict) and self._valid_vec3_like(track_scale_prior.get("scale")):
             metrics["generic_track_scale_prior_scale"] = track_scale_prior.get("scale")
+            metrics["generic_track_scale_prior_source"] = "explicit_track_scale_prior"
             pose_scale = [float(v) for v in track_scale_prior.get("scale")]
         else:
+            metrics["generic_track_scale_prior_scale"] = [float(v) for v in pose.get("scale")]
+            metrics["generic_track_scale_prior_source"] = "previous_accepted_pose_scale"
             pose_scale = [float(v) for v in pose.get("scale")]
         report_path = result_dir / "pose_reuse_record.json"
         task_path = task_dir / "task.json"
@@ -6722,8 +6725,6 @@ class ProjectExecutor:
     ) -> dict:
         if ProjectExecutor._generic_pose_motion_phase_from_metrics({"generic_pose_motion_phase": generic_phase}) != "contact_calibration":
             return {"reuse": False, "reason": "not_contact_phase"}
-        if not track_scale_prior:
-            return {"reuse": False, "reason": "missing_scale_prior"}
         if not isinstance(previous_accepted, dict) or previous_accepted.get("status") not in {None, "accepted"}:
             return {"reuse": False, "reason": "missing_previous_accepted"}
         if last_optimizer_frame_id is not None:
@@ -6767,12 +6768,16 @@ class ProjectExecutor:
                 "mask_area_delta_ratio": float(mask_delta_ratio),
                 **bbox_stats,
             }
+        scale_prior_source = "explicit_track_scale_prior"
+        if not (isinstance(track_scale_prior, dict) and ProjectExecutor._valid_vec3_like(track_scale_prior.get("scale"))):
+            scale_prior_source = "previous_accepted_pose_scale"
         return {
             "reuse": True,
             "reuse_reason": "bbox_and_mask_stable",
             "generic_pose_motion_phase": "static_supported",
             "reused_from_frame_id": int(previous_accepted.get("frame_id") or 0),
             "scale_locked": True,
+            "scale_prior_source": scale_prior_source,
             "mask_area_delta_ratio": None if mask_delta_ratio is None else float(mask_delta_ratio),
             **bbox_stats,
         }

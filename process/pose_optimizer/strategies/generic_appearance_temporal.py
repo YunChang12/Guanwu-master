@@ -54,6 +54,7 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "depth_error",
     "depth_weight_effective",
     "candidate_rank_score",
+    "semantic_up_candidate_reject_reason",
     "rejected_by_depth_gate",
     "valid_depth_ratio",
     "appearance_score",
@@ -89,6 +90,14 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "support_orientation_score",
     "support_orientation_penalty",
     "support_orientation_penalty_eff",
+    "semantic_up_confidence",
+    "semantic_up_score",
+    "semantic_up_penalty",
+    "semantic_up_penalty_eff",
+    "semantic_up_alignment",
+    "semantic_up_angle_deg",
+    "semantic_up_axis_index",
+    "semantic_up_axis_sign",
     "support_aligned_candidate_used",
     "support_normal_angle_deg_before_alignment",
     "support_normal_angle_deg_after_alignment",
@@ -463,6 +472,123 @@ def _locked_mesh_up_axis(mesh_axis_prior: dict[str, Any] | None) -> tuple[int, f
     except Exception:
         up_sign = 1.0
     return axis_idx, up_sign
+
+
+def semantic_up_orientation_score(
+    rotation_cam: np.ndarray,
+    mesh_axis_prior: dict[str, Any] | None,
+    *,
+    world_up_axis: str = "-y",
+    t_world_from_cam: np.ndarray | None = None,
+    sigma_deg: float = 25.0,
+    tolerance_deg: float = 10.0,
+) -> dict[str, Any]:
+    locked_up_axis = _locked_mesh_up_axis(mesh_axis_prior)
+    if locked_up_axis is None:
+        return {
+            "semantic_up_confidence": 0.0,
+            "semantic_up_axis_index": None,
+            "semantic_up_axis_sign": None,
+            "semantic_up_alignment": 0.0,
+            "semantic_up_angle_deg": None,
+            "semantic_up_score": 0.0,
+            "semantic_up_penalty": 0.0,
+        }
+    axis_index, axis_sign = locked_up_axis
+    rotation = np.asarray(rotation_cam, dtype=np.float64).reshape(3, 3)
+    semantic_up_cam = _normalize(rotation[:, axis_index] * axis_sign)
+    try:
+        if t_world_from_cam is not None:
+            target_up_cam = fast.camera_up_vector(np.asarray(t_world_from_cam, dtype=np.float64).reshape(4, 4), world_up_axis)
+        else:
+            target_up_cam = fast.world_up_vector_from_arg(world_up_axis)
+    except Exception:
+        target_up_cam = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    target_up_cam = _normalize(target_up_cam)
+    if float(np.linalg.norm(semantic_up_cam)) <= 1e-12 or float(np.linalg.norm(target_up_cam)) <= 1e-12:
+        return {
+            "semantic_up_confidence": 0.0,
+            "semantic_up_axis_index": axis_index,
+            "semantic_up_axis_sign": axis_sign,
+            "semantic_up_alignment": 0.0,
+            "semantic_up_angle_deg": None,
+            "semantic_up_score": 0.0,
+            "semantic_up_penalty": 0.0,
+        }
+    alignment = float(np.clip(np.dot(semantic_up_cam, target_up_cam), -1.0, 1.0))
+    angle_deg = float(math.degrees(math.acos(alignment)))
+    excess = max(0.0, angle_deg - float(tolerance_deg))
+    sigma = max(1e-6, float(sigma_deg))
+    score = float(math.exp(-((excess / sigma) ** 2)))
+    return {
+        "semantic_up_confidence": 1.0,
+        "semantic_up_axis_index": axis_index,
+        "semantic_up_axis_sign": axis_sign,
+        "semantic_up_alignment": alignment,
+        "semantic_up_angle_deg": angle_deg,
+        "semantic_up_score": score,
+        "semantic_up_penalty": float(1.0 - score),
+    }
+
+
+def semantic_up_orientation_reject_reason(result: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if not bool(getattr(args, "semantic_up_hard_gate_enabled", True)):
+        return None
+    if float(result.get("semantic_up_confidence") or 0.0) <= 0.0:
+        return None
+    angle_value = result.get("semantic_up_angle_deg")
+    if angle_value is None:
+        return None
+    try:
+        angle_deg = float(angle_value)
+    except Exception:
+        return None
+    if not math.isfinite(angle_deg):
+        return None
+    max_angle = float(getattr(args, "semantic_up_hard_gate_max_angle_deg", 135.0))
+    if angle_deg > max_angle:
+        return "semantic_up_angle_above_threshold"
+    return None
+
+
+def annotate_candidate_semantic_up_for_ranking(
+    candidate: dict[str, Any],
+    mesh_axis_prior: dict[str, Any] | None,
+    args: argparse.Namespace,
+    *,
+    t_world_from_cam: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Attach cheap semantic-up fields so coarse candidates can be ranked safely."""
+
+    enabled_value = str(getattr(args, "semantic_up_constraint_enabled", "auto")).strip().lower()
+    enabled = enabled_value not in {"0", "false", "off", "disabled", "none"}
+    rotation = candidate.get("rotation_cam")
+    if not enabled or rotation is None or _locked_mesh_up_axis(mesh_axis_prior) is None:
+        candidate.setdefault("semantic_up_candidate_reject_reason", None)
+        candidate_rank_score(candidate)
+        return candidate
+    try:
+        semantic_up = semantic_up_orientation_score(
+            np.asarray(rotation, dtype=np.float64),
+            mesh_axis_prior,
+            world_up_axis=str(getattr(args, "world_up_axis", "-y")),
+            t_world_from_cam=t_world_from_cam,
+            sigma_deg=float(getattr(args, "semantic_up_sigma_deg", 25.0)),
+            tolerance_deg=float(getattr(args, "semantic_up_tolerance_deg", 10.0)),
+        )
+    except Exception:
+        candidate.setdefault("semantic_up_candidate_reject_reason", None)
+        candidate_rank_score(candidate)
+        return candidate
+    candidate.update(semantic_up)
+    candidate["semantic_up_candidate_reject_reason"] = semantic_up_orientation_reject_reason(candidate, args)
+    candidate_rank_score(candidate)
+    return candidate
+
+
+def _semantic_up_candidate_valid_for_ranking(result: dict[str, Any]) -> bool:
+    reason = result.get("semantic_up_candidate_reject_reason")
+    return reason is None or str(reason) == ""
 
 
 def locked_up_axis_orientation_reject_reason(
@@ -1804,6 +1930,9 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
         )
         if locked_up_reject_reason is not None:
             reject_reasons.append(locked_up_reject_reason)
+        semantic_up_reject_reason = semantic_up_orientation_reject_reason(result, self.generic_args)
+        if semantic_up_reject_reason is not None:
+            reject_reasons.append(semantic_up_reject_reason)
         return {
             "acceptance_status": "accepted" if not reject_reasons else "rejected",
             "reject_reasons": reject_reasons,
@@ -1838,6 +1967,10 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                     "observation_score": 0.0,
                     "invalid_projection_penalty": 1.0,
                     "projection_valid_ratio": 0.0,
+                    "semantic_up_confidence": 0.0,
+                    "semantic_up_score": 0.0,
+                    "semantic_up_penalty": 0.0,
+                    "semantic_up_penalty_eff": 0.0,
                 }
             )
             result["score"] = -1.0
@@ -2031,6 +2164,31 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 "optional_prior_score": optional_prior_score,
             }
         )
+        semantic_up_enabled_value = str(getattr(self.generic_args, "semantic_up_constraint_enabled", "auto")).strip().lower()
+        semantic_up_enabled = semantic_up_enabled_value not in {"0", "false", "off", "disabled", "none"}
+        semantic_up = (
+            semantic_up_orientation_score(
+                np.asarray(result["rotation_cam"], dtype=np.float64),
+                self.mesh_axis_prior,
+                world_up_axis=str(getattr(self.generic_args, "world_up_axis", "-y")),
+                t_world_from_cam=self.t_world_from_cam,
+                sigma_deg=float(getattr(self.generic_args, "semantic_up_sigma_deg", 25.0)),
+                tolerance_deg=float(getattr(self.generic_args, "semantic_up_tolerance_deg", 10.0)),
+            )
+            if semantic_up_enabled and not coarse_scoring
+            else {
+                "semantic_up_confidence": 0.0,
+                "semantic_up_axis_index": None,
+                "semantic_up_axis_sign": None,
+                "semantic_up_alignment": 0.0,
+                "semantic_up_angle_deg": None,
+                "semantic_up_score": 0.0,
+                "semantic_up_penalty": 0.0,
+            }
+        )
+        result.update(semantic_up)
+        result["upright_confidence"] = float(semantic_up.get("semantic_up_confidence") or 0.0)
+        result["upright_score"] = float(semantic_up.get("semantic_up_score") or 0.0)
 
         observation_score = (
             float(getattr(self.generic_args, "generic_mask_weight", 1.0)) * mask_blend_score
@@ -2081,6 +2239,11 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             * float(getattr(self.generic_args, "support_orientation_penalty_weight", 0.0))
             * float(support.get("support_orientation_penalty") or 0.0)
         )
+        semantic_up_penalty_eff = (
+            float(semantic_up.get("semantic_up_confidence") or 0.0)
+            * float(getattr(self.generic_args, "semantic_up_penalty_weight", 0.0))
+            * float(semantic_up.get("semantic_up_penalty") or 0.0)
+        )
 
         if coarse_scoring:
             proj_ratio = 1.0 if result.get("projected_bbox") is not None else 0.0
@@ -2100,6 +2263,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
             - temporal_jump_penalty
             - support_contact_penalty_eff
             - support_orientation_penalty_eff
+            - semantic_up_penalty_eff
         )
         result.update(
             {
@@ -2111,6 +2275,7 @@ class GenericPoseEvaluator(fast.CameraPoseEvaluator):
                 "temporal_jump_penalty": temporal_jump_penalty,
                 "support_contact_penalty_eff": float(support_contact_penalty_eff),
                 "support_orientation_penalty_eff": float(support_orientation_penalty_eff),
+                "semantic_up_penalty_eff": float(semantic_up_penalty_eff),
                 "projection_valid_ratio": proj_ratio,
                 "visible_ratio": _visible_ratio(rendered_mask, visible_region),
                 "truncation_ratio": 1.0 - _visible_ratio(rendered_mask, visible_region),
@@ -2534,15 +2699,18 @@ def select_contact_snap_rescue_result(
     return original
 
 
-def _depth_candidate_key(result: dict[str, Any]) -> tuple[float, float, float]:
+def _depth_candidate_key(result: dict[str, Any]) -> tuple[float, float, float, float]:
     depth_score = float(result.get("depth_score") or 0.0) * float(result.get("depth_confidence") or 0.0)
     valid_ratio = float(result.get("valid_depth_ratio") or 0.0)
     visual_score = float(result.get("score") or -1e9)
-    return depth_score, valid_ratio, visual_score
+    semantic_up_rank = 1.0 if _semantic_up_candidate_valid_for_ranking(result) else 0.0
+    return semantic_up_rank, depth_score, valid_ratio, visual_score
 
 
-def _candidate_rank_key(result: dict[str, Any]) -> tuple[float, float, float]:
+def _candidate_rank_key(result: dict[str, Any]) -> tuple[float, float, float, float]:
+    semantic_up_rank = 1.0 if _semantic_up_candidate_valid_for_ranking(result) else 0.0
     return (
+        semantic_up_rank,
         candidate_rank_score(result),
         float(result.get("depth_score") or 0.0) * float(result.get("depth_confidence") or 0.0),
         float(result.get("score") or -1e9),
@@ -2962,6 +3130,12 @@ def augment_generic_rotation_candidates(
                 continue
             seen.add(sig)
             result["initializer_metadata"] = dict(spec["initializer_metadata"])
+            annotate_candidate_semantic_up_for_ranking(
+                result,
+                getattr(evaluator, "mesh_axis_prior", None),
+                args,
+                t_world_from_cam=getattr(evaluator, "t_world_from_cam", None),
+            )
             augmented.append(result)
     else:
         for spec in batch_specs:
@@ -2977,6 +3151,12 @@ def augment_generic_rotation_candidates(
                 continue
             seen.add(sig)
             result["initializer_metadata"] = dict(spec["initializer_metadata"])
+            annotate_candidate_semantic_up_for_ranking(
+                result,
+                getattr(evaluator, "mesh_axis_prior", None),
+                args,
+                t_world_from_cam=getattr(evaluator, "t_world_from_cam", None),
+            )
             augmented.append(result)
     return sorted(augmented, key=_candidate_rank_key, reverse=True)[: max(len(candidates), int(args.top_k_candidates))]
 
@@ -3026,7 +3206,12 @@ def generate_generic_grid_candidates(
         if signature in seen:
             return
         seen.add(signature)
-        candidate_rank_score(candidate)
+        annotate_candidate_semantic_up_for_ranking(
+            candidate,
+            getattr(evaluator, "mesh_axis_prior", None),
+            args,
+            t_world_from_cam=getattr(evaluator, "t_world_from_cam", None),
+        )
         results.append(candidate)
 
     if corrected_seed is not None:
@@ -3165,9 +3350,10 @@ def select_generic_refine_candidates(
         selected: list[dict[str, Any]] = []
         selected_signatures: set[tuple[float, ...]] = set(required_signatures)
 
-        def add_items(items: list[dict[str, Any]], quota: int | None = None) -> None:
+        def add_items(items: list[dict[str, Any]], quota: int | None = None, *, sort_key: Any | None = None) -> None:
             added = 0
-            for item in items:
+            ordered_items = sorted(items, key=sort_key or _candidate_rank_key, reverse=True)
+            for item in ordered_items:
                 if len(selected) + len(required) >= limit:
                     break
                 signature = fast.pose_signature(item)
@@ -3188,7 +3374,7 @@ def select_generic_refine_candidates(
             if float(item.get("depth_confidence") or 0.0) > 0.0
             and float(item.get("depth_score") or 0.0) > 0.0
         ]
-        add_items(sorted(depth_candidates, key=_depth_candidate_key, reverse=True), depth_quota)
+        add_items(depth_candidates, depth_quota, sort_key=_depth_candidate_key)
         add_items(unique, None)
         if prefer_temporal_first:
             required = sorted(required, key=_temporal_refine_priority)
@@ -3217,6 +3403,86 @@ def _temporal_refine_priority(item: dict[str, Any]) -> tuple[int, float]:
     base_source = str(meta.get("base_source", ""))
     temporal_rank = 0 if base_source == "temporal_prior" else 1 if source == "temporal_prior" else 2
     return temporal_rank, -float(item.get("score", -1e9))
+
+
+def generic_visual_rescue_score(result: dict[str, Any], args: argparse.Namespace) -> float:
+    mask_score = float(result.get("visible_mask_iou") or result.get("soft_mask_iou") or result.get("mask_iou") or 0.0)
+    bbox_score = float(result.get("bbox_iou") or 0.0)
+    contour_score = float(result.get("contour_score") or 0.0)
+    edge_score = float(result.get("edge_score") or 0.0)
+    return float(
+        float(getattr(args, "generic_mask_weight", 1.0)) * mask_score
+        + float(getattr(args, "generic_bbox_weight", 0.15)) * bbox_score
+        + float(getattr(args, "generic_contour_weight", 0.35)) * contour_score
+        + float(getattr(args, "generic_edge_weight", 0.20)) * edge_score
+    )
+
+
+def _visual_rescue_allowed(result: dict[str, Any]) -> bool:
+    if result.get("acceptance_status") != "accepted":
+        return False
+    reasons = result.get("reject_reasons") or []
+    if not isinstance(reasons, list):
+        return False
+    return len(reasons) == 0
+
+
+def select_visual_rescue_best_candidate(
+    refined_results: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+    current_best: tuple[dict[str, Any], list[dict[str, Any]]],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not bool(getattr(args, "generic_visual_rescue_enabled", True)):
+        return current_best
+    best_result, best_history = current_best
+    current_edge = float(best_result.get("edge_score") or 0.0)
+    current_contour = float(best_result.get("contour_score") or 0.0)
+    current_mask = float(best_result.get("visible_mask_iou") or best_result.get("mask_iou") or 0.0)
+    current_bbox = float(best_result.get("visible_bbox_iou") or best_result.get("bbox_iou") or 0.0)
+    current_is_visually_weak = (
+        current_edge < float(getattr(args, "generic_visual_rescue_current_edge_max", 0.18))
+        or current_contour < float(getattr(args, "generic_visual_rescue_current_contour_max", 0.25))
+        or current_mask < float(getattr(args, "generic_visual_rescue_current_mask_max", 0.0))
+        or current_bbox < float(getattr(args, "generic_visual_rescue_current_bbox_max", 0.0))
+    )
+    if not current_is_visually_weak:
+        return current_best
+
+    current_visual = generic_visual_rescue_score(best_result, args)
+    min_depth_score = float(getattr(args, "generic_visual_rescue_min_depth_score", 0.90))
+    min_margin = float(getattr(args, "generic_visual_rescue_min_visual_margin", 0.20))
+    rescue: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+    rescue_margin = 0.0
+    rescue_visual = current_visual
+    for candidate, history in refined_results:
+        if candidate is best_result:
+            continue
+        if not _visual_rescue_allowed(candidate):
+            continue
+        if float(candidate.get("depth_score") or 0.0) < min_depth_score:
+            continue
+        candidate_visual = generic_visual_rescue_score(candidate, args)
+        margin = candidate_visual - current_visual
+        if margin < min_margin:
+            continue
+        if rescue is None or candidate_visual > rescue_visual:
+            rescue = (candidate, history)
+            rescue_margin = margin
+            rescue_visual = candidate_visual
+
+    if rescue is None:
+        return current_best
+    rescued_result, rescued_history = rescue
+    rescued_result["visual_rescue_original_acceptance_status"] = rescued_result.get("acceptance_status")
+    rescued_result["visual_rescue_original_reject_reasons"] = list(rescued_result.get("reject_reasons") or [])
+    rescued_result["acceptance_status"] = "accepted"
+    rescued_result["reject_reasons"] = []
+    rescued_result["visual_rescue_candidate_used"] = True
+    rescued_result["visual_rescue_source_rank"] = rescued_result.get("candidate_rank")
+    rescued_result["visual_rescue_visual_score"] = float(rescue_visual)
+    rescued_result["visual_rescue_previous_visual_score"] = float(current_visual)
+    rescued_result["visual_rescue_visual_margin"] = float(rescue_margin)
+    return rescued_result, rescued_history
 
 
 def candidate_summary(result: dict[str, Any], *, t_world_from_cam: np.ndarray) -> dict[str, Any]:
@@ -3657,6 +3923,11 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         best_result, best_history = max(accepted, key=lambda item: float(item[0].get("score", -1e9)))
     if best_result is None:
         raise RuntimeError("No valid pose candidate survived refinement.")
+    best_result, best_history = select_visual_rescue_best_candidate(
+        refined_results,
+        (best_result, best_history),
+        args,
+    )
 
     best_uniform_scale = fast.scale_to_uniform_scalar(np.asarray(best_result["scale"], dtype=np.float64))
     best_result["scale"] = fast.make_uniform_scale(best_uniform_scale)
@@ -3859,6 +4130,14 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "support_orientation_score": best_result.get("support_orientation_score"),
             "support_orientation_penalty": best_result.get("support_orientation_penalty"),
             "support_orientation_penalty_eff": best_result.get("support_orientation_penalty_eff"),
+            "semantic_up_constraint_enabled": str(getattr(args, "semantic_up_constraint_enabled", "auto")),
+            "semantic_up_axis_index": best_result.get("semantic_up_axis_index"),
+            "semantic_up_axis_sign": best_result.get("semantic_up_axis_sign"),
+            "semantic_up_alignment": best_result.get("semantic_up_alignment"),
+            "semantic_up_angle_deg": best_result.get("semantic_up_angle_deg"),
+            "semantic_up_score": best_result.get("semantic_up_score"),
+            "semantic_up_penalty": best_result.get("semantic_up_penalty"),
+            "semantic_up_penalty_eff": best_result.get("semantic_up_penalty_eff"),
         },
         "edge_assist": {
             "enabled": bool(args.edge_score_enabled),
@@ -4043,6 +4322,19 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generic_upright_enabled", default="auto")
     parser.add_argument("--generic_upright_min_confidence", type=float, default=0.70)
     parser.add_argument("--generic_upright_weight", type=float, default=0.15)
+    parser.add_argument("--semantic_up_constraint_enabled", default="auto")
+    parser.add_argument("--semantic_up_penalty_weight", type=float, default=0.0)
+    parser.add_argument("--semantic_up_sigma_deg", type=float, default=25.0)
+    parser.add_argument("--semantic_up_tolerance_deg", type=float, default=10.0)
+    parser.add_argument("--semantic_up_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--semantic_up_hard_gate_max_angle_deg", type=float, default=135.0)
+    parser.add_argument("--generic_visual_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--generic_visual_rescue_min_depth_score", type=float, default=0.90)
+    parser.add_argument("--generic_visual_rescue_current_edge_max", type=float, default=0.18)
+    parser.add_argument("--generic_visual_rescue_current_contour_max", type=float, default=0.25)
+    parser.add_argument("--generic_visual_rescue_current_mask_max", type=float, default=0.86)
+    parser.add_argument("--generic_visual_rescue_current_bbox_max", type=float, default=0.84)
+    parser.add_argument("--generic_visual_rescue_min_visual_margin", type=float, default=0.20)
     parser.add_argument("--generic_heading_enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--generic_heading_weight", type=float, default=0.0)
 

@@ -597,6 +597,56 @@ def test_support_bottom_points_respect_locked_mesh_up_axis() -> None:
     assert orientation["support_normal_angle_deg"] == pytest.approx(90.0)
 
 
+def test_semantic_up_orientation_score_uses_locked_axis_without_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import semantic_up_orientation_score
+
+    mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    aligned_rotation = np.diag([1.0, -1.0, 1.0]).astype(np.float64)
+    flipped_rotation = np.eye(3, dtype=np.float64)
+
+    aligned = semantic_up_orientation_score(
+        aligned_rotation,
+        mesh_axis_prior,
+        world_up_axis="-y",
+        sigma_deg=25.0,
+        tolerance_deg=10.0,
+    )
+    flipped = semantic_up_orientation_score(
+        flipped_rotation,
+        mesh_axis_prior,
+        world_up_axis="-y",
+        sigma_deg=25.0,
+        tolerance_deg=10.0,
+    )
+
+    assert aligned["semantic_up_confidence"] == 1.0
+    assert aligned["semantic_up_axis_index"] == 1
+    assert aligned["semantic_up_axis_sign"] == 1.0
+    assert aligned["semantic_up_angle_deg"] == pytest.approx(0.0)
+    assert aligned["semantic_up_score"] == pytest.approx(1.0)
+    assert aligned["semantic_up_penalty"] == pytest.approx(0.0)
+    assert flipped["semantic_up_angle_deg"] == pytest.approx(180.0)
+    assert flipped["semantic_up_score"] < 1e-10
+    assert flipped["semantic_up_penalty"] == pytest.approx(1.0)
+
+
+def test_generic_parser_defaults_keep_semantic_up_as_gate_not_score_penalty() -> None:
+    from process.pose_optimizer.strategies import generic_appearance_temporal as generic
+
+    parser = argparse.ArgumentParser()
+    generic.add_generic_arguments(parser)
+    args, _unknown = parser.parse_known_args([])
+
+    assert args.semantic_up_penalty_weight == pytest.approx(0.0)
+    assert args.generic_visual_rescue_current_mask_max == pytest.approx(0.86)
+    assert args.generic_visual_rescue_current_bbox_max == pytest.approx(0.84)
+
+
 def test_locked_mesh_up_axis_rejects_sideways_contact_orientation() -> None:
     from process.pose_optimizer.strategies.generic_appearance_temporal import (
         locked_up_axis_orientation_reject_reason,
@@ -704,6 +754,332 @@ def test_generic_pose_acceptance_rejects_locked_up_axis_sideways_contact() -> No
 
     assert acceptance["acceptance_status"] == "rejected"
     assert "locked_up_axis_support_angle_above_threshold" in acceptance["reject_reasons"]
+
+
+def test_generic_pose_acceptance_rejects_semantic_up_flip_without_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = GenericPoseEvaluator.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 100.0
+    evaluator.truncation_info = {"is_truncated": False}
+    evaluator.mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="free_motion",
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_min_threshold=0.0,
+        generic_contact_depth_min_score=0.70,
+        generic_acceptance_depth_confidence_high=999.0,
+        generic_contact_support_max_separation_m=0.05,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        support_locked_up_max_angle_deg=50.0,
+        semantic_up_hard_gate_enabled=True,
+        semantic_up_hard_gate_max_angle_deg=135.0,
+    )
+
+    acceptance = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.90,
+            "bbox_center_error_px": 4.0,
+            "projection_valid_ratio": 0.95,
+            "depth_confidence": 0.0,
+            "depth_score": 1.0,
+            "support_plane_enabled": False,
+            "support_plane_confidence": 0.0,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.0,
+            "semantic_up_confidence": 1.0,
+            "semantic_up_angle_deg": 180.0,
+        }
+    )
+
+    assert acceptance["acceptance_status"] == "rejected"
+    assert "semantic_up_angle_above_threshold" in acceptance["reject_reasons"]
+
+
+def test_generic_pose_acceptance_rejects_large_semantic_up_deviation_without_support_plane() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import GenericPoseEvaluator
+
+    evaluator = GenericPoseEvaluator.__new__(GenericPoseEvaluator)
+    evaluator.target_bbox_diagonal = 100.0
+    evaluator.truncation_info = {"is_truncated": False}
+    evaluator.mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    evaluator.generic_args = argparse.Namespace(
+        generic_pose_motion_phase="free_motion",
+        generic_acceptance_min_visible_mask_iou=0.12,
+        generic_acceptance_min_bbox_iou=0.10,
+        generic_acceptance_max_center_error_ratio=0.35,
+        generic_acceptance_min_projection_valid_ratio=0.50,
+        generic_acceptance_truncated_min_projection_valid_ratio=0.30,
+        generic_acceptance_projection_temporal_exempt_enabled=True,
+        generic_acceptance_projection_exempt_min_mask_iou=0.90,
+        generic_acceptance_projection_exempt_min_bbox_iou=0.60,
+        generic_acceptance_projection_exempt_min_temporal_score=0.50,
+        generic_acceptance_depth_min_threshold=0.0,
+        generic_contact_depth_min_score=0.70,
+        generic_acceptance_depth_confidence_high=999.0,
+        generic_contact_support_max_separation_m=0.05,
+        support_acceptance_min_confidence=0.70,
+        support_acceptance_max_separation_m=0.15,
+        support_locked_up_max_angle_deg=50.0,
+        semantic_up_hard_gate_enabled=True,
+        semantic_up_hard_gate_max_angle_deg=90.0,
+    )
+
+    acceptance = evaluator._acceptance(
+        {
+            "visible_mask_iou": 0.88,
+            "mask_iou": 0.88,
+            "bbox_iou": 0.90,
+            "bbox_center_error_px": 4.0,
+            "projection_valid_ratio": 0.95,
+            "depth_confidence": 1.0,
+            "depth_score": 0.96,
+            "support_plane_enabled": False,
+            "support_plane_confidence": 0.0,
+            "support_floating_distance_m": 0.0,
+            "support_penetration_distance_m": 0.0,
+            "semantic_up_confidence": 1.0,
+            "semantic_up_angle_deg": 146.0,
+        }
+    )
+
+    assert acceptance["acceptance_status"] == "rejected"
+    assert "semantic_up_angle_above_threshold" in acceptance["reject_reasons"]
+
+
+def test_visual_rescue_keeps_current_when_challenger_violates_semantic_up_gate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_visual_rescue_best_candidate
+
+    current = {
+        "score": 2.10,
+        "mask_iou": 0.733,
+        "bbox_iou": 0.712,
+        "edge_score": 0.152,
+        "contour_score": 0.203,
+        "depth_score": 0.980,
+        "acceptance_status": "accepted",
+        "reject_reasons": [],
+    }
+    visually_better = {
+        "score": 1.80,
+        "mask_iou": 0.883,
+        "bbox_iou": 0.879,
+        "edge_score": 0.345,
+        "contour_score": 0.585,
+        "depth_score": 0.958,
+        "acceptance_status": "rejected",
+        "reject_reasons": ["semantic_up_angle_above_threshold"],
+        "candidate_rank": 2,
+    }
+    args = argparse.Namespace(
+        generic_visual_rescue_enabled=True,
+        generic_visual_rescue_min_depth_score=0.90,
+        generic_visual_rescue_current_edge_max=0.18,
+        generic_visual_rescue_current_contour_max=0.25,
+        generic_visual_rescue_min_visual_margin=0.20,
+        generic_mask_weight=0.90,
+        generic_bbox_weight=0.20,
+        generic_contour_weight=0.45,
+        generic_edge_weight=0.30,
+    )
+
+    selected, _history = select_visual_rescue_best_candidate(
+        [(current, [{"step": "current"}]), (visually_better, [{"step": "visual"}])],
+        (current, [{"step": "current"}]),
+        args,
+    )
+
+    assert selected is current
+    assert "visual_rescue_candidate_used" not in visually_better
+
+
+def test_visual_rescue_keeps_current_when_challenger_depth_is_poor() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_visual_rescue_best_candidate
+
+    current = {
+        "score": 2.10,
+        "mask_iou": 0.733,
+        "bbox_iou": 0.712,
+        "edge_score": 0.152,
+        "contour_score": 0.203,
+        "depth_score": 0.980,
+        "acceptance_status": "accepted",
+        "reject_reasons": [],
+    }
+    poor_depth = {
+        "score": 1.80,
+        "mask_iou": 0.883,
+        "bbox_iou": 0.879,
+        "edge_score": 0.345,
+        "contour_score": 0.585,
+        "depth_score": 0.50,
+        "acceptance_status": "rejected",
+        "reject_reasons": ["semantic_up_angle_above_threshold"],
+    }
+    args = argparse.Namespace(
+        generic_visual_rescue_enabled=True,
+        generic_visual_rescue_min_depth_score=0.90,
+        generic_visual_rescue_current_edge_max=0.18,
+        generic_visual_rescue_current_contour_max=0.25,
+        generic_visual_rescue_min_visual_margin=0.20,
+        generic_mask_weight=0.90,
+        generic_bbox_weight=0.20,
+        generic_contour_weight=0.45,
+        generic_edge_weight=0.30,
+    )
+
+    selected, _history = select_visual_rescue_best_candidate(
+        [(current, []), (poor_depth, [])],
+        (current, []),
+        args,
+    )
+
+    assert selected is current
+
+
+def test_visual_rescue_can_replace_mask_bbox_weak_current_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_visual_rescue_best_candidate
+
+    current = {
+        "score": 2.10,
+        "mask_iou": 0.80,
+        "bbox_iou": 0.78,
+        "edge_score": 0.42,
+        "contour_score": 0.40,
+        "depth_score": 0.97,
+        "acceptance_status": "accepted",
+        "reject_reasons": [],
+    }
+    visually_better = {
+        "score": 1.95,
+        "mask_iou": 0.87,
+        "bbox_iou": 0.88,
+        "edge_score": 0.37,
+        "contour_score": 0.52,
+        "depth_score": 0.96,
+        "semantic_up_candidate_reject_reason": None,
+        "acceptance_status": "accepted",
+        "reject_reasons": [],
+        "candidate_rank": 2,
+    }
+    args = argparse.Namespace(
+        generic_visual_rescue_enabled=True,
+        generic_visual_rescue_min_depth_score=0.90,
+        generic_visual_rescue_current_edge_max=0.18,
+        generic_visual_rescue_current_contour_max=0.25,
+        generic_visual_rescue_current_mask_max=0.86,
+        generic_visual_rescue_current_bbox_max=0.84,
+        generic_visual_rescue_min_visual_margin=0.05,
+        generic_mask_weight=0.90,
+        generic_bbox_weight=0.20,
+        generic_contour_weight=0.45,
+        generic_edge_weight=0.30,
+    )
+
+    selected, _history = select_visual_rescue_best_candidate(
+        [(current, [{"step": "current"}]), (visually_better, [{"step": "visual"}])],
+        (current, [{"step": "current"}]),
+        args,
+    )
+
+    assert selected is visually_better
+    assert visually_better["visual_rescue_candidate_used"] is True
+
+
+def test_candidate_semantic_up_annotation_marks_flipped_candidate_for_ranking() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import annotate_candidate_semantic_up_for_ranking
+
+    args = argparse.Namespace(
+        semantic_up_constraint_enabled="auto",
+        semantic_up_sigma_deg=25.0,
+        semantic_up_tolerance_deg=10.0,
+        semantic_up_hard_gate_enabled=True,
+        semantic_up_hard_gate_max_angle_deg=90.0,
+        world_up_axis="-y",
+    )
+    mesh_axis_prior = {
+        "available": True,
+        "up_axis_idx": 1,
+        "up_sign": 1.0,
+        "lock_up_sign": True,
+    }
+    aligned = {"rotation_cam": np.diag([1.0, -1.0, 1.0]).astype(np.float64)}
+    flipped = {"rotation_cam": np.eye(3, dtype=np.float64)}
+
+    annotate_candidate_semantic_up_for_ranking(aligned, mesh_axis_prior, args)
+    annotate_candidate_semantic_up_for_ranking(flipped, mesh_axis_prior, args)
+
+    assert aligned["semantic_up_angle_deg"] == pytest.approx(0.0)
+    assert aligned["semantic_up_candidate_reject_reason"] is None
+    assert flipped["semantic_up_angle_deg"] == pytest.approx(180.0)
+    assert flipped["semantic_up_candidate_reject_reason"] == "semantic_up_angle_above_threshold"
+
+
+def test_select_generic_refine_candidates_prefers_semantic_up_valid_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    visually_strong_flipped = {
+        "score": 10.0,
+        "depth_score": 0.90,
+        "depth_confidence": 1.0,
+        "mask_blend_score": 0.95,
+        "bbox_iou": 0.95,
+        "contour_score": 0.90,
+        "appearance_score": 0.90,
+        "appearance_confidence": 1.0,
+        "semantic_up_confidence": 1.0,
+        "semantic_up_angle_deg": 180.0,
+        "semantic_up_candidate_reject_reason": "semantic_up_angle_above_threshold",
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "generic_grid"},
+    }
+    visually_weaker_valid = {
+        "score": 8.0,
+        "depth_score": 0.85,
+        "depth_confidence": 1.0,
+        "mask_blend_score": 0.70,
+        "bbox_iou": 0.72,
+        "contour_score": 0.65,
+        "appearance_score": 0.70,
+        "appearance_confidence": 1.0,
+        "semantic_up_confidence": 1.0,
+        "semantic_up_angle_deg": 5.0,
+        "semantic_up_candidate_reject_reason": None,
+        "translation_cam": np.array([1.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.diag([1.0, -1.0, 1.0]).astype(np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "initializer_metadata": {"source": "generic_grid"},
+    }
+
+    selected = select_generic_refine_candidates(
+        [visually_strong_flipped, visually_weaker_valid],
+        refine_top_k=1,
+    )
+
+    assert selected[0] is visually_weaker_valid
 
 
 def test_support_orientation_score_penalizes_axis_tilt_softly() -> None:

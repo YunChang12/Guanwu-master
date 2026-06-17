@@ -9,6 +9,7 @@ Visibility = Literal["visible", "occluded", "lost"]
 InteractionState = Literal["idle", "held", "moving", "contact"]
 RelationPredicate = Literal["on", "in", "next_to", "holding", "approaching", "contact_with", "on_floor", "against_wall"]
 RelationStatus = Literal["active", "ended"]
+BBox3DType = Literal["aabb", "obb"]
 EventType = Literal[
     "appeared",
     "disappeared",
@@ -25,11 +26,23 @@ class Pose3D(BaseModel):
     frame: str = "world"
 
 
+class BBox3D(BaseModel):
+    type: BBox3DType = "aabb"
+    center: list[float] = Field(..., min_length=3, max_length=3)
+    size: list[float] = Field(..., min_length=3, max_length=3)
+    orientation_quat: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    corners: list[list[float]] | None = Field(default=None, min_length=8, max_length=8)
+    frame: str = "world"
+    source: str = "unknown"
+    confidence: float | None = None
+
+
 class Geometry(BaseModel):
     bbox_2d: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0], min_length=4, max_length=4)
     mask_ref: str = ""
     pose_3d: Pose3D = Field(default_factory=Pose3D)
     scale_3d: list[float] | None = Field(default=None, min_length=3, max_length=3)
+    bbox_3d: BBox3D | None = None
     shape_proxy: Literal["box", "sphere", "capsule", "cylinder", "mesh"] = "box"
 
 

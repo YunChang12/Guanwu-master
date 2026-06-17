@@ -101,10 +101,20 @@ def _valid_vec3_tuple(value: object) -> tuple[float, float, float] | None:
 
 
 def _track_center(point: dict) -> tuple[float, float, float] | None:
+    bbox_3d = point.get("bbox_3d")
+    if isinstance(bbox_3d, dict):
+        center = _valid_vec3_tuple(bbox_3d.get("center"))
+        if center is not None:
+            return center
     return _valid_vec3_tuple(point.get("centroid_world")) or _valid_vec3_tuple(point.get("position_xyz"))
 
 
 def _track_size(point: dict) -> tuple[float, float, float] | None:
+    bbox_3d = point.get("bbox_3d")
+    if isinstance(bbox_3d, dict):
+        size = _valid_vec3_tuple(bbox_3d.get("size"))
+        if size is not None and any(v > 0.0 for v in size):
+            return size
     aabb = point.get("bbox_3d_aabb")
     if isinstance(aabb, dict):
         lo = _valid_vec3_tuple(aabb.get("min"))

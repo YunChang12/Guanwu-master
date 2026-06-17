@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from guanwu.video.core.instance_matching import bbox_iou, deduplicate_instances, label_matches
-from guanwu.video.core.schema import AffordanceState, Geometry, ObjectNode, PhysicsState, Pose3D, Provenance, SemanticState
+from guanwu.video.core.schema import BBox3D, AffordanceState, Geometry, ObjectNode, PhysicsState, Pose3D, Provenance, SemanticState
 from guanwu.video.core.types import DetectedInstance, FrameDetections
 from guanwu.video.core.logger import get_logger
 from guanwu.video.features.spatial.alignment_utils import resolve_depth_map_path
@@ -524,6 +524,7 @@ class StateEstimationAgent:
             bbox_min: list[float] | None = None
             bbox_max: list[float] | None = None
             scale: list[float] | None = None
+            bbox_3d: BBox3D | None = None
             velocity: list[float] | None = None
             depth_samples: list[float | None] = []
             depth_consistency: float | None = None
@@ -566,6 +567,12 @@ class StateEstimationAgent:
 
                     depth_consistency = self._depth_consistency(depth_samples)
                     geom_quality = self._geom_quality(item.score, pose.pose_quality, depth_samples)
+                    bbox_3d = _bbox3d_from_aabb(
+                        bbox_min=bbox_min,
+                        bbox_max=bbox_max,
+                        source="geometry_lift_depth",
+                        confidence=geom_quality,
+                    )
                     geometry_status = "metric"
 
             interaction = "moving" if velocity is not None and any(abs(v) > 0.05 for v in velocity) else "idle"
@@ -585,6 +592,7 @@ class StateEstimationAgent:
                         orientation_quat=orientation_quat,
                     ),
                     scale_3d=scale,
+                    bbox_3d=bbox_3d,
                     shape_proxy=self._shape_proxy_for_label(label),
                 ),
                 physics=PhysicsState(
@@ -612,6 +620,7 @@ class StateEstimationAgent:
                     "timestamp_sec": detections.timestamp,
                     "centroid_world": centroid,
                     "orientation_quat": node.geometry.pose_3d.orientation_quat,
+                    "bbox_3d": bbox_3d.model_dump(mode="json") if bbox_3d is not None else None,
                     "bbox_3d_aabb": {"min": bbox_min, "max": bbox_max} if bbox_min is not None and bbox_max is not None else None,
                     "mask_quality": item.score,
                     "geom_quality": geom_quality,
@@ -981,6 +990,41 @@ def _mat_vec_mul(m: list[list[float]], v: list[float]) -> list[float]:
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
         m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
+
+
+def _bbox3d_from_aabb(
+    *,
+    bbox_min: list[float] | None,
+    bbox_max: list[float] | None,
+    source: str,
+    confidence: float | None = None,
+) -> BBox3D | None:
+    if bbox_min is None or bbox_max is None or len(bbox_min) != 3 or len(bbox_max) != 3:
+        return None
+    lo = [float(v) for v in bbox_min]
+    hi = [float(v) for v in bbox_max]
+    if not all(math.isfinite(v) for v in [*lo, *hi]):
+        return None
+    size = [max(0.001, hi[i] - lo[i]) for i in range(3)]
+    if not any(v > 0.0 for v in size):
+        return None
+    center = [(lo[i] + hi[i]) * 0.5 for i in range(3)]
+    half = [s * 0.5 for s in size]
+    corners = [
+        [center[0] + sx * half[0], center[1] + sy * half[1], center[2] + sz * half[2]]
+        for sz in (-1.0, 1.0)
+        for sy in (-1.0, 1.0)
+        for sx in (-1.0, 1.0)
+    ]
+    return BBox3D(
+        type="aabb",
+        center=center,
+        size=size,
+        corners=corners,
+        frame="world",
+        source=source,
+        confidence=confidence,
+    )
 
 
 def _rotation_to_quat(rot: Any) -> list[float] | None:

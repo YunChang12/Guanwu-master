@@ -2452,6 +2452,18 @@ class ProjectExecutor:
                     "geometry_status": frame.get("geometry_status", frame.get("source", pose_source)),
                     "quality": frame.get("quality", {}),
                 }
+                bbox_3d = frame.get("bbox_3d")
+                if not isinstance(bbox_3d, dict):
+                    bbox_3d = ProjectExecutor._bbox3d_from_pose(
+                        center=center,
+                        scale=scale,
+                        rotation_matrix=rotation,
+                        orientation_quat=refined_frame["orientation_quat"],
+                        source=refined_frame["pose_source"],
+                        confidence=refined_frame["confidence"],
+                    )
+                if isinstance(bbox_3d, dict):
+                    refined_frame["bbox_3d"] = bbox_3d
                 if frame.get("T_world_from_object") is not None:
                     refined_frame["T_world_from_object"] = frame.get("T_world_from_object")
                 frames_out.append(refined_frame)
@@ -4853,7 +4865,7 @@ class ProjectExecutor:
                         timestamp = float(rec.get("timestamp_sec", self._timestamp_for_frame(traj, fid)) or 0.0)
                     except Exception:
                         timestamp = self._timestamp_for_frame(traj, fid)
-                    corrected.append({
+                    corrected_frame = {
                         "frame_id": fid,
                         "timestamp_sec": timestamp,
                         "centroid_world": frame_center,
@@ -4866,7 +4878,19 @@ class ProjectExecutor:
                             "metrics": pose_opt.get("metrics", {}),
                             "reason": pose_opt.get("reason"),
                         },
-                    })
+                    }
+                    bbox_3d = self._bbox3d_from_pose(
+                        center=frame_center,
+                        scale=scale,
+                        rotation_matrix=rotation,
+                        orientation_quat=quat,
+                        source="edge_contour_fast",
+                        confidence=None,
+                        vertices=verts,
+                    )
+                    if bbox_3d is not None:
+                        corrected_frame["bbox_3d"] = bbox_3d
+                    corrected.append(corrected_frame)
                 corrected.sort(key=lambda item: int(item.get("frame_id") or 0))
                 corrected_trajectories[obj_id] = {
                     "frames": corrected,
@@ -5049,7 +5073,7 @@ class ProjectExecutor:
                         previous_depth_points = np.asarray(pts, dtype=np.float64)
                         rotation = depth_rotations[fid]
                         quat = self._rotation_matrix_to_quat_xyzw(rotation)
-                        corrected.append({
+                        corrected_frame = {
                             "frame_id": fid,
                             "timestamp_sec": rec.get("timestamp_sec", 0.0),
                             "centroid_world": center,
@@ -5057,7 +5081,19 @@ class ProjectExecutor:
                             "rotation_matrix": rotation,
                             "scale": scale,
                             "geometry_status": "metric_depth",
-                        })
+                        }
+                        bbox_3d = self._bbox3d_from_pose(
+                            center=center,
+                            scale=scale,
+                            rotation_matrix=rotation,
+                            orientation_quat=quat,
+                            source="metric_depth",
+                            confidence=None,
+                            vertices=verts_canonical,
+                        )
+                        if bbox_3d is not None:
+                            corrected_frame["bbox_3d"] = bbox_3d
+                        corrected.append(corrected_frame)
 
             if not corrected:
                 _logger.info("[scene.compose] skip %s: no metric trajectory frames", obj_id)
@@ -5152,6 +5188,7 @@ class ProjectExecutor:
             corrected_trajectories,
             tabletop_reference=tabletop_reference,
         )
+        self._refresh_corrected_trajectory_bbox3d(smoothed)
         self._json_dump(smoothed_traj_path, smoothed)
         self._json_dump(smoothing_report_path, report)
         _logger.info(
@@ -5162,6 +5199,40 @@ class ProjectExecutor:
             float(report.get("max_rotation_adjust_deg", 0.0) or 0.0),
         )
         return smoothed, report
+
+    @staticmethod
+    def _refresh_corrected_trajectory_bbox3d(trajectories: dict) -> None:
+        if not isinstance(trajectories, dict):
+            return
+        for track in trajectories.values():
+            frames = track.get("frames") if isinstance(track, dict) else track
+            if not isinstance(frames, list):
+                continue
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                if not ProjectExecutor._valid_vec3_like(frame.get("centroid_world")):
+                    continue
+                if not ProjectExecutor._valid_vec3_like(frame.get("scale")):
+                    continue
+                rotation = frame.get("rotation_matrix")
+                if not isinstance(rotation, list) or len(rotation) != 3:
+                    continue
+                existing_bbox = frame.get("bbox_3d") if isinstance(frame.get("bbox_3d"), dict) else {}
+                if existing_bbox and not isinstance(frame.get("trajectory_smoothing"), dict):
+                    continue
+                source = str(frame.get("source") or frame.get("pose_source") or frame.get("geometry_status") or "pose_optimize")
+                bbox_size = existing_bbox.get("size") if ProjectExecutor._valid_vec3_like(existing_bbox.get("size")) else frame["scale"]
+                bbox_3d = ProjectExecutor._bbox3d_from_pose(
+                    center=frame["centroid_world"],
+                    scale=bbox_size,
+                    rotation_matrix=rotation,
+                    orientation_quat=frame.get("orientation_quat"),
+                    source=source,
+                    confidence=frame.get("confidence"),
+                )
+                if bbox_3d is not None:
+                    frame["bbox_3d"] = bbox_3d
 
     @staticmethod
     def _scene_glb_viewer_coordinate_convention() -> USDCoordinateConvention:
@@ -5301,18 +5372,36 @@ class ProjectExecutor:
                 rotation = frame.get("rotation_matrix") or track.get("rotation_matrix")
                 if not isinstance(rotation, list) or len(rotation) != 3:
                     rotation = np.eye(3, dtype=np.float64).tolist()
-                compat_frames.append({
+                center = [float(v) for v in frame["centroid_world"]]
+                scale = [float(v) for v in frame["scale"]]
+                orientation_quat = frame.get("orientation_quat") or self._rotation_matrix_to_quat_xyzw(rotation)
+                source = frame.get("source", "depth_icp_temporal")
+                bbox_3d = self._bbox3d_from_pose(
+                    center=center,
+                    scale=scale,
+                    rotation_matrix=rotation,
+                    orientation_quat=orientation_quat,
+                    source=source,
+                    confidence=float(frame.get("confidence", 0.0) or 0.0),
+                    vertices=np.asarray(obj_mesh.vertices, dtype=np.float64),
+                )
+                if bbox_3d is None and isinstance(frame.get("bbox_3d"), dict):
+                    bbox_3d = frame["bbox_3d"]
+                compat_frame = {
                     "frame_id": int(frame.get("frame_id") or 0),
                     "timestamp_sec": float(frame.get("timestamp_sec", 0.0) or 0.0),
-                    "centroid_world": [float(v) for v in frame["centroid_world"]],
-                    "orientation_quat": frame.get("orientation_quat") or self._rotation_matrix_to_quat_xyzw(rotation),
+                    "centroid_world": center,
+                    "orientation_quat": orientation_quat,
                     "rotation_matrix": rotation,
-                    "scale": [float(v) for v in frame["scale"]],
+                    "scale": scale,
                     "geometry_status": frame.get("geometry_status", "depth_icp_temporal"),
                     "confidence": float(frame.get("confidence", 0.0) or 0.0),
-                    "source": frame.get("source", "depth_icp_temporal"),
+                    "source": source,
                     "quality": frame.get("quality", {}),
-                })
+                }
+                if isinstance(bbox_3d, dict):
+                    compat_frame["bbox_3d"] = bbox_3d
+                compat_frames.append(compat_frame)
             if not compat_frames:
                 continue
 
@@ -5860,13 +5949,23 @@ class ProjectExecutor:
         T[:3, 3] = center
         metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
         confidence = ProjectExecutor._edge_pose_confidence(metrics)
+        orientation_quat = ProjectExecutor._rotation_matrix_to_quat_xyzw(rotation)
+        bbox_3d = ProjectExecutor._bbox3d_from_pose(
+            center=center,
+            scale=scale,
+            rotation_matrix=rotation,
+            orientation_quat=orientation_quat,
+            source=pose_source,
+            confidence=confidence,
+        )
         return {
             "frame_id": int(record.get("frame_id") or 0),
             "timestamp_sec": float(record.get("timestamp_sec", 0.0) or 0.0),
             "centroid_world": [float(v) for v in center],
             "rotation_matrix": rotation.tolist(),
-            "orientation_quat": ProjectExecutor._rotation_matrix_to_quat_xyzw(rotation),
+            "orientation_quat": orientation_quat,
             "scale": [float(v) for v in scale],
+            "bbox_3d": bbox_3d,
             "T_world_from_object": T.tolist(),
             "confidence": confidence,
             "source": pose_source,
@@ -5890,6 +5989,84 @@ class ProjectExecutor:
         center_score = max(0.0, 1.0 - center_error / 120.0)
         confidence = 0.45 * max(0.0, min(1.0, mask_iou)) + 0.35 * max(0.0, min(1.0, bbox_iou)) + 0.20 * center_score
         return max(0.05, min(0.99, float(confidence)))
+
+    @staticmethod
+    def _bbox3d_from_pose(
+        *,
+        center,
+        scale,
+        rotation_matrix,
+        orientation_quat=None,
+        source: str = "pose_optimize",
+        confidence: float | None = None,
+        vertices=None,
+    ) -> dict | None:
+        import numpy as np
+
+        try:
+            center_arr = np.asarray(center, dtype=np.float64).reshape(3)
+            scale_arr = np.asarray(scale, dtype=np.float64).reshape(3)
+            rotation = np.asarray(rotation_matrix, dtype=np.float64).reshape(3, 3)
+        except Exception:
+            return None
+        if not np.all(np.isfinite(center_arr)) or not np.all(np.isfinite(scale_arr)) or not np.all(np.isfinite(rotation)):
+            return None
+
+        verts_arr = None
+        if vertices is not None:
+            try:
+                verts_arr = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+            except Exception:
+                verts_arr = None
+            if verts_arr is not None and (len(verts_arr) == 0 or not np.all(np.isfinite(verts_arr))):
+                verts_arr = None
+
+        if verts_arr is not None:
+            local_min = np.min(verts_arr, axis=0)
+            local_max = np.max(verts_arr, axis=0)
+            local_center = 0.5 * (local_min + local_max)
+            local_half = 0.5 * (local_max - local_min)
+            size = np.abs((local_max - local_min) * scale_arr)
+            bbox_center = center_arr + rotation @ (local_center * scale_arr)
+            local_offsets = [
+                np.array([sx * local_half[0], sy * local_half[1], sz * local_half[2]], dtype=np.float64)
+                for sz in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+                for sx in (-1.0, 1.0)
+            ]
+            corners = [center_arr + rotation @ ((local_center + offset) * scale_arr) for offset in local_offsets]
+        else:
+            size = np.abs(scale_arr)
+            bbox_center = center_arr
+            local_half = 0.5 * size
+            corners = [
+                center_arr + rotation @ np.array([sx * local_half[0], sy * local_half[1], sz * local_half[2]], dtype=np.float64)
+                for sz in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+                for sx in (-1.0, 1.0)
+            ]
+
+        if not np.all(np.isfinite(size)) or not any(float(v) > 0.0 for v in size):
+            return None
+        quat = orientation_quat
+        if not isinstance(quat, list) or len(quat) != 4:
+            quat = ProjectExecutor._rotation_matrix_to_quat_xyzw(rotation)
+        bbox: dict = {
+            "type": "obb",
+            "center": [float(v) for v in bbox_center.tolist()],
+            "size": [float(v) for v in size.tolist()],
+            "orientation_quat": [float(v) for v in quat],
+            "corners": [[float(v) for v in corner.tolist()] for corner in corners],
+            "frame": "world",
+            "source": str(source or "pose_optimize"),
+        }
+        try:
+            conf = float(confidence) if confidence is not None else None
+        except Exception:
+            conf = None
+        if conf is not None and math.isfinite(conf):
+            bbox["confidence"] = conf
+        return bbox
 
     @staticmethod
     def _edge_pose_temporal_prior_payload(previous: dict | None) -> dict | None:

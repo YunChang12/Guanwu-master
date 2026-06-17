@@ -235,6 +235,13 @@ semantic_up_sigma_deg: 25.0
 semantic_up_tolerance_deg: 10.0
 semantic_up_hard_gate_enabled: true
 semantic_up_hard_gate_max_angle_deg: 90.0
+semantic_up_flip_rescue_enabled: true
+semantic_up_flip_rescue_source_top_k: 8
+semantic_up_flip_rescue_min_mask_iou: 0.55
+semantic_up_flip_rescue_min_bbox_iou: 0.70
+semantic_up_flip_rescue_keep_top_k: 3
+semantic_up_flip_rescue_variants: cam_z_180,cam_x_180,min_align
+semantic_up_flip_rescue_prior_paths: ""
 generic_visual_rescue_enabled: true
 generic_visual_rescue_min_depth_score: 0.90
 generic_visual_rescue_current_edge_max: 0.18

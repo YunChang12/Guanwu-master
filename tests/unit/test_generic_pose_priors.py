@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import numpy as np
 import pytest
@@ -645,6 +646,202 @@ def test_generic_parser_defaults_keep_semantic_up_as_gate_not_score_penalty() ->
     assert args.semantic_up_penalty_weight == pytest.approx(0.0)
     assert args.generic_visual_rescue_current_mask_max == pytest.approx(0.86)
     assert args.generic_visual_rescue_current_bbox_max == pytest.approx(0.84)
+
+
+def _semantic_up_flip_args(**overrides: object) -> argparse.Namespace:
+    values = {
+        "world_up_axis": "-y",
+        "semantic_up_constraint_enabled": "auto",
+        "semantic_up_sigma_deg": 25.0,
+        "semantic_up_tolerance_deg": 10.0,
+        "semantic_up_hard_gate_enabled": True,
+        "semantic_up_hard_gate_max_angle_deg": 90.0,
+        "semantic_up_flip_rescue_enabled": True,
+        "semantic_up_flip_rescue_source_top_k": 8,
+        "semantic_up_flip_rescue_min_mask_iou": 0.55,
+        "semantic_up_flip_rescue_min_bbox_iou": 0.70,
+        "semantic_up_flip_rescue_keep_top_k": 3,
+        "semantic_up_flip_rescue_variants": "cam_z_180,cam_x_180,min_align",
+        "semantic_up_flip_rescue_prior_paths": "",
+        "top_k_candidates": 1,
+        "refine_top_k": 2,
+        "generic_depth_refine_bucket_top_k": 1,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class _FakeSemanticUpFlipEvaluator:
+    def __init__(self) -> None:
+        self.mesh_axis_prior = {
+            "available": True,
+            "up_axis_idx": 1,
+            "up_sign": 1.0,
+            "lock_up_sign": True,
+        }
+        self.t_world_from_cam = None
+        self.calls: list[np.ndarray] = []
+
+    def evaluate_absolute(
+        self,
+        translation: np.ndarray,
+        rotation: np.ndarray,
+        scale: np.ndarray,
+    ) -> dict[str, object]:
+        self.calls.append(np.asarray(rotation, dtype=np.float64))
+        return {
+            "translation_cam": np.asarray(translation, dtype=np.float64),
+            "rotation_cam": np.asarray(rotation, dtype=np.float64),
+            "scale": np.asarray(scale, dtype=np.float64),
+            "projected_bbox": [0.0, 0.0, 1.0, 1.0],
+            "score": 1.0,
+            "mask_iou": 0.82,
+            "mask_blend_score": 0.82,
+            "bbox_iou": 0.84,
+            "depth_score": 0.0,
+            "depth_confidence": 0.0,
+        }
+
+
+def _reversed_semantic_up_candidate() -> dict[str, object]:
+    return {
+        "translation_cam": np.array([0.0, 0.0, 2.0], dtype=np.float64),
+        "rotation_cam": np.eye(3, dtype=np.float64),
+        "scale": np.ones(3, dtype=np.float64),
+        "projected_bbox": [0.0, 0.0, 1.0, 1.0],
+        "score": 1.5,
+        "mask_iou": 0.86,
+        "mask_blend_score": 0.86,
+        "bbox_iou": 0.88,
+        "depth_score": 0.0,
+        "depth_confidence": 0.0,
+        "initializer_metadata": {"source": "generic_grid"},
+    }
+
+
+def test_semantic_up_flip_rescue_builds_camera_z_seed_from_high_visual_reversed_candidate() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        annotate_candidate_semantic_up_for_ranking,
+        make_semantic_up_flip_seeds,
+    )
+
+    args = _semantic_up_flip_args(semantic_up_flip_rescue_variants="cam_z_180")
+    evaluator = _FakeSemanticUpFlipEvaluator()
+    base = _reversed_semantic_up_candidate()
+    annotate_candidate_semantic_up_for_ranking(base, evaluator.mesh_axis_prior, args)
+
+    assert base["semantic_up_angle_deg"] == pytest.approx(180.0)
+    assert base["semantic_up_candidate_reject_reason"] == "semantic_up_angle_above_threshold"
+
+    seeds = make_semantic_up_flip_seeds([base], evaluator, args)
+
+    assert len(seeds) == 1
+    seed = seeds[0]
+    assert seed["semantic_up_flip_rescue_candidate_used"] is True
+    assert seed["semantic_up_flip_variant"] == "cam_z_180"
+    assert seed["semantic_up_angle_deg_before_flip"] == pytest.approx(180.0)
+    assert seed["semantic_up_angle_deg_after_flip"] == pytest.approx(0.0)
+    assert seed["semantic_up_candidate_reject_reason"] is None
+    assert seed["initializer_metadata"]["source"] == "semantic_up_flip_rescue_seed"
+    assert np.allclose(seed["rotation_cam"], np.diag([-1.0, -1.0, 1.0]))
+
+
+def test_semantic_up_flip_rescue_uses_prior_report_pose_source(tmp_path) -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import (
+        load_semantic_up_flip_prior_candidates,
+        make_semantic_up_flip_seeds,
+    )
+
+    report_path = tmp_path / "optimization_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "optimized_corrected_pose_world": {
+                    "translation_world": [0.0, 0.0, 2.0],
+                    "rotation_matrix": np.eye(3).tolist(),
+                    "scale": [1.0, 1.0, 1.0],
+                },
+                "metrics": {
+                    "mask_iou": 0.86,
+                    "bbox_iou": 0.88,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = _semantic_up_flip_args(
+        semantic_up_flip_rescue_variants="cam_z_180",
+        semantic_up_flip_rescue_prior_paths=str(report_path),
+    )
+    evaluator = _FakeSemanticUpFlipEvaluator()
+    evaluator.t_world_from_cam = np.eye(4, dtype=np.float64)
+
+    prior_candidates = load_semantic_up_flip_prior_candidates(evaluator, args, np.eye(4, dtype=np.float64))
+    seeds = make_semantic_up_flip_seeds(prior_candidates, evaluator, args)
+
+    assert len(prior_candidates) == 1
+    assert prior_candidates[0]["initializer_metadata"]["source"] == "semantic_up_flip_prior_pose"
+    assert len(seeds) == 1
+    assert seeds[0]["initializer_metadata"]["base_source"] == "semantic_up_flip_prior_pose"
+    assert seeds[0]["semantic_up_flip_variant"] == "cam_z_180"
+
+
+def test_merge_protected_initial_candidates_preserves_semantic_up_flip_seed_with_colliding_forward_signature() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import merge_protected_initial_candidates
+
+    visual = _reversed_semantic_up_candidate()
+    visual["initializer_metadata"] = {"source": "visual_0"}
+    seed = _reversed_semantic_up_candidate()
+    seed["rotation_cam"] = np.diag([-1.0, -1.0, 1.0]).astype(np.float64)
+    seed["score"] = 0.5
+    seed["initializer_metadata"] = {"source": "semantic_up_flip_rescue_seed"}
+
+    merged = merge_protected_initial_candidates(
+        [visual],
+        support_aligned_seeds=[],
+        depth_snapped_seeds=[],
+        semantic_up_flip_seeds=[seed],
+        args=_semantic_up_flip_args(top_k_candidates=1, refine_top_k=1, semantic_up_flip_rescue_keep_top_k=1),
+    )
+    sources = [item.get("initializer_metadata", {}).get("source") for item in merged]
+
+    assert sources == ["visual_0", "semantic_up_flip_rescue_seed"]
+
+
+def test_select_generic_refine_candidates_keeps_semantic_up_flip_seed() -> None:
+    from process.pose_optimizer.strategies.generic_appearance_temporal import select_generic_refine_candidates
+
+    visual = _reversed_semantic_up_candidate()
+    visual["initializer_metadata"] = {"source": "visual_0"}
+    seed = _reversed_semantic_up_candidate()
+    seed["rotation_cam"] = np.diag([-1.0, -1.0, 1.0]).astype(np.float64)
+    seed["score"] = 0.5
+    seed["initializer_metadata"] = {"source": "semantic_up_flip_rescue_seed"}
+
+    selected = select_generic_refine_candidates(
+        [visual],
+        refine_top_k=1,
+        semantic_up_flip_seed=seed,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["initializer_metadata"]["source"] == "semantic_up_flip_rescue_seed"
+
+
+def test_generic_parser_defaults_enable_semantic_up_flip_rescue() -> None:
+    from process.pose_optimizer.strategies import generic_appearance_temporal as generic
+
+    parser = argparse.ArgumentParser()
+    generic.add_generic_arguments(parser)
+    args, _unknown = parser.parse_known_args([])
+
+    assert args.semantic_up_flip_rescue_enabled is True
+    assert args.semantic_up_flip_rescue_source_top_k == 8
+    assert args.semantic_up_flip_rescue_min_mask_iou == pytest.approx(0.55)
+    assert args.semantic_up_flip_rescue_min_bbox_iou == pytest.approx(0.70)
+    assert args.semantic_up_flip_rescue_keep_top_k == 3
+    assert args.semantic_up_flip_rescue_variants == "cam_z_180,cam_x_180,min_align"
+    assert args.semantic_up_flip_rescue_prior_paths == ""
 
 
 def test_locked_mesh_up_axis_rejects_sideways_contact_orientation() -> None:

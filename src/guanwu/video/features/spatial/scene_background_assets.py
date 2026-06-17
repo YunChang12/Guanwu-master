@@ -11,15 +11,10 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter
-
-from guanwu.video.features.spatial.road_geometry import resolve_depth_maps_dir, select_road_plane_for_frame
-
+from PIL import Image
 
 DYNAMIC_LABELS = ("car", "truck", "bus", "van", "motorcycle", "bicycle", "person")
 STATIC_GUARD_LABELS = ("fence", "road", "sidewalk", "rail", "wall", "track", "building")
-ROAD_LABELS = ("road", "roadway", "asphalt", "lane", "street")
-NON_ROAD_STATIC_LABELS = ("sidewalk", "rail", "track", "fence", "wall", "building", "grass", "curb")
 TASK_BACKGROUND_LABELS = (
     "table",
     "tabletop",
@@ -44,6 +39,23 @@ DEFAULT_OPENAI_IMAGE_EDIT_PROMPT = (
     "still feel like the same robotic workbench scene, only with the active objects gently removed.\n\n"
     "Avoid over-cleaning, avoid replacing the environment, avoid making the tabletop pristine, and avoid "
     "changing geometry or style."
+)
+ROAD_OPENAI_IMAGE_EDIT_PROMPT = (
+    "Edit the input image minimally. Keep the scene as close as possible to the original frame.\n\n"
+    "Generate a clean static road background.\n\n"
+    "Remove all vehicles, road users, distant cars, vehicle shadows, reflections, motion residues, and "
+    "ghosting artifacts. Fill only the regions occluded by vehicles or road users.\n\n"
+    "Preserve the exact camera perspective, road geometry, lane width, lane markings, curbs, sidewalks, "
+    "buildings, lighting, reflections, shadows, asphalt texture, weathering, and scene style.\n\n"
+    "Avoid over-cleaning, avoid changing the environment, avoid changing road geometry, avoid moving lane "
+    "markings, and avoid inventing new structures."
+)
+GENERIC_OPENAI_IMAGE_EDIT_PROMPT = (
+    "Edit the input image minimally. Keep the scene as close as possible to the original frame.\n\n"
+    "Generate a clean static background by removing only temporary foreground objects and occluders. "
+    "Preserve the camera perspective, geometry, lighting, shadows, reflections, material texture, scene "
+    "boundaries, and natural imperfections.\n\n"
+    "Avoid over-cleaning, avoid replacing the environment, and avoid changing geometry or style."
 )
 
 
@@ -131,117 +143,85 @@ def build_static_guard_mask(
     return guard
 
 
-def build_road_visible_mask(
-    detections: dict[str, Any],
-    image_shape: tuple[int, int],
-) -> np.ndarray:
-    height, width = image_shape
-    road = np.zeros((height, width), dtype=bool)
-    for inst in detections.get("instances", []) or []:
-        label = str(inst.get("concept_label") or inst.get("label") or inst.get("class_name") or "").lower()
-        if not _is_road_label(label):
+def _scene_detection_labels(frame_entries: list[dict[str, Any]], target_det: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for inst in target_det.get("instances", []) or []:
+        label = str(inst.get("concept_label") or inst.get("label") or inst.get("class_name") or "").strip().lower()
+        if label:
+            labels.append(label)
+    for entry in frame_entries[: min(len(frame_entries), 8)]:
+        try:
+            det = _load_json(entry["detections"])
+        except Exception:
             continue
-        mask = _decode_instance_mask(inst, (height, width))
-        if mask is None:
-            mask = _bbox_mask(inst.get("bbox"), (height, width))
-        road |= mask
-    if not road.any():
-        return road
-    static_guard = build_static_guard_mask(detections, (height, width), expand_px=0)
-    if static_guard.any():
-        road &= ~static_guard
-    return _clean_semantic_road_mask(road)
+        for inst in det.get("instances", []) or []:
+            label = str(inst.get("concept_label") or inst.get("label") or inst.get("class_name") or "").strip().lower()
+            if label:
+                labels.append(label)
+    return labels
 
 
-def expand_road_mask_with_side_boundaries(
-    road_mask: np.ndarray,
+def _is_road_scene_from_labels(labels: list[str]) -> bool:
+    road_tokens = (
+        "road",
+        "roadway",
+        "asphalt",
+        "lane",
+        "street",
+        "curb",
+        "sidewalk",
+        "traffic",
+        "car",
+        "vehicle",
+        "truck",
+        "bus",
+        "van",
+        "motorcycle",
+        "bicycle",
+        "pedestrian",
+    )
+    return any(any(token in label for token in road_tokens) for label in labels)
+
+
+def _select_clean_scene_prompt_profile(
+    requested_profile: Any,
     *,
-    static_guard_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    road = road_mask.astype(bool)
-    if not road.any():
-        return road
-    height, width = road.shape[:2]
-    guard = static_guard_mask.astype(bool) if static_guard_mask is not None and static_guard_mask.shape == (height, width) else None
-    sample = road.copy()
-    if guard is not None:
-        sample &= ~guard
-    rows: list[int] = []
-    lefts: list[float] = []
-    rights: list[float] = []
-    min_pixels = max(6, int(round(width * 0.015)))
-    clip_margin = max(2, int(round(width * 0.01)))
-    for y in range(height):
-        xs = np.flatnonzero(sample[y])
-        if len(xs) < min_pixels:
-            continue
-        left = float(xs.min())
-        right = float(xs.max())
-        if right - left + 1.0 < max(8.0, width * 0.04):
-            continue
-        if left <= clip_margin or right >= width - 1 - clip_margin:
-            continue
-        rows.append(y)
-        lefts.append(left)
-        rights.append(right)
-    if len(rows) < max(8, int(round(height * 0.08))):
-        return road
-    row_arr = np.asarray(rows, dtype=np.float64)
-    left_arr = np.asarray(lefts, dtype=np.float64)
-    right_arr = np.asarray(rights, dtype=np.float64)
-    left_fit = _fit_boundary_line(row_arr, left_arr)
-    right_fit = _fit_boundary_line(row_arr, right_arr)
-    if left_fit is None or right_fit is None:
-        return road
-    y0 = 0
-    y1 = height - 1
-    yy = np.arange(height, dtype=np.float64)
-    left_line = left_fit[0] * yy + left_fit[1]
-    right_line = right_fit[0] * yy + right_fit[1]
-    min_width = max(6.0, width * 0.01)
-    widths = right_line - left_line + 1.0
-    valid_rows = (yy >= y0) & (yy <= y1) & (widths >= min_width) & (left_line < right_line)
-    if int(np.count_nonzero(valid_rows)) < max(8, int(round(height * 0.08))):
-        return road
-    xx = np.arange(width, dtype=np.float64)[None, :]
-    left_fill = np.clip(left_line, 0.0, width - 1.0)
-    right_fill = np.clip(right_line, 0.0, width - 1.0)
-    envelope = (xx >= left_fill[:, None]) & (xx <= right_fill[:, None])
-    envelope &= valid_rows[:, None]
-    expanded = envelope.copy()
-    expanded |= road & valid_rows[:, None]
-    if guard is not None:
-        expanded &= ~guard
-    return _fill_internal_holes(_bottom_connected_mask(expanded))
+    mode: str,
+    tabletop_task_mode: bool,
+    frame_entries: list[dict[str, Any]],
+    target_det: dict[str, Any],
+) -> tuple[str, str]:
+    profile = str(requested_profile or "auto").strip().lower()
+    aliases = {
+        "table": "tabletop",
+        "tabletop_task": "tabletop",
+        "task": "tabletop",
+        "manipulation": "tabletop",
+        "robot_task": "tabletop",
+        "road_task": "road",
+        "vehicle": "road",
+        "traffic": "road",
+        "scene": "generic",
+        "clean_scene": "generic",
+    }
+    profile = aliases.get(profile, profile)
+    if profile in {"tabletop", "road", "generic"}:
+        return profile, "config"
+    if tabletop_task_mode:
+        return "tabletop", "background_mode"
+    if mode in {"road", "road_task", "vehicle", "traffic"}:
+        return "road", "background_mode"
+    if _is_road_scene_from_labels(_scene_detection_labels(frame_entries, target_det)):
+        return "road", "detections"
+    return "generic", "default"
 
 
-def build_road_full_mask_from_visible(
-    road_visible_mask: np.ndarray,
-    dynamic_mask: np.ndarray,
-    *,
-    static_guard_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    road = road_visible_mask.astype(bool).copy()
-    shape = road.shape[:2]
-    if not road.any():
-        return road
-    guard = static_guard_mask.astype(bool) if static_guard_mask is not None and static_guard_mask.shape == shape else None
-    if guard is not None:
-        road &= ~guard
-    fill_candidates = dynamic_mask.astype(bool) if dynamic_mask is not None and dynamic_mask.shape == shape else np.zeros(shape, dtype=bool)
-    if fill_candidates.any():
-        near_road = cv2.dilate(road.astype(np.uint8), np.ones((17, 17), dtype=np.uint8), iterations=1) > 0
-        fill = fill_candidates & near_road
-        if guard is not None:
-            fill &= ~guard
-        road |= fill
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((7, 7), dtype=np.uint8)) > 0
-    road = expand_road_mask_with_side_boundaries(road, static_guard_mask=guard)
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)) > 0
-    road = _bottom_connected_mask(road)
-    if guard is not None:
-        road &= ~guard
-    return _fill_internal_holes(road)
+def _prompt_for_clean_scene_profile(profile: str) -> str:
+    if profile == "road":
+        return ROAD_OPENAI_IMAGE_EDIT_PROMPT
+    if profile == "generic":
+        return GENERIC_OPENAI_IMAGE_EDIT_PROMPT
+    return DEFAULT_OPENAI_IMAGE_EDIT_PROMPT
 
 
 def generate_target_frame_background_assets(
@@ -249,18 +229,15 @@ def generate_target_frame_background_assets(
     summary_path: str | Path,
     output_dir: str | Path,
     target_frame_id: int = 1,
-    road_geometry_path: str | Path | None = None,
     object_index_path: str | Path | None = None,
     depth_maps_dir: str | Path | None = None,
     camera_trajectory_path: str | Path | None = None,
     clean_depth_estimator: Callable[[Path], Any] | None = None,
-    semantic_road_estimator: Callable[..., Any] | None = None,
     grid_stride: int = 4,
     top_k: int = 5,
     background_mode: str = "auto",
     task_foreground_object_ids: list[str] | tuple[str, ...] | set[str] | None = None,
-    disable_road_semantics: bool = False,
-    background_cleaner: str = "temporal",
+    background_cleaner: str = "openai_image_edit",
     background_cleaner_config: dict[str, Any] | None = None,
     background_cleaner_reference_frame_id: int | None = None,
     background_image_cleaner: Callable[..., dict[str, Any] | None] | None = None,
@@ -282,6 +259,28 @@ def generate_target_frame_background_assets(
     mode = str(background_mode or "auto").strip().lower()
     task_ids = [str(object_id).strip() for object_id in (task_foreground_object_ids or []) if str(object_id).strip()]
     tabletop_task_mode = mode in {"tabletop_task", "task", "manipulation", "robot_task"}
+    cleaner_name = str(background_cleaner or "openai_image_edit").strip().lower()
+    cleaner_config = dict(background_cleaner_config or {})
+    requested_clean_profile = (
+        cleaner_config.get("scene_prompt_profile")
+        or cleaner_config.get("prompt_profile")
+        or cleaner_config.get("background_prompt_profile")
+    )
+    selected_clean_profile, _selected_clean_profile_source = _select_clean_scene_prompt_profile(
+        requested_clean_profile,
+        mode=mode,
+        tabletop_task_mode=tabletop_task_mode,
+        frame_entries=frame_entries,
+        target_det=target_det,
+    )
+    openai_cleaner_aliases = {"openai_image_edit", "gpt_image_edit", "gpt-image-edit"}
+    if cleaner_name not in openai_cleaner_aliases:
+        raise ValueError(
+            f"Unsupported background_cleaner={background_cleaner!r}. "
+            "Legacy temporal/donor background generation has been removed; use openai_image_edit."
+        )
+    openai_image_cleaner_requested = True
+    clean_scene_background_mode = True
     object_index_masks = {} if task_ids else _load_object_index_masks(object_index_path, (height, width))
     target_mask = (
         build_task_foreground_mask(target_det, (height, width), task_ids)
@@ -290,86 +289,39 @@ def generate_target_frame_background_assets(
     )
     if not tabletop_task_mode:
         target_mask |= object_index_masks.get(int(target_frame_id), np.zeros((height, width), dtype=bool))
-    target_road_visible_mask = np.zeros((height, width), dtype=bool)
-    if not tabletop_task_mode:
-        target_road_visible_mask = build_road_visible_mask(target_det, (height, width))
-        target_road_visible_mask |= _load_sidecar_road_mask(target_entry, target_det, (height, width), summary_path=summary_path)
-    static_guard_mask = build_static_guard_mask(target_det, (height, width))
-
-    source_rgbs: list[np.ndarray] = []
-    source_weights: list[np.ndarray] = []
     source_count = np.zeros((height, width), dtype=np.uint16)
-    road_visible_votes = np.zeros((height, width), dtype=np.uint16)
-    road_full_votes = np.zeros((height, width), dtype=np.uint16)
-    road_frame_count = 0
-    cleaner_name = str(background_cleaner or "temporal").strip().lower()
-    openai_image_cleaner_enabled = tabletop_task_mode and cleaner_name in {
-        "openai_image_edit",
-        "gpt_image_edit",
-        "gpt-image-edit",
-    }
-    limit_frames = [] if openai_image_cleaner_enabled else (
-        frame_entries if top_k <= 0 else _rank_frames(frame_entries, target_frame_id)[: max(top_k, 1) * 8]
-    )
-    for entry in limit_frames:
-        det = _load_json(entry["detections"])
-        if not det.get("image_b64"):
-            continue
-        rgb = _decode_image_b64(det["image_b64"])
-        if rgb.shape[:2] != (height, width):
-            rgb = np.asarray(Image.fromarray(rgb).resize((width, height), Image.BILINEAR))
-        frame_id = int(entry.get("frame_idx") or det.get("frame_idx") or target_frame_id)
-        mask = build_task_foreground_mask(det, (height, width), task_ids) if tabletop_task_mode else build_dynamic_mask(det, (height, width))
-        if not tabletop_task_mode:
-            mask |= object_index_masks.get(frame_id, np.zeros((height, width), dtype=bool))
-        if not tabletop_task_mode:
-            frame_static_guard = build_static_guard_mask(det, (height, width))
-            static_guard_mask |= frame_static_guard
-            frame_road_visible = build_road_visible_mask(det, (height, width))
-            frame_road_visible |= _load_sidecar_road_mask(entry, det, (height, width), summary_path=summary_path)
-            frame_road_full = build_road_full_mask_from_visible(
-                frame_road_visible,
-                mask,
-                static_guard_mask=frame_static_guard,
-            )
-            if _is_usable_semantic_road_mask(frame_road_full):
-                road_frame_count += 1
-                road_visible_votes += frame_road_visible.astype(np.uint16)
-                road_full_votes += frame_road_full.astype(np.uint16)
-        usable = ~mask
-        if not usable.any():
-            continue
-        temporal = 1.0 / (1.0 + abs(frame_id - target_frame_id))
-        distance = cv2.distanceTransform(usable.astype(np.uint8), cv2.DIST_L2, 3)
-        boundary = np.clip(distance / 12.0, 0.0, 1.0)
-        target_penalty = 0.35 if frame_id == target_frame_id else 1.0
-        weight = usable.astype(np.float32) * float(temporal) * float(target_penalty) * boundary.astype(np.float32)
-        source_rgbs.append(rgb.astype(np.float32))
-        source_weights.append(weight)
-        source_count += usable.astype(np.uint16)
+    openai_image_cleaner_enabled = clean_scene_background_mode and openai_image_cleaner_requested
+    clean_rgb = target_rgb.copy()
+    confidence = np.zeros((height, width), dtype=np.float32)
 
-    if source_rgbs:
-        clean_rgb = _robust_median_rgb(source_rgbs, source_weights, fallback=target_rgb)
-        confidence = _confidence_from_weights(source_weights)
-    else:
-        clean_rgb = target_rgb.copy()
-        confidence = np.zeros((height, width), dtype=np.float32)
-
-    fallback_mask = (source_count < 2) & (~target_mask)
-    clean_rgb[fallback_mask] = target_rgb[fallback_mask]
-    clean_rgb = _fill_low_candidate_dynamic_regions(clean_rgb, target_rgb, target_mask, source_count)
-
-    if tabletop_task_mode:
+    if clean_scene_background_mode:
         clean_rgb_path = output_dir / "clean_target_rgb.png"
         dynamic_mask_path = output_dir / "dynamic_mask_target.png"
         confidence_path = output_dir / "confidence_map.png"
         source_count_path = output_dir / "source_count_map.png"
         tabletop_mesh = mesh_dir / "tabletop_background.obj"
         cleaner_assets: dict[str, str] = {}
-        cleaner_quality: dict[str, Any] = {"clean_rgb_source": "temporal"}
-        cleaner_config = dict(background_cleaner_config or {})
+        cleaner_quality: dict[str, Any] = {"clean_rgb_source": "openai_image_edit"}
         if openai_image_cleaner_enabled:
+            profile_was_requested = any(
+                key in cleaner_config for key in ("scene_prompt_profile", "prompt_profile", "background_prompt_profile")
+            )
             cleaner_config = _load_openai_image_edit_config(cleaner_config)
+            if profile_was_requested or any(
+                key in cleaner_config for key in ("scene_prompt_profile", "prompt_profile", "background_prompt_profile")
+            ):
+                selected_profile, selected_profile_source = _select_clean_scene_prompt_profile(
+                    cleaner_config.get("scene_prompt_profile")
+                    or cleaner_config.get("prompt_profile")
+                    or cleaner_config.get("background_prompt_profile"),
+                    mode=mode,
+                    tabletop_task_mode=tabletop_task_mode,
+                    frame_entries=frame_entries,
+                    target_det=target_det,
+                )
+                cleaner_config["scene_prompt_profile"] = selected_profile
+                cleaner_config["scene_prompt_profile_source"] = selected_profile_source
+                cleaner_config["prompt"] = _prompt_for_clean_scene_profile(selected_profile)
             reference_frame_id = int(background_cleaner_reference_frame_id or target_frame_id)
             reference_entry = _select_frame(frame_entries, reference_frame_id)
             reference_det = _load_json(reference_entry["detections"])
@@ -377,8 +329,8 @@ def generate_target_frame_background_assets(
             if reference_rgb.shape[:2] != (height, width):
                 reference_rgb = np.asarray(Image.fromarray(reference_rgb).resize((width, height), Image.BILINEAR))
             cleaner_mask_mode = str(cleaner_config.get("mask_mode") or cleaner_config.get("edit_mask_mode") or "target").strip().lower()
-            mask_frame_mode = str(cleaner_config.get("mask_frame_mode") or cleaner_config.get("temporal_mask_mode") or "reference_frame").strip().lower()
-            mask_frame_entries = frame_entries if mask_frame_mode in {"all", "all_frames", "temporal", "union"} else [reference_entry]
+            mask_frame_mode = str(cleaner_config.get("mask_frame_mode") or "reference_frame").strip().lower()
+            mask_frame_entries = frame_entries if mask_frame_mode in {"all", "all_frames", "union"} else [reference_entry]
             prompt_only_mode = cleaner_mask_mode in {"none", "no_mask", "prompt", "prompt_only", "image_prompt", "reference_only"}
             full_image_output = _as_bool(
                 cleaner_config.get("use_full_image_output"),
@@ -436,6 +388,8 @@ def generate_target_frame_background_assets(
                 "clean_rgb_reference_frame_id": int(reference_frame_id),
                 "clean_rgb_model": str((cleaner_result or {}).get("model") or cleaner_config.get("model") or "gpt-image-2"),
                 "clean_rgb_prompt": str((cleaner_result or {}).get("prompt") or cleaner_config.get("prompt") or DEFAULT_OPENAI_IMAGE_EDIT_PROMPT),
+                "scene_prompt_profile": str(cleaner_config.get("scene_prompt_profile") or "custom"),
+                "scene_prompt_profile_source": str(cleaner_config.get("scene_prompt_profile_source") or "custom_prompt"),
                 "clean_rgb_mask_fraction": float(np.mean(cleaner_mask)),
                 "clean_rgb_mask_mode": cleaner_mask_mode,
                 "clean_rgb_mask_frame_mode": mask_frame_mode,
@@ -478,7 +432,11 @@ def generate_target_frame_background_assets(
             )
         manifest_path = output_dir / "background_manifest.json"
         manifest = {
-            "schema": "guanwu.target_frame_background_assets.tabletop.v1",
+            "schema": (
+                "guanwu.target_frame_background_assets.tabletop.v1"
+                if tabletop_task_mode
+                else "guanwu.target_frame_background_assets.clean_scene.v1"
+            ),
             "target_frame_id": int(target_frame_id),
             "image_size": [int(width), int(height)],
             "assets": {
@@ -491,18 +449,22 @@ def generate_target_frame_background_assets(
                 **cleaner_assets,
             },
             "quality": {
-                "background_mode": "tabletop_task",
-                "source_frame_count": len(source_rgbs),
+                "background_mode": "tabletop_task" if tabletop_task_mode else "clean_scene_background",
+                "requested_background_mode": mode,
+                "source_frame_count": 0,
                 "target_dynamic_fraction": float(np.mean(target_mask)),
                 "target_foreground_object_ids": task_ids,
                 "mean_confidence": float(np.mean(confidence)),
-                "road_semantics_disabled": True,
                 **cleaner_quality,
             },
             "road_plane": None,
         }
         if depth_asset:
-            manifest["schema"] = "guanwu.target_frame_background_assets.tabletop_depth.v2"
+            manifest["schema"] = (
+                "guanwu.target_frame_background_assets.tabletop_depth.v2"
+                if tabletop_task_mode
+                else "guanwu.target_frame_background_assets.clean_scene_depth.v2"
+            )
             manifest["assets"].update(
                 {key: value for key, value in depth_asset.get("assets", {}).items() if value}
             )
@@ -527,173 +489,9 @@ def generate_target_frame_background_assets(
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"manifest_path": str(manifest_path), "mesh_dir": str(mesh_dir)}
 
-    road_visible_mask = target_road_visible_mask
-    road_full_mask = build_road_full_mask_from_visible(
-        road_visible_mask,
-        target_mask,
-        static_guard_mask=static_guard_mask,
-    )
-    global_road_mask = _global_road_mask_from_votes(
-        visible_votes=road_visible_votes,
-        full_votes=road_full_votes,
-        frame_count=road_frame_count,
-        target_fallback=road_full_mask,
-        static_guard_mask=static_guard_mask,
-    )
-    road_mask = global_road_mask if global_road_mask.any() else road_full_mask
-    road_plane = _load_road_plane(road_geometry_path, target_frame_id)
-    clean_rgb_path = output_dir / "clean_target_rgb.png"
-    dynamic_mask_path = output_dir / "dynamic_mask_target.png"
-    static_guard_mask_path = output_dir / "static_guard_mask_target.png"
-    confidence_path = output_dir / "confidence_map.png"
-    source_count_path = output_dir / "source_count_map.png"
-    road_mask_path = output_dir / "road_mask.png"
-    road_visible_mask_path = output_dir / "road_visible_mask.png"
-    road_full_mask_path = output_dir / "road_full_mask.png"
-    global_road_mask_path = output_dir / "global_road_full_mask.png"
-    Image.fromarray(clean_rgb).save(clean_rgb_path)
-    semantic_road_mask_path: Path | None = None
-    semantic_road_estimator_used = False
-    semantic_estimator_mask = None if disable_road_semantics else _run_semantic_road_estimator(
-        semantic_road_estimator,
-        clean_rgb_path=clean_rgb_path,
-        frame_id=int(target_frame_id),
-        image_shape=(height, width),
-    )
-    if semantic_estimator_mask is not None and semantic_estimator_mask.any():
-        semantic_road_estimator_used = True
-        semantic_road_mask_path = output_dir / "semantic_road_estimator_mask.png"
-        Image.fromarray((semantic_estimator_mask.astype(np.uint8) * 255)).save(semantic_road_mask_path)
-        road_visible_mask |= semantic_estimator_mask
-        road_full_mask = build_road_full_mask_from_visible(
-            road_visible_mask,
-            target_mask,
-            static_guard_mask=static_guard_mask,
-        )
-        global_road_mask = _global_road_mask_from_votes(
-            visible_votes=road_visible_votes,
-            full_votes=road_full_votes,
-            frame_count=road_frame_count,
-            target_fallback=road_full_mask,
-            static_guard_mask=static_guard_mask,
-        )
-        road_mask = global_road_mask if global_road_mask.any() else road_full_mask
-    if road_plane is None:
-        road_plane = _estimate_global_road_plane_from_semantic_depth(
-            road_mask=road_mask,
-            target_frame_id=target_frame_id,
-            depth_maps_dir=depth_maps_dir,
-            camera_trajectory_path=camera_trajectory_path,
-        )
-    Image.fromarray((target_mask.astype(np.uint8) * 255)).save(dynamic_mask_path)
-    Image.fromarray((static_guard_mask.astype(np.uint8) * 255)).save(static_guard_mask_path)
-    Image.fromarray(np.clip(confidence * 255.0, 0, 255).astype(np.uint8)).save(confidence_path)
-    Image.fromarray(np.clip(source_count, 0, 255).astype(np.uint8)).save(source_count_path)
-    Image.fromarray((road_mask.astype(np.uint8) * 255)).save(road_mask_path)
-    Image.fromarray((road_visible_mask.astype(np.uint8) * 255)).save(road_visible_mask_path)
-    Image.fromarray((road_full_mask.astype(np.uint8) * 255)).save(road_full_mask_path)
-    Image.fromarray((global_road_mask.astype(np.uint8) * 255)).save(global_road_mask_path)
-
-    road_mesh = mesh_dir / "road_mesh.obj"
-    structures_mesh = mesh_dir / "structures_mesh.obj"
-    far_mesh = mesh_dir / "far_mesh.obj"
-    _write_textured_grid_obj(
-        road_mesh,
-        output_dir,
-        clean_rgb_path,
-        width,
-        height,
-        mask=road_mask,
-        grid_stride=grid_stride,
-        layer="road",
-        road_plane=road_plane,
-    )
-    _write_textured_grid_obj(
-        structures_mesh,
-        output_dir,
-        clean_rgb_path,
-        width,
-        height,
-        mask=(~road_mask) & (~target_mask),
-        grid_stride=grid_stride,
-        layer="structures",
-        road_plane=None,
-    )
-    _write_far_mesh(far_mesh, output_dir, clean_rgb_path, width, height)
-
-    manifest_path = output_dir / "background_manifest.json"
-    manifest = {
-        "schema": "guanwu.target_frame_background_assets.v1",
-        "target_frame_id": int(target_frame_id),
-        "image_size": [int(width), int(height)],
-        "assets": {
-            "clean_rgb": str(clean_rgb_path),
-            "dynamic_mask": str(dynamic_mask_path),
-            "static_guard_mask": str(static_guard_mask_path),
-            "confidence_map": str(confidence_path),
-            "source_count_map": str(source_count_path),
-            "road_mask": str(road_mask_path),
-            "road_visible_mask": str(road_visible_mask_path),
-            "road_full_mask": str(road_full_mask_path),
-            "global_road_full_mask": str(global_road_mask_path),
-            **({"semantic_road_estimator_mask": str(semantic_road_mask_path)} if semantic_road_mask_path else {}),
-            "road_mesh": str(road_mesh),
-            "structures_mesh": str(structures_mesh),
-            "far_mesh": str(far_mesh),
-        },
-        "quality": {
-            "source_frame_count": len(source_rgbs),
-            "target_dynamic_fraction": float(np.mean(target_mask)),
-            "road_fraction": float(np.mean(road_mask)),
-            "road_visible_fraction": float(np.mean(road_visible_mask)),
-            "road_full_fraction": float(np.mean(road_full_mask)),
-            "road_mask_source": (
-                "semantic_estimator"
-                if semantic_road_estimator_used
-                else ("semantic_multiframe" if road_frame_count > 0 else "semantic_target_or_empty")
-            ),
-            "road_semantic_frame_count": int(road_frame_count),
-            "mean_confidence": float(np.mean(confidence)),
-            "background_mode": "road_target_frame",
-            "road_semantics_disabled": bool(disable_road_semantics),
-        },
-        "road_plane": road_plane,
-    }
-    depth_calibration_mask = road_visible_mask & (~target_mask)
-    if int(np.count_nonzero(depth_calibration_mask)) < min(128, max(16, int(depth_calibration_mask.size // 64))):
-        depth_calibration_mask = (~target_mask) & (~static_guard_mask)
-    depth_asset = _try_generate_depth_background_asset_from_estimator(
-        clean_rgb_path=clean_rgb_path,
-        output_dir=output_dir,
-        target_frame_id=target_frame_id,
-        camera_trajectory_path=camera_trajectory_path,
-        depth_maps_dir=depth_maps_dir,
-        calibration_mask=depth_calibration_mask,
-        grid_stride=grid_stride,
-        clean_depth_estimator=clean_depth_estimator,
-    )
-    if not depth_asset:
-        depth_asset = _try_generate_depth_background_asset(
-            clean_rgb_path=clean_rgb_path,
-            output_dir=output_dir,
-            target_frame_id=target_frame_id,
-            depth_maps_dir=depth_maps_dir,
-            camera_trajectory_path=camera_trajectory_path,
-            grid_stride=grid_stride,
-        )
-    if depth_asset:
-        manifest["schema"] = "guanwu.target_frame_background_assets.v2"
-        manifest["assets"].update(depth_asset["assets"])
-        manifest["quality"].update(depth_asset["quality"])
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"manifest_path": str(manifest_path), "mesh_dir": str(mesh_dir)}
-
 
 def load_background_asset_meshes(
     background_assets_manifest: str | Path | None,
-    *,
-    road_geometry_path: str | Path | None = None,
-    camera_trajectory_path: str | Path | None = None,
 ) -> list[tuple[str, Path]]:
     if not background_assets_manifest:
         return []
@@ -702,188 +500,111 @@ def load_background_asset_meshes(
         return []
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     assets = data.get("assets", {})
-    background_mesh = assets.get("background_mesh") or assets.get("global_fused_background_mesh")
+    background_mesh = assets.get("background_mesh")
     if background_mesh:
         path = Path(background_mesh)
         if path.exists():
-            if "road_surface_mesh" in assets or "static_background_mesh" in assets:
-                assets.pop("road_surface_mesh", None)
-                assets.pop("static_background_mesh", None)
-                manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             return [("background", path)]
     depth_bg = assets.get("depth_background_glb") or assets.get("depth_background_mesh")
     if depth_bg:
         path = Path(depth_bg)
         if path.exists():
-            multiframe_assets = _build_multiframe_global_background_assets(
-                manifest_path=manifest_path,
-                manifest=data,
-                depth_background_path=path,
-                road_geometry_path=road_geometry_path,
-                camera_trajectory_path=camera_trajectory_path,
-            )
-            if multiframe_assets:
-                return multiframe_assets
             return [("depth_background", path)]
     tabletop_mesh = assets.get("tabletop_mesh") or assets.get("task_background_mesh")
     if tabletop_mesh:
         path = Path(tabletop_mesh)
         if path.exists():
             return [("tabletop", path)]
-    ordered = [
-        ("road", assets.get("road_mesh")),
-        ("structures", assets.get("structures_mesh")),
-        ("far", assets.get("far_mesh")),
-    ]
-    out: list[tuple[str, Path]] = []
-    for name, raw in ordered:
-        if not raw:
-            continue
-        path = Path(raw)
-        if path.exists():
-            out.append((name, path))
-    return out
+    return []
 
 
-def _build_multiframe_global_background_assets(
-    *,
-    manifest_path: Path,
-    manifest: dict[str, Any],
-    depth_background_path: Path,
+def ensure_road_plane_fused_background_asset(
+    background_assets_manifest: str | Path | None,
     road_geometry_path: str | Path | None,
-    camera_trajectory_path: str | Path | None,
-) -> list[tuple[str, Path]] | None:
-    if not road_geometry_path or not camera_trajectory_path:
+) -> dict[str, Any] | None:
+    if not background_assets_manifest or not road_geometry_path:
         return None
-    assets = manifest.get("assets", {})
-    clean_rgb_path = assets.get("clean_rgb")
-    if not clean_rgb_path:
+    manifest_path = Path(background_assets_manifest)
+    road_path = Path(road_geometry_path)
+    if not manifest_path.exists() or not road_path.exists():
         return None
-    clean_rgb_file = Path(clean_rgb_path)
-    if not clean_rgb_file.exists():
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        road_geometry = json.loads(road_path.read_text(encoding="utf-8"))
+    except Exception:
         return None
-    target_frame_id = int(manifest.get("target_frame_id", 0) or 0)
-    if target_frame_id <= 0:
+    quality = manifest.get("quality") if isinstance(manifest.get("quality"), dict) else {}
+    requested_mode = str(quality.get("requested_background_mode") or "").strip().lower()
+    prompt_profile = str(quality.get("scene_prompt_profile") or "").strip().lower()
+    if requested_mode != "road" and prompt_profile != "road":
         return None
-    road_geometry = _load_json(road_geometry_path)
-    road_plane = select_road_plane_for_frame(road_geometry, target_frame_id, policy="global_for_fixed_camera")
-    camera = _camera_for_frame(camera_trajectory_path, target_frame_id)
-    if not road_plane or camera is None:
+    plane = road_geometry.get("global_plane") if isinstance(road_geometry, dict) else None
+    if not isinstance(plane, dict):
         return None
-    depth_maps_dir = resolve_depth_maps_dir(road_geometry.get("depth_maps_dir"))
-    if depth_maps_dir is None:
+    normal = np.asarray(plane.get("normal_world") or [], dtype=np.float64).reshape(-1)
+    if normal.shape != (3,):
         return None
-    depth_files = _depth_map_files(depth_maps_dir)
-    if not depth_files:
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-8 or not math.isfinite(norm):
+        return None
+    normal = normal / norm
+    try:
+        offset = float(plane.get("offset"))
+    except Exception:
         return None
 
-    out_dir = depth_background_path.parent
-    background_out = out_dir / "background_global_fused_v1.glb"
-    mask_out = out_dir / "road_support_global_multiframe_v1.png"
+    assets = manifest.get("assets") if isinstance(manifest.get("assets"), dict) else {}
+    depth_bg = assets.get("depth_background_glb") or assets.get("depth_background_mesh")
+    if not depth_bg:
+        return None
+    depth_bg_path = Path(depth_bg)
+    if not depth_bg_path.exists():
+        return None
+    fused_path = depth_bg_path.parent / "background_global_fused_v1.glb"
+    source_mtime = max(depth_bg_path.stat().st_mtime, road_path.stat().st_mtime)
     try:
-        source_mtimes = [
-            Path(__file__).stat().st_mtime,
-            clean_rgb_file.stat().st_mtime,
-            depth_background_path.stat().st_mtime,
-            Path(road_geometry_path).stat().st_mtime,
-            Path(camera_trajectory_path).stat().st_mtime,
-            manifest_path.stat().st_mtime,
-        ]
-        for key in ("global_road_full_mask", "road_full_mask", "road_mask", "dynamic_mask", "static_guard_mask"):
-            raw = assets.get(key)
-            if raw and Path(raw).exists():
-                source_mtimes.append(Path(raw).stat().st_mtime)
-        source_mtimes.extend(path.stat().st_mtime for path in depth_files)
-        source_mtime = max(source_mtimes)
-        if background_out.exists() and background_out.stat().st_mtime >= source_mtime:
-            return [("background", background_out)]
+        if fused_path.exists() and fused_path.stat().st_mtime >= source_mtime:
+            assets_for_update = manifest.setdefault("assets", {})
+            assets_for_update["background_mesh"] = str(depth_bg_path)
+            assets_for_update["visual_background_mesh"] = str(depth_bg_path)
+            assets_for_update["global_fused_background_mesh"] = str(fused_path)
+            quality = manifest.setdefault("quality", {})
+            quality["background_mode"] = "depth_mesh_with_road_plane_support"
+            quality["road_depth_source"] = "global_road_plane_support_only"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            return {"path": str(fused_path), "reused": True}
     except OSError:
         pass
 
     try:
-        rgb = np.asarray(Image.open(clean_rgb_file).convert("RGB"))
+        import trimesh
+
+        mesh = trimesh.load(str(depth_bg_path), force="mesh")
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+            return None
+        signed = vertices @ normal + offset
+        mesh.vertices = vertices - signed[:, None] * normal.reshape(1, 3)
+        mesh.export(str(fused_path))
     except Exception:
         return None
-    height, width = rgb.shape[:2]
-    road_mask = _read_optional_mask(
-        assets.get("global_road_full_mask") or assets.get("road_full_mask") or assets.get("road_mask"),
-        (height, width),
-    )
-    dynamic_mask = _read_optional_mask(assets.get("dynamic_mask"), (height, width))
-    static_guard_mask = _read_optional_mask(assets.get("static_guard_mask"), (height, width))
 
-    depth_stack = _load_depth_stack_for_shape(depth_files, (height, width))
-    if depth_stack is None:
-        return None
-    road_support = _semantic_road_support_mask(
-        road_mask=road_mask,
-        dynamic_mask=dynamic_mask,
-        static_guard_mask=static_guard_mask,
-        shape=(height, width),
-    )
-    if int(np.count_nonzero(road_support)) == 0:
-        return None
-
-    static_remove_radius = max(1, min(2, int(round(width * 0.003))))
-    static_remove_kernel = np.ones((static_remove_radius * 2 + 1, static_remove_radius * 2 + 1), dtype=np.uint8)
-    static_remove = cv2.dilate(road_support.astype(np.uint8), static_remove_kernel, iterations=1) > 0
-    if dynamic_mask is not None:
-        near_road = cv2.dilate(road_support.astype(np.uint8), np.ones((13, 13), dtype=np.uint8), iterations=1) > 0
-        static_remove |= dynamic_mask & near_road
-    road_surface_mask = _road_surface_mask_for_static_gap(
-        road_support=road_support,
-        static_remove=static_remove,
-        static_guard_mask=static_guard_mask,
-    )
-    seam_pixels = int(np.count_nonzero(road_surface_mask & ~road_support))
-
-    static_depth = _robust_multiframe_depth(depth_stack)
-    final_depth = static_depth.copy()
-    road_plane_depth = _road_plane_depth_map_for_mask(
-        road_mask=road_surface_mask,
-        camera=camera,
-        road_plane=road_plane,
-    )
-    road_depth_valid = np.isfinite(road_plane_depth) & (road_plane_depth > 1e-6)
-    road_surface_valid = road_surface_mask & road_depth_valid
-    if int(np.count_nonzero(road_surface_valid)) == 0:
-        return None
-    static_valid = np.isfinite(static_depth) & (static_depth > 1e-6)
-    static_mask = static_valid & (~road_surface_mask)
-    final_depth[road_surface_valid] = road_plane_depth[road_surface_valid]
-    final_valid = static_mask | road_surface_valid
-    background_mesh = _build_masked_depth_mesh(
-        rgb=rgb,
-        depth=final_depth,
-        mask=final_valid,
-        camera=camera,
-        grid_stride=4,
-        max_depth=120.0,
-    )
-    if background_mesh is None:
-        return None
-
-    try:
-        background_mesh.export(str(background_out))
-        Image.fromarray((road_support.astype(np.uint8) * 255)).save(mask_out)
-        manifest.setdefault("assets", {})["background_mesh"] = str(background_out)
-        manifest["assets"]["global_fused_background_mesh"] = str(background_out)
-        manifest["assets"]["road_support_mask"] = str(mask_out)
-        manifest["assets"].pop("road_surface_mesh", None)
-        manifest["assets"].pop("static_background_mesh", None)
-        quality = manifest.setdefault("quality", {})
-        quality["background_mode"] = "global_fused_single_mesh"
-        quality["road_depth_source"] = "global_road_plane"
-        quality["static_depth_source"] = "robust_multiframe_depth"
-        quality["road_surface_extra_seam_pixels"] = seam_pixels
-        quality["road_surface_mask_fraction"] = float(np.mean(road_surface_mask))
-        quality["static_background_removed_fraction"] = float(np.mean(road_surface_mask))
-        quality["background_mesh_vertex_count"] = int(len(background_mesh.vertices))
-        quality["background_mesh_face_count"] = int(len(background_mesh.faces))
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        return None
-    return [("background", background_out)]
+    updated_assets = manifest.setdefault("assets", {})
+    updated_assets["background_mesh"] = str(depth_bg_path)
+    updated_assets["visual_background_mesh"] = str(depth_bg_path)
+    updated_assets["global_fused_background_mesh"] = str(fused_path)
+    updated_quality = manifest.setdefault("quality", {})
+    updated_quality["background_mode"] = "depth_mesh_with_road_plane_support"
+    updated_quality["road_support_source"] = "geometric_depth_plane"
+    updated_quality["road_depth_source"] = "global_road_plane_support_only"
+    updated_quality["static_depth_source"] = str(quality.get("depth_background_source") or "clean_background_depth")
+    updated_quality["road_surface_mask_fraction"] = 1.0
+    updated_quality["global_fused_background_mesh"] = str(fused_path)
+    updated_quality["global_fused_road_plane_source"] = str(plane.get("source") or "global_plane")
+    updated_quality["global_fused_road_plane_normal_world"] = [float(v) for v in normal.tolist()]
+    updated_quality["global_fused_road_plane_offset"] = float(offset)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"path": str(fused_path), "reused": False}
 
 
 def _depth_map_files(depth_maps_dir: Path) -> list[Path]:
@@ -905,41 +626,6 @@ def _read_optional_mask(path: str | Path | None, shape: tuple[int, int]) -> np.n
     if mask.shape != shape:
         mask = cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask > 0
-
-
-def _run_semantic_road_estimator(
-    estimator: Callable[..., Any] | None,
-    *,
-    clean_rgb_path: Path,
-    frame_id: int,
-    image_shape: tuple[int, int],
-) -> np.ndarray | None:
-    if estimator is None:
-        return None
-    try:
-        result = estimator(clean_rgb_path, frame_id=int(frame_id))
-    except TypeError:
-        result = estimator(clean_rgb_path)
-    except Exception:
-        return None
-    if result is None:
-        return None
-    mask_value = result.get("mask") if isinstance(result, dict) else result
-    if mask_value is None:
-        return None
-    if isinstance(mask_value, (str, Path)):
-        return _read_optional_mask(mask_value, image_shape)
-    try:
-        mask = np.asarray(mask_value)
-    except Exception:
-        return None
-    if mask.ndim == 3:
-        mask = mask[:, :, 0]
-    if mask.ndim != 2:
-        return None
-    if mask.shape != image_shape:
-        mask = cv2.resize(mask.astype(np.uint8), (image_shape[1], image_shape[0]), interpolation=cv2.INTER_NEAREST)
-    return mask.astype(bool)
 
 
 def _build_task_foreground_mask_for_frames(
@@ -1169,277 +855,6 @@ def run_openai_image_edit_background_cleaner(
     }
 
 
-def _load_sidecar_road_mask(
-    entry: dict[str, Any],
-    detections: dict[str, Any],
-    shape: tuple[int, int],
-    *,
-    summary_path: Path | None = None,
-) -> np.ndarray:
-    candidates: list[Path] = []
-    for key in ("road_mask", "road_visible_mask", "road_full_mask"):
-        raw = entry.get(key) or detections.get(key)
-        if raw:
-            candidates.append(Path(raw))
-    det_path = entry.get("detections")
-    if det_path:
-        frame_dir = Path(det_path).parent
-        candidates.extend(
-            [
-                frame_dir / "road" / "road_mask.png",
-                frame_dir / "road_mask.png",
-                frame_dir / "road_visible_mask.png",
-            ]
-        )
-    frame_id = int(entry.get("frame_idx") or detections.get("frame_idx") or 0)
-    if summary_path is not None and frame_id > 0:
-        project_outputs = _find_project_outputs_dir(summary_path)
-        if project_outputs is not None:
-            candidates.extend(
-                [
-                    project_outputs / "road_gsam2_probe" / f"frame_{frame_id:06d}" / "road_mask.png",
-                    project_outputs / "road_gsam2_probe" / f"frame_{frame_id:06d}" / "road_visible_mask.png",
-                ]
-            )
-    out = np.zeros(shape, dtype=bool)
-    for candidate in candidates:
-        mask = _read_optional_mask(candidate, shape)
-        if mask is not None:
-            out |= mask
-    return _clean_semantic_road_mask(out) if out.any() else out
-
-
-def _find_project_outputs_dir(path: Path) -> Path | None:
-    current = Path(path).resolve()
-    for parent in [current.parent, *current.parents]:
-        if parent.name == "outputs":
-            return parent
-    return None
-
-
-def _is_road_label(label: str) -> bool:
-    text = str(label or "").lower()
-    if any(token in text for token in NON_ROAD_STATIC_LABELS):
-        return False
-    return any(token in text for token in ROAD_LABELS)
-
-
-def _clean_semantic_road_mask(mask: np.ndarray) -> np.ndarray:
-    road = mask.astype(bool)
-    if not road.any():
-        return road
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8)) > 0
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)) > 0
-    return _bottom_connected_mask(road)
-
-
-def _is_usable_semantic_road_mask(mask: np.ndarray) -> bool:
-    if mask is None or not mask.any():
-        return False
-    height, width = mask.shape[:2]
-    area = float(np.mean(mask))
-    if area < 0.005 or area > 0.85:
-        return False
-    bottom_band = mask[int(round(height * 0.75)) :, :]
-    if float(np.mean(bottom_band)) < 0.01:
-        return False
-    return True
-
-
-def _global_road_mask_from_votes(
-    *,
-    visible_votes: np.ndarray,
-    full_votes: np.ndarray,
-    frame_count: int,
-    target_fallback: np.ndarray,
-    static_guard_mask: np.ndarray,
-) -> np.ndarray:
-    shape = target_fallback.shape[:2]
-    guard = static_guard_mask.astype(bool) if static_guard_mask.shape == shape else np.zeros(shape, dtype=bool)
-    if frame_count <= 0:
-        out = target_fallback.astype(bool).copy()
-        out &= ~guard
-        return _clean_semantic_road_mask(out) if out.any() else out
-    visible_votes = visible_votes.astype(np.uint16)
-    full_votes = full_votes.astype(np.uint16)
-    threshold = max(1, int(math.ceil(float(frame_count) * 0.35)))
-    road = full_votes >= threshold
-    road |= visible_votes >= 1
-    road &= ~guard
-    if target_fallback.any():
-        road |= target_fallback.astype(bool) & ~guard
-    if not road.any():
-        return road
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((7, 7), dtype=np.uint8)) > 0
-    road = expand_road_mask_with_side_boundaries(road, static_guard_mask=guard)
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)) > 0
-    road &= ~guard
-    return _bottom_connected_mask(road)
-
-
-def _load_depth_stack_for_shape(depth_files: list[Path], shape: tuple[int, int], *, max_frames: int = 96) -> np.ndarray | None:
-    if not depth_files:
-        return None
-    if len(depth_files) > max_frames:
-        indices = np.linspace(0, len(depth_files) - 1, max_frames, dtype=int)
-        selected = [depth_files[int(index)] for index in indices]
-    else:
-        selected = depth_files
-    depth_maps: list[np.ndarray] = []
-    height, width = shape
-    for path in selected:
-        try:
-            depth = np.load(str(path)).astype(np.float64)
-        except Exception:
-            continue
-        if depth.ndim == 3:
-            depth = depth[0]
-        if depth.ndim != 2:
-            continue
-        if depth.shape != (height, width):
-            depth = cv2.resize(depth.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float64)
-        depth_maps.append(depth)
-    if not depth_maps:
-        return None
-    return np.stack(depth_maps, axis=0)
-
-
-def _semantic_road_support_mask(
-    *,
-    road_mask: np.ndarray | None,
-    dynamic_mask: np.ndarray | None,
-    static_guard_mask: np.ndarray | None,
-    shape: tuple[int, int],
-) -> np.ndarray:
-    if road_mask is None or road_mask.shape != shape:
-        return np.zeros(shape, dtype=bool)
-    road = road_mask.astype(bool).copy()
-    static_guard = _expand_static_guard_mask(static_guard_mask, shape)
-    if static_guard is not None:
-        road &= ~static_guard
-    if dynamic_mask is not None and dynamic_mask.shape == shape and dynamic_mask.any() and road.any():
-        corridor = _road_corridor_from_seed(road, shape)
-        near_road = cv2.dilate(road.astype(np.uint8), np.ones((17, 17), dtype=np.uint8), iterations=1) > 0
-        fill = dynamic_mask.astype(bool) & near_road
-        if corridor is not None:
-            fill &= corridor
-        if static_guard is not None:
-            fill &= ~static_guard
-        road |= fill
-    if not road.any():
-        return road
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8)) > 0
-    road = expand_road_mask_with_side_boundaries(road, static_guard_mask=static_guard)
-    road = cv2.morphologyEx(road.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)) > 0
-    road = _bottom_connected_mask(road)
-    if static_guard is not None:
-        road &= ~static_guard
-    return road
-
-
-def _road_surface_mask_for_static_gap(
-    *,
-    road_support: np.ndarray,
-    static_remove: np.ndarray,
-    static_guard_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    road = road_support.astype(bool).copy()
-    if static_remove is None or static_remove.shape != road.shape:
-        return road
-    seam_ring = static_remove.astype(bool) & ~road
-    if static_guard_mask is not None and static_guard_mask.shape == road.shape:
-        seam_ring &= ~static_guard_mask.astype(bool)
-    if seam_ring.any():
-        road |= seam_ring
-    return road
-
-
-def _estimate_global_road_plane_from_semantic_depth(
-    *,
-    road_mask: np.ndarray,
-    target_frame_id: int,
-    depth_maps_dir: str | Path | None,
-    camera_trajectory_path: str | Path | None,
-) -> dict[str, Any] | None:
-    if road_mask is None or not road_mask.any() or not depth_maps_dir or not camera_trajectory_path:
-        return None
-    shape = road_mask.shape[:2]
-    depth_dir = resolve_depth_maps_dir(depth_maps_dir)
-    if depth_dir is None:
-        return None
-    depth_files = _depth_map_files(depth_dir)
-    if not depth_files:
-        return None
-    camera = _camera_for_frame(camera_trajectory_path, int(target_frame_id))
-    if camera is None:
-        return None
-
-    if len(depth_files) > 96:
-        indices = np.linspace(0, len(depth_files) - 1, 96, dtype=int)
-        depth_files = [depth_files[int(index)] for index in indices]
-    planes: list[tuple[np.ndarray, float, dict[str, float]]] = []
-    sample_mask = road_mask.astype(bool)
-    min_samples = min(512, max(80, int(sample_mask.size // 128)))
-    for depth_path in depth_files:
-        try:
-            depth = np.load(str(depth_path)).astype(np.float64)
-        except Exception:
-            continue
-        if depth.ndim == 3:
-            depth = depth[0]
-        if depth.ndim != 2:
-            continue
-        if depth.shape != shape:
-            depth = cv2.resize(depth.astype(np.float32), (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR).astype(np.float64)
-        valid = sample_mask & np.isfinite(depth) & (depth > 1e-6)
-        if int(np.count_nonzero(valid)) < min_samples:
-            continue
-        points = _camera_depth_points_for_mask(depth, valid, camera)
-        fit = _fit_plane_from_world_points(points)
-        if fit is None:
-            continue
-        normal, offset, stats = fit
-        planes.append((normal, offset, stats))
-    if not planes:
-        return None
-
-    normals = np.stack([item[0] for item in planes], axis=0)
-    reference = normals[0]
-    for idx in range(len(normals)):
-        if float(normals[idx] @ reference) < 0.0:
-            normals[idx] = -normals[idx]
-    weights = np.asarray(
-        [max(1e-3, item[2]["inlier_ratio"] / max(item[2]["rmse_m"], 1e-3)) for item in planes],
-        dtype=np.float64,
-    )
-    normal = np.sum(normals * weights[:, None], axis=0) / max(float(np.sum(weights)), 1e-8)
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-8:
-        return None
-    normal = normal / norm
-    offsets = np.asarray([item[1] for item in planes], dtype=np.float64)
-    offset = _weighted_quantile(offsets, weights, 0.5)
-    scene_up = np.asarray([0.0, -1.0, 0.0], dtype=np.float64)
-    if float(normal @ scene_up) < 0.0:
-        normal = -normal
-        offset = -float(offset)
-    return {
-        "source": "weighted_keyframe_mean+semantic_bg_depth_tar",
-        "normal_world": [float(v) for v in normal],
-        "offset": float(offset),
-        "quality": {
-            "keyframe_count": int(len(planes)),
-            "mean_inlier_ratio": float(np.mean([item[2]["inlier_ratio"] for item in planes])),
-            "mean_rmse_m": float(np.mean([item[2]["rmse_m"] for item in planes])),
-        },
-        "selection": {
-            "mode": "global",
-            "policy": "global_for_fixed_camera",
-            "target_frame_id": int(target_frame_id),
-        },
-    }
-
-
 def _camera_depth_points_for_mask(depth: np.ndarray, mask: np.ndarray, camera: dict[str, Any]) -> np.ndarray:
     ys, xs = np.nonzero(mask)
     if len(xs) > 50000:
@@ -1508,370 +923,6 @@ def _fit_plane_from_world_points(points: np.ndarray) -> tuple[np.ndarray, float,
         "rmse_m": float(np.sqrt(np.mean(residual_in**2))),
         "p95_abs_m": float(np.percentile(np.abs(residual_in), 95)),
     }
-
-
-def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
-    values = np.asarray(values, dtype=np.float64)
-    weights = np.maximum(np.asarray(weights, dtype=np.float64), 0.0)
-    if len(values) == 0:
-        return 0.0
-    order = np.argsort(values)
-    values = values[order]
-    weights = weights[order]
-    total = float(np.sum(weights))
-    if total <= 1e-12:
-        return float(np.median(values))
-    cdf = np.cumsum(weights) / total
-    idx = int(np.searchsorted(cdf, float(quantile), side="left"))
-    idx = max(0, min(idx, len(values) - 1))
-    return float(values[idx])
-
-
-def _expand_static_guard_mask(static_guard_mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-    if static_guard_mask is None or static_guard_mask.shape != shape:
-        return None
-    guard = static_guard_mask.astype(bool)
-    if not guard.any():
-        return None
-    height, width = shape
-    radius = max(1, int(round(min(height, width) * 0.006)))
-    kernel = np.ones((radius * 2 + 1, radius * 2 + 1), dtype=np.uint8)
-    return cv2.dilate(guard.astype(np.uint8), kernel, iterations=1) > 0
-
-
-def _fit_boundary_line(rows: np.ndarray, xs: np.ndarray) -> tuple[float, float] | None:
-    rows = np.asarray(rows, dtype=np.float64)
-    xs = np.asarray(xs, dtype=np.float64)
-    if len(rows) != len(xs) or len(rows) < 2:
-        return None
-    keep = np.ones(len(rows), dtype=bool)
-    coeff: np.ndarray | None = None
-    for _ in range(3):
-        if int(np.count_nonzero(keep)) < 2:
-            break
-        try:
-            coeff = np.polyfit(rows[keep], xs[keep], 1)
-        except Exception:
-            return None
-        fitted = np.polyval(coeff, rows)
-        residual = xs - fitted
-        med = float(np.median(residual[keep]))
-        mad = float(np.median(np.abs(residual[keep] - med)))
-        keep = np.abs(residual - med) <= max(3.0, mad * 3.0)
-    if coeff is None or not np.isfinite(coeff).all():
-        return None
-    return float(coeff[0]), float(coeff[1])
-
-
-def _road_corridor_from_seed(seed_mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-    if seed_mask is None or seed_mask.shape != shape:
-        return None
-    seed = seed_mask.astype(bool)
-    height, width = shape
-    row_bounds: list[tuple[int, float, float]] = []
-    min_width = max(6.0, width * 0.05)
-    for y in range(height):
-        xs = np.flatnonzero(seed[y])
-        if len(xs) < min_width:
-            continue
-        row_bounds.append((y, float(xs.min()), float(xs.max())))
-    if len(row_bounds) < 2:
-        return None
-    rows = np.array([item[0] for item in row_bounds], dtype=np.float64)
-    left = np.array([item[1] for item in row_bounds], dtype=np.float64)
-    right = np.array([item[2] for item in row_bounds], dtype=np.float64)
-    all_rows = np.arange(height, dtype=np.float64)
-    left_interp = np.interp(all_rows, rows, left, left[0], left[-1])
-    right_interp = np.interp(all_rows, rows, right, right[0], right[-1])
-    width_interp = np.maximum(right_interp - left_interp + 1.0, 1.0)
-    margin = np.clip(width_interp * 0.18, 3.0, max(4.0, width * 0.08))
-    # Avoid extrapolating a bottom-row road seed into the far sky/structures.
-    top_seed = int(rows.min())
-    top_margin = max(4, int(round(height * 0.08)))
-    valid_rows = all_rows >= max(0, top_seed - top_margin)
-    xx = np.arange(width, dtype=np.float64)[None, :]
-    corridor = (xx >= (left_interp[:, None] - margin[:, None])) & (xx <= (right_interp[:, None] + margin[:, None]))
-    corridor &= valid_rows[:, None]
-    return corridor
-
-
-def _signed_distance_images_to_plane(depth_stack: np.ndarray, camera: dict[str, Any], road_plane: dict[str, Any]) -> np.ndarray:
-    depth_stack = np.asarray(depth_stack, dtype=np.float64)
-    frame_count, height, width = depth_stack.shape
-    fx = float(camera.get("fx", max(width, height) * 0.8))
-    fy = float(camera.get("fy", max(width, height) * 0.8))
-    cx = float(camera.get("cx", width * 0.5))
-    cy = float(camera.get("cy", height * 0.5))
-    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
-    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
-    normal = np.asarray(road_plane.get("normal_world", [0.0, 1.0, 0.0]), dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-8:
-        return np.full((frame_count, height, width), np.nan, dtype=np.float64)
-    normal = normal / norm
-    offset = float(road_plane.get("offset", 0.0))
-    yy, xx = np.indices((height, width), dtype=np.float64)
-    ray_x = (xx - cx) / max(abs(fx), 1e-8)
-    ray_y = (yy - cy) / max(abs(fy), 1e-8)
-    ray_cam = np.stack([ray_x, ray_y, np.ones_like(ray_x)], axis=-1)
-    ray_world_dot = (ray_cam.reshape(-1, 3) @ rotation.T @ normal).reshape(height, width)
-    origin_dot = float(translation @ normal) + offset
-    return depth_stack * ray_world_dot[None, :, :] + origin_dot
-
-
-def _bottom_connected_mask(mask: np.ndarray) -> np.ndarray:
-    mask_u8 = mask.astype(np.uint8)
-    num, labels = cv2.connectedComponents(mask_u8, connectivity=8)
-    if num <= 1:
-        return mask.astype(bool)
-    bottom_labels = np.unique(labels[max(0, labels.shape[0] - 3) :, :])
-    bottom_labels = bottom_labels[bottom_labels > 0]
-    if len(bottom_labels) == 0:
-        areas = np.bincount(labels.reshape(-1), minlength=num)
-        areas[0] = 0
-        keep = int(np.argmax(areas))
-        return labels == keep
-    return np.isin(labels, bottom_labels)
-
-
-def _fill_internal_holes(mask: np.ndarray) -> np.ndarray:
-    out = mask.astype(bool).copy()
-    if not out.any():
-        return out
-    inv = (~out).astype(np.uint8)
-    num, labels = cv2.connectedComponents(inv, connectivity=8)
-    if num <= 1:
-        return out
-    height, width = out.shape[:2]
-    border_labels = set(int(v) for v in np.unique(labels[0, :]))
-    border_labels.update(int(v) for v in np.unique(labels[height - 1, :]))
-    border_labels.update(int(v) for v in np.unique(labels[:, 0]))
-    border_labels.update(int(v) for v in np.unique(labels[:, width - 1]))
-    for label in range(1, num):
-        if label in border_labels:
-            continue
-        out[labels == label] = True
-    return out
-
-
-def _robust_multiframe_depth(depth_stack: np.ndarray) -> np.ndarray:
-    depth = np.asarray(depth_stack, dtype=np.float64)
-    depth = np.where(np.isfinite(depth) & (depth > 1e-6), depth, np.nan)
-    with np.errstate(all="ignore"):
-        median = np.nanmedian(depth, axis=0)
-    return median.astype(np.float64)
-
-
-def _build_masked_depth_mesh(
-    *,
-    rgb: np.ndarray,
-    depth: np.ndarray,
-    mask: np.ndarray,
-    camera: dict[str, Any],
-    grid_stride: int,
-    max_depth: float,
-):
-    import trimesh
-    from trimesh.visual import ColorVisuals
-
-    height, width = depth.shape
-    stride = max(1, int(grid_stride))
-    xs = list(range(0, width, stride))
-    ys = list(range(0, height, stride))
-    if xs[-1] != width - 1:
-        xs.append(width - 1)
-    if ys[-1] != height - 1:
-        ys.append(height - 1)
-
-    fx = float(camera.get("fx", max(width, height) * 0.8))
-    fy = float(camera.get("fy", max(width, height) * 0.8))
-    cx = float(camera.get("cx", width * 0.5))
-    cy = float(camera.get("cy", height * 0.5))
-    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
-    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
-
-    vertices: list[list[float]] = []
-    colors: list[list[int]] = []
-    valid_index: dict[tuple[int, int], int] = {}
-    mask = mask.astype(bool)
-    for yi, y in enumerate(ys):
-        for xi, x in enumerate(xs):
-            d = float(depth[y, x])
-            if not mask[y, x] or not math.isfinite(d) or d <= 0.01 or d > max_depth:
-                continue
-            point_cam = np.array([(float(x) - cx) * d / fx, (float(y) - cy) * d / fy, d], dtype=np.float64)
-            point_world = rotation @ point_cam + translation
-            valid_index[(yi, xi)] = len(vertices)
-            vertices.append([float(value) for value in point_world])
-            colors.append([int(value) for value in rgb[y, x, :3]] + [255])
-
-    faces: list[list[int]] = []
-    for yi in range(len(ys) - 1):
-        for xi in range(len(xs) - 1):
-            keys = [(yi, xi), (yi, xi + 1), (yi + 1, xi), (yi + 1, xi + 1)]
-            if any(key not in valid_index for key in keys):
-                continue
-            y_mid = int(round((ys[yi] + ys[yi + 1]) * 0.5))
-            x_mid = int(round((xs[xi] + xs[xi + 1]) * 0.5))
-            if not mask[min(max(y_mid, 0), height - 1), min(max(x_mid, 0), width - 1)]:
-                continue
-            z_values = [float(depth[ys[key[0]], xs[key[1]]]) for key in keys]
-            if max(z_values) / max(min(z_values), 1e-6) > 1.8:
-                continue
-            v00 = valid_index[(yi, xi)]
-            v10 = valid_index[(yi, xi + 1)]
-            v01 = valid_index[(yi + 1, xi)]
-            v11 = valid_index[(yi + 1, xi + 1)]
-            faces.append([v00, v10, v11])
-            faces.append([v00, v11, v01])
-
-    if not vertices or not faces:
-        return None
-    mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=np.float32), faces=np.asarray(faces, dtype=np.int64), process=False)
-    mesh.visual = ColorVisuals(mesh=mesh, vertex_colors=np.asarray(colors, dtype=np.uint8))
-    return mesh
-
-
-def _project_world_vertices_to_image(vertices: np.ndarray, image_shape: tuple[int, int], camera: dict[str, Any]) -> dict[str, np.ndarray]:
-    height, width = image_shape
-    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
-    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
-    fx = float(camera.get("fx", max(width, height) * 0.8))
-    fy = float(camera.get("fy", max(width, height) * 0.8))
-    cx = float(camera.get("cx", width * 0.5))
-    cy = float(camera.get("cy", height * 0.5))
-    points_cam = (rotation.T @ (np.asarray(vertices, dtype=np.float64) - translation).T).T
-    z = points_cam[:, 2]
-    valid = np.isfinite(points_cam).all(axis=1) & (z > 1e-6)
-    u = np.full(len(vertices), -1, dtype=np.int64)
-    v = np.full(len(vertices), -1, dtype=np.int64)
-    u[valid] = np.rint(fx * points_cam[valid, 0] / z[valid] + cx).astype(np.int64)
-    v[valid] = np.rint(fy * points_cam[valid, 1] / z[valid] + cy).astype(np.int64)
-    inside = valid & (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    return {"inside": inside, "u": u, "v": v, "points_cam": points_cam}
-
-
-def _signed_distance_to_plane(points: np.ndarray, road_plane: dict[str, Any]) -> np.ndarray:
-    normal = np.asarray(road_plane.get("normal_world", [0.0, 1.0, 0.0]), dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-8:
-        return np.full(len(points), np.nan, dtype=np.float64)
-    normal = normal / norm
-    offset = float(road_plane.get("offset", 0.0))
-    return np.asarray(points, dtype=np.float64) @ normal + offset
-
-
-def _build_road_surface_mesh_from_mask(
-    *,
-    rgb: np.ndarray,
-    road_mask: np.ndarray,
-    camera: dict[str, Any],
-    road_plane: dict[str, Any],
-    grid_stride: int = 4,
-):
-    import trimesh
-    from trimesh.visual import ColorVisuals
-
-    height, width = road_mask.shape[:2]
-    stride = max(1, int(grid_stride))
-    xs = list(range(0, width, stride))
-    ys = list(range(0, height, stride))
-    if xs[-1] != width - 1:
-        xs.append(width - 1)
-    if ys[-1] != height - 1:
-        ys.append(height - 1)
-
-    vertices: list[np.ndarray] = []
-    colors: list[np.ndarray] = []
-    index: dict[tuple[int, int], int] = {}
-    for yi, y in enumerate(ys):
-        for xi, x in enumerate(xs):
-            if not road_mask[y, x]:
-                continue
-            point = _camera_pixel_ray_plane_intersection(float(x), float(y), camera, road_plane)
-            if point is None:
-                continue
-            index[(yi, xi)] = len(vertices)
-            vertices.append(point)
-            colors.append(rgb[y, x])
-
-    faces: list[list[int]] = []
-    for yi in range(len(ys) - 1):
-        for xi in range(len(xs) - 1):
-            keys = ((yi, xi), (yi + 1, xi), (yi, xi + 1), (yi + 1, xi + 1))
-            if not all(key in index for key in keys):
-                continue
-            y_mid = int(round((ys[yi] + ys[yi + 1]) * 0.5))
-            x_mid = int(round((xs[xi] + xs[xi + 1]) * 0.5))
-            if not road_mask[min(max(y_mid, 0), height - 1), min(max(x_mid, 0), width - 1)]:
-                continue
-            v00 = index[(yi, xi)]
-            v10 = index[(yi + 1, xi)]
-            v01 = index[(yi, xi + 1)]
-            v11 = index[(yi + 1, xi + 1)]
-            faces.append([v00, v10, v11])
-            faces.append([v00, v11, v01])
-    if not vertices or not faces:
-        return None
-    mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=np.float32), faces=np.asarray(faces, dtype=np.int64), process=False)
-    mesh.visual = ColorVisuals(mesh=mesh, vertex_colors=np.asarray(colors, dtype=np.uint8))
-    return mesh
-
-
-def _road_plane_depth_map_for_mask(
-    *,
-    road_mask: np.ndarray,
-    camera: dict[str, Any],
-    road_plane: dict[str, Any],
-) -> np.ndarray:
-    height, width = road_mask.shape[:2]
-    depth = np.full((height, width), np.nan, dtype=np.float64)
-    ys, xs = np.nonzero(road_mask.astype(bool))
-    if len(xs) == 0:
-        return depth
-    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
-    translation = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
-    for y, x in zip(ys.tolist(), xs.tolist(), strict=False):
-        point = _camera_pixel_ray_plane_intersection(float(x), float(y), camera, road_plane)
-        if point is None:
-            continue
-        point_cam = rotation.T @ (np.asarray(point, dtype=np.float64).reshape(3) - translation)
-        z = float(point_cam[2])
-        if math.isfinite(z) and z > 1e-6:
-            depth[int(y), int(x)] = z
-    return depth
-
-
-def _camera_pixel_ray_plane_intersection(
-    x: float,
-    y: float,
-    camera: dict[str, Any],
-    road_plane: dict[str, Any],
-) -> np.ndarray | None:
-    fx = float(camera.get("fx", 1.0))
-    fy = float(camera.get("fy", 1.0))
-    if abs(fx) < 1e-8 or abs(fy) < 1e-8:
-        return None
-    cx = float(camera.get("cx", 0.0))
-    cy = float(camera.get("cy", 0.0))
-    rotation = np.asarray(camera.get("R", np.eye(3)), dtype=np.float64)
-    origin = np.asarray(camera.get("t", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
-    ray_cam = np.array([(x - cx) / fx, (y - cy) / fy, 1.0], dtype=np.float64)
-    ray_world = rotation @ ray_cam
-    normal = np.asarray(road_plane.get("normal_world", [0.0, 1.0, 0.0]), dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(normal))
-    if norm < 1e-8:
-        return None
-    normal = normal / norm
-    offset = float(road_plane.get("offset", 0.0))
-    denom = float(normal @ ray_world)
-    if abs(denom) < 1e-8:
-        return None
-    t = -float(normal @ origin + offset) / denom
-    if not math.isfinite(t) or t <= 1e-6:
-        return None
-    point = origin + ray_world * t
-    return point.astype(np.float64)
 
 
 def generate_depth_background_mesh_assets(
@@ -2389,25 +1440,6 @@ def _build_depth_textured_mesh(
     discontinuity_faces_removed = 0
     long_edge_faces_removed = 0
 
-    def _triangle_is_valid(face: list[int]) -> tuple[bool, str | None]:
-        pts = np.asarray([vertices[int(idx)] for idx in face], dtype=np.float64)
-        z = pts[:, 2]
-        min_depth = max(float(np.min(z)), 1e-6)
-        max_depth = float(np.max(z))
-        if max_depth / min_depth > 1.8 or (max_depth - min_depth) > max(0.12, min_depth * 0.18):
-            return False, "depth_discontinuity"
-        edge_lengths = [
-            float(np.linalg.norm(pts[0] - pts[1])),
-            float(np.linalg.norm(pts[1] - pts[2])),
-            float(np.linalg.norm(pts[2] - pts[0])),
-        ]
-        focal = max(1e-6, min(abs(fx), abs(fy)))
-        expected_grid_edge = min_depth * float(stride) / focal
-        max_reasonable_edge = max(0.08, expected_grid_edge * 4.0)
-        if max(edge_lengths) > max_reasonable_edge:
-            return False, "long_edge"
-        return True, None
-
     for yi in range(len(ys) - 1):
         for xi in range(len(xs) - 1):
             keys = [(yi, xi), (yi, xi + 1), (yi + 1, xi), (yi + 1, xi + 1)]
@@ -2421,14 +1453,8 @@ def _build_depth_textured_mesh(
             if max(z_values) / max(min(z_values), 1e-6) > 1.8:
                 discontinuity_faces_removed += 2
                 continue
-            for face in ([v00, v10, v11], [v00, v11, v01]):
-                valid, reason = _triangle_is_valid(face)
-                if valid:
-                    faces.append(face)
-                elif reason == "long_edge":
-                    long_edge_faces_removed += 1
-                else:
-                    discontinuity_faces_removed += 1
+            faces.append([v00, v10, v11])
+            faces.append([v00, v11, v01])
 
     if not vertices or not faces:
         raise ValueError("Depth background mesh has no valid geometry")
@@ -2553,177 +1579,6 @@ def _weighted_average_rgb(rgbs: list[np.ndarray], weights: list[np.ndarray], fal
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _robust_median_rgb(rgbs: list[np.ndarray], weights: list[np.ndarray], fallback: np.ndarray) -> np.ndarray:
-    stack = np.stack(rgbs, axis=0)
-    wstack = np.stack(weights, axis=0)
-    valid = wstack > 1e-6
-    masked = np.where(valid[..., None], stack, np.nan)
-    median = np.nanmedian(masked, axis=0)
-    out = fallback.astype(np.float32)
-    ok = np.isfinite(median).all(axis=2)
-    out[ok] = median[ok]
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def _confidence_from_weights(weights: list[np.ndarray]) -> np.ndarray:
-    if not weights:
-        return np.zeros((1, 1), dtype=np.float32)
-    total = np.zeros_like(weights[0], dtype=np.float32)
-    count = np.zeros_like(weights[0], dtype=np.float32)
-    for weight in weights:
-        total += weight
-        count += (weight > 1e-6).astype(np.float32)
-    return np.clip((total / max(float(len(weights)), 1.0)) * np.clip(count / 3.0, 0.0, 1.0), 0.0, 1.0)
-
-
-def _fill_low_candidate_dynamic_regions(
-    clean_rgb: np.ndarray,
-    target_rgb: np.ndarray,
-    dynamic_mask: np.ndarray,
-    source_count: np.ndarray,
-) -> np.ndarray:
-    fill_mask = dynamic_mask & (source_count == 0)
-    if not fill_mask.any():
-        return clean_rgb
-    num, labels = cv2.connectedComponents(fill_mask.astype(np.uint8), connectivity=8)
-    out = clean_rgb.copy()
-    reliable = (~dynamic_mask) & (source_count >= 3)
-    for label in range(1, num):
-        region = labels == label
-        area = int(np.count_nonzero(region))
-        if area <= 0 or area > 4000:
-            continue
-        ys, xs = np.where(region)
-        x1, x2 = max(0, int(xs.min()) - 12), min(out.shape[1], int(xs.max()) + 13)
-        y1, y2 = max(0, int(ys.min()) - 12), min(out.shape[0], int(ys.max()) + 13)
-        ring = reliable[y1:y2, x1:x2]
-        if int(np.count_nonzero(ring)) < 8:
-            continue
-        region_center_y = float((ys.min() + ys.max()) * 0.5)
-        use_row_fill = region_center_y < out.shape[0] * 0.55 or area < 1400
-        if use_row_fill:
-            _fill_region_from_horizontal_neighbors(out, region, reliable)
-            _feather_region_edges(out, region)
-            continue
-        local_mask = region[y1:y2, x1:x2].astype(np.uint8) * 255
-        local_rgb = out[y1:y2, x1:x2].copy()
-        try:
-            local_bgr = cv2.cvtColor(local_rgb, cv2.COLOR_RGB2BGR)
-            repaired = cv2.inpaint(local_bgr, local_mask, 3.0, cv2.INPAINT_TELEA)
-            repaired_rgb = cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
-            out[y1:y2, x1:x2][region[y1:y2, x1:x2]] = repaired_rgb[region[y1:y2, x1:x2]]
-        except Exception:
-            colors = out[y1:y2, x1:x2][ring]
-            color = np.median(colors.astype(np.float32), axis=0)
-            out[region] = np.clip(color, 0, 255).astype(np.uint8)
-    return out
-
-
-def _feather_region_edges(out: np.ndarray, region: np.ndarray) -> None:
-    if not region.any():
-        return
-    boundary = region & (cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 3) <= 2.5)
-    if not boundary.any():
-        return
-    try:
-        blurred = np.asarray(Image.fromarray(np.ascontiguousarray(out)).filter(ImageFilter.GaussianBlur(radius=1.0)))
-    except Exception:
-        return
-    out[boundary] = np.clip(out[boundary].astype(np.float32) * 0.55 + blurred[boundary].astype(np.float32) * 0.45, 0, 255).astype(np.uint8)
-
-
-def _fill_region_from_horizontal_neighbors(out: np.ndarray, region: np.ndarray, reliable: np.ndarray) -> None:
-    height, width = region.shape
-    ys, xs = np.where(region)
-    if len(xs) == 0:
-        return
-    x_min = int(xs.min())
-    x_max = int(xs.max())
-    y_min = int(ys.min())
-    y_max = int(ys.max())
-    pad = 24
-    fallback_mask = reliable[max(0, y_min - pad) : min(height, y_max + pad + 1), max(0, x_min - pad) : min(width, x_max + pad + 1)]
-    fallback_rgb = out[max(0, y_min - pad) : min(height, y_max + pad + 1), max(0, x_min - pad) : min(width, x_max + pad + 1)]
-    if fallback_mask.any():
-        fallback_color = np.median(fallback_rgb[fallback_mask].astype(np.float32), axis=0)
-    else:
-        fallback_color = np.median(out[reliable].astype(np.float32), axis=0) if reliable.any() else np.array([96.0, 96.0, 96.0])
-
-    for y in range(y_min, y_max + 1):
-        row = region[y]
-        if not row.any():
-            continue
-        row_x = np.where(row)[0]
-        left_x, left = _sample_side_color(out, reliable, y, int(row_x.min()), -1)
-        right_x, right = _sample_side_color(out, reliable, y, int(row_x.max()), 1)
-
-        if left is not None and right is not None and right_x is not None and left_x is not None and right_x > left_x:
-            alpha = ((row_x.astype(np.float32) - float(left_x)) / float(right_x - left_x))[:, None]
-            colors = left[None, :] * (1.0 - alpha) + right[None, :] * alpha
-        elif left is not None:
-            colors = np.repeat(left[None, :], len(row_x), axis=0)
-        elif right is not None:
-            colors = np.repeat(right[None, :], len(row_x), axis=0)
-        else:
-            colors = np.repeat(fallback_color[None, :], len(row_x), axis=0)
-        out[y, row_x] = np.clip(colors, 0, 255).astype(np.uint8)
-
-
-def _sample_side_color(
-    out: np.ndarray,
-    reliable: np.ndarray,
-    y: int,
-    edge_x: int,
-    direction: int,
-) -> tuple[int | None, np.ndarray | None]:
-    height, width = reliable.shape
-    step = 1 if direction > 0 else -1
-    start = edge_x + step
-    if start < 0 or start >= width:
-        return None, None
-    max_dist = 44
-    sample_span = 14
-    for dist in range(1, max_dist + 1):
-        x = edge_x + step * dist
-        if x < 0 or x >= width:
-            break
-        if not reliable[y, x]:
-            continue
-        if direction > 0:
-            x1, x2 = x, min(width, x + sample_span)
-        else:
-            x1, x2 = max(0, x - sample_span + 1), x + 1
-        y1, y2 = max(0, y - 2), min(height, y + 3)
-        mask = reliable[y1:y2, x1:x2]
-        if int(np.count_nonzero(mask)) < 3:
-            continue
-        colors = out[y1:y2, x1:x2][mask].astype(np.float32)
-        return x, _robust_local_color(colors)
-    return None, None
-
-
-def _robust_local_color(colors: np.ndarray) -> np.ndarray:
-    if len(colors) == 0:
-        return np.array([96.0, 96.0, 96.0], dtype=np.float32)
-    luma = colors @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    med = float(np.median(luma))
-    mad = float(np.median(np.abs(luma - med)))
-    keep = np.abs(luma - med) <= max(10.0, mad * 2.5)
-    if int(np.count_nonzero(keep)) >= 3:
-        colors = colors[keep]
-    return np.median(colors, axis=0).astype(np.float32)
-
-
-def _load_road_plane(path: str | Path | None, frame_id: int) -> dict[str, Any] | None:
-    if not path or not Path(path).exists():
-        return None
-    data = _load_json(path)
-    plane = select_road_plane_for_frame(data, int(frame_id), policy="global_for_fixed_camera")
-    if not plane:
-        return None
-    return plane
-
-
 def _load_object_index_masks(path: str | Path | None, shape: tuple[int, int]) -> dict[int, np.ndarray]:
     if not path or not Path(path).exists():
         return {}
@@ -2759,65 +1614,6 @@ def _load_object_index_masks(path: str | Path | None, shape: tuple[int, int]) ->
     return masks
 
 
-def _write_textured_grid_obj(
-    path: Path,
-    output_dir: Path,
-    texture_path: Path,
-    width: int,
-    height: int,
-    *,
-    mask: np.ndarray,
-    grid_stride: int,
-    layer: str,
-    road_plane: dict[str, Any] | None,
-) -> None:
-    stride = max(2, int(grid_stride))
-    xs = list(range(0, width, stride))
-    ys = list(range(0, height, stride))
-    if xs[-1] != width - 1:
-        xs.append(width - 1)
-    if ys[-1] != height - 1:
-        ys.append(height - 1)
-    vertices: list[tuple[float, float, float]] = []
-    uvs: list[tuple[float, float]] = []
-    index: dict[tuple[int, int], int] = {}
-    for yi, y in enumerate(ys):
-        for xi, x in enumerate(xs):
-            wx = (x / max(width - 1, 1) - 0.5) * 12.0
-            wz = (y / max(height - 1, 1) - 0.5) * -8.0
-            if layer == "road":
-                wy = _road_y(wx, wz, road_plane)
-            else:
-                wy = 1.5 + (0.5 - y / max(height - 1, 1)) * 3.0
-                wz -= 2.0
-            index[(yi, xi)] = len(vertices) + 1
-            vertices.append((wx, wy, wz))
-            uvs.append((x / max(width - 1, 1), 1.0 - y / max(height - 1, 1)))
-    faces: list[tuple[int, int, int]] = []
-    for yi in range(len(ys) - 1):
-        for xi in range(len(xs) - 1):
-            cx = min(width - 1, int((xs[xi] + xs[xi + 1]) * 0.5))
-            cy = min(height - 1, int((ys[yi] + ys[yi + 1]) * 0.5))
-            if not mask[cy, cx]:
-                continue
-            v00 = index[(yi, xi)]
-            v10 = index[(yi, xi + 1)]
-            v01 = index[(yi + 1, xi)]
-            v11 = index[(yi + 1, xi + 1)]
-            faces.append((v00, v10, v11))
-            faces.append((v00, v11, v01))
-    if not faces:
-        faces = [(1, 2, min(3, len(vertices)))]
-    _write_obj_with_mtl(path, output_dir, texture_path, vertices, uvs, faces)
-
-
-def _write_far_mesh(path: Path, output_dir: Path, texture_path: Path, width: int, height: int) -> None:
-    vertices = [(-8.0, 4.0, -16.0), (8.0, 4.0, -16.0), (8.0, -1.0, -16.0), (-8.0, -1.0, -16.0)]
-    uvs = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
-    faces = [(1, 2, 3), (1, 3, 4)]
-    _write_obj_with_mtl(path, output_dir, texture_path, vertices, uvs, faces)
-
-
 def _write_tabletop_background_obj(path: Path, output_dir: Path, texture_path: Path, width: int, height: int) -> None:
     aspect = float(width) / max(float(height), 1.0)
     half_w = 4.0 * max(aspect, 1.0)
@@ -2831,16 +1627,6 @@ def _write_tabletop_background_obj(path: Path, output_dir: Path, texture_path: P
     uvs = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
     faces = [(1, 2, 3), (1, 3, 4)]
     _write_obj_with_mtl(path, output_dir, texture_path, vertices, uvs, faces)
-
-
-def _road_y(x: float, z: float, road_plane: dict[str, Any] | None) -> float:
-    if not road_plane:
-        return 0.0
-    n = np.asarray(road_plane.get("normal_world", [0.0, 1.0, 0.0]), dtype=np.float64)
-    d = float(road_plane.get("offset", 0.0))
-    if abs(float(n[1])) < 1e-6:
-        return 0.0
-    return float(-(n[0] * x + n[2] * z + d) / n[1])
 
 
 def _write_obj_with_mtl(

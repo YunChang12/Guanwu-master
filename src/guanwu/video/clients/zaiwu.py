@@ -765,6 +765,8 @@ class ZaiwuSeg2TrackDetector(_ZaiwuVideoDetectorBase):
 
 
 class ZaiwuSAM3DAdapter:
+    _OBJECT_QUALITY = "balanced"
+
     def __init__(
         self,
         gateway: ZaiwuGatewayClient,
@@ -802,7 +804,10 @@ class ZaiwuSAM3DAdapter:
                         timeout_sec=self._per_object_timeout_sec,
                     )
                 else:
-                    payload: dict[str, Any] = {"image_base64": detections.image_b64}
+                    payload: dict[str, Any] = {
+                        "image_base64": detections.image_b64,
+                        "quality": self._OBJECT_QUALITY,
+                    }
                     if instance.mask_rle:
                         payload["mask_rle"] = instance.mask_rle
                     else:
@@ -818,6 +823,7 @@ class ZaiwuSAM3DAdapter:
                     segment_kind=obj.segment_kind,
                     frame_idx=detections.frame_idx,
                     raw=result if isinstance(result, dict) else {},
+                    sam3d_quality=self._OBJECT_QUALITY if obj.segment_kind != "body" else None,
                 )
                 if obj.segment_kind == "body" and isinstance(result, dict):
                     _extract_body_camera_and_pose(normalized, result)
@@ -826,9 +832,19 @@ class ZaiwuSAM3DAdapter:
                 logger.error("[Zaiwu] SAM3D reconstruction failed for %s: %s", obj.object_id, exc)
         return out
 
-    def _normalize_result(self, *, object_id: str, segment_kind: str, frame_idx: int, raw: dict[str, Any]) -> dict[str, Any]:
-        files = raw.get("files") if isinstance(raw.get("files"), list) else []
-        source_files: list[tuple[str, Path]] = []
+    def _normalize_result(
+        self,
+        *,
+        object_id: str,
+        segment_kind: str,
+        frame_idx: int,
+        raw: dict[str, Any],
+        sam3d_quality: str | None = None,
+    ) -> dict[str, Any]:
+        files = raw.get("files") if isinstance(raw.get("files"), list) else raw.get("outputs")
+        if not isinstance(files, list):
+            files = []
+        source_files: list[tuple[str, Path, dict[str, Any]]] = []
         for item in files:
             if not isinstance(item, dict):
                 continue
@@ -839,9 +855,10 @@ class ZaiwuSAM3DAdapter:
             if local_path is None:
                 continue
             file_format = str(item.get("format") or local_path.suffix.lstrip("."))
-            source_files.append((file_format, local_path))
+            source_files.append((file_format, local_path, item))
 
         materialized_files: list[dict[str, str]] = []
+        mesh_candidates: list[dict[str, Any]] = []
         if self._materialization_root:
             object_root = (
                 self._materialization_root
@@ -852,20 +869,34 @@ class ZaiwuSAM3DAdapter:
                 / "assets"
             )
             object_root.mkdir(parents=True, exist_ok=True)
-            for file_format, src in source_files:
+            for file_format, src, item in source_files:
                 ext = src.suffix or (f".{file_format}" if file_format else ".bin")
                 dst = _unique_path(object_root / f"object{ext}")
                 _materialize_file(src, dst, self._materialization_mode)
                 materialized_files.append({"format": file_format or ext.lstrip("."), "path": str(dst)})
+                mesh_candidates.append({
+                    "format": file_format or ext.lstrip("."),
+                    "path": str(dst),
+                    "file_id": str(item.get("file_id") or ""),
+                    "is_primary": bool(item.get("is_primary")),
+                })
         else:
-            for file_format, src in source_files:
+            for file_format, src, item in source_files:
                 materialized_files.append({"format": file_format or src.suffix.lstrip("."), "path": str(src)})
+                mesh_candidates.append({
+                    "format": file_format or src.suffix.lstrip("."),
+                    "path": str(src),
+                    "file_id": str(item.get("file_id") or ""),
+                    "is_primary": bool(item.get("is_primary")),
+                })
 
         chosen = ""
-        if materialized_files:
-            ply = next((item for item in materialized_files if item.get("format") == "ply"), None)
-            chosen = str((ply or materialized_files[0]).get("path", ""))
-        return {
+        chosen_format = ""
+        if mesh_candidates:
+            chosen_item = self._choose_sam3d_mesh(mesh_candidates, raw)
+            chosen = str(chosen_item.get("path", ""))
+            chosen_format = str(chosen_item.get("format", ""))
+        result = {
             "instance_id": object_id,
             "segment_kind": segment_kind,
             "source": "zaiwu_sam3d",
@@ -874,6 +905,46 @@ class ZaiwuSAM3DAdapter:
             "mesh_path": chosen,
             "files": materialized_files,
         }
+        if sam3d_quality:
+            result["sam3d_quality"] = sam3d_quality
+        if chosen_format:
+            result["mesh_format"] = chosen_format
+        return result
+
+    @staticmethod
+    def _choose_sam3d_mesh(candidates: list[dict[str, Any]], raw: dict[str, Any]) -> dict[str, Any]:
+        def _matches_reference(candidate: dict[str, Any], ref: Any) -> bool:
+            if not ref:
+                return False
+            if isinstance(ref, dict):
+                ref_values = {
+                    str(ref.get("file_id") or ""),
+                    str(ref.get("path") or ""),
+                    str(ref.get("mesh_path") or ""),
+                }
+            else:
+                ref_values = {str(ref)}
+            ref_values = {value for value in ref_values if value}
+            candidate_file_id = str(candidate.get("file_id") or "")
+            candidate_path = str(candidate.get("path") or "")
+            for value in ref_values:
+                if value == candidate_file_id or value == candidate_path or candidate_path.endswith(value):
+                    return True
+            return False
+
+        for ref_key in ("primary_mesh", "preferred_mesh"):
+            ref = raw.get(ref_key)
+            for candidate in candidates:
+                if _matches_reference(candidate, ref):
+                    return candidate
+        for candidate in candidates:
+            if candidate.get("is_primary"):
+                return candidate
+        for preferred_format in ("glb", "ply"):
+            for candidate in candidates:
+                if str(candidate.get("format") or "").lower() == preferred_format:
+                    return candidate
+        return candidates[0]
 
     def _download_file(self, file_id: str, item: dict[str, Any]) -> Path | None:
         file_format = str(item.get("format") or "bin")

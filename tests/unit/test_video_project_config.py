@@ -97,13 +97,13 @@ def test_project_config_persists_tabletop_task_background_settings(tmp_path: Pat
         ),
     )
     config.settings.zaiwu.background_mode = "tabletop_task"
-    config.settings.zaiwu.background_disable_road_semantics = True
     config.settings.zaiwu.task_foreground_object_ids = ["obj_000009"]
     config.settings.zaiwu.background_target_frame_id = 1
     config.settings.zaiwu.background_cleaner = "openai_image_edit"
     config.settings.zaiwu.background_cleaner_config_path = "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     config.settings.zaiwu.background_cleaner_model = "gpt-image-2"
     config.settings.zaiwu.background_cleaner_reference_frame_id = 1
+    config.settings.zaiwu.background_scene_prompt_profile = "road"
 
     save_project_config(config, config_path)
     saved = config_path.read_text(encoding="utf-8")
@@ -112,13 +112,13 @@ def test_project_config_persists_tabletop_task_background_settings(tmp_path: Pat
     assert "background_mode" in saved
     assert "task_foreground_object_ids" in saved
     assert loaded.settings.zaiwu.background_mode == "tabletop_task"
-    assert loaded.settings.zaiwu.background_disable_road_semantics is True
     assert loaded.settings.zaiwu.task_foreground_object_ids == ["obj_000009"]
     assert loaded.settings.zaiwu.background_target_frame_id == 1
     assert loaded.settings.zaiwu.background_cleaner == "openai_image_edit"
     assert loaded.settings.zaiwu.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     assert loaded.settings.zaiwu.background_cleaner_model == "gpt-image-2"
     assert loaded.settings.zaiwu.background_cleaner_reference_frame_id == 1
+    assert loaded.settings.zaiwu.background_scene_prompt_profile == "road"
 
 
 def test_init_project_applies_workspace_tabletop_task_background_settings(tmp_path: Path) -> None:
@@ -128,13 +128,13 @@ def test_init_project_applies_workspace_tabletop_task_background_settings(tmp_pa
     workspace.video_pipeline.provider_mode = "zaiwu"
     workspace.video_pipeline.mesh_reconstruct_object_ids = ["obj_000009"]
     workspace.video_pipeline.background_mode = "tabletop_task"
-    workspace.video_pipeline.background_disable_road_semantics = True
     workspace.video_pipeline.task_foreground_object_ids = ["obj_000009"]
     workspace.video_pipeline.background_target_frame_id = 1
     workspace.video_pipeline.background_cleaner = "openai_image_edit"
     workspace.video_pipeline.background_cleaner_config_path = "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     workspace.video_pipeline.background_cleaner_model = "gpt-image-2"
     workspace.video_pipeline.background_cleaner_reference_frame_id = 1
+    workspace.video_pipeline.background_scene_prompt_profile = "road"
 
     context = VideoProjectExecutor.init_project(
         video=str(video_path),
@@ -143,13 +143,13 @@ def test_init_project_applies_workspace_tabletop_task_background_settings(tmp_pa
     )
 
     assert context.config.settings.zaiwu.background_mode == "tabletop_task"
-    assert context.config.settings.zaiwu.background_disable_road_semantics is True
     assert context.config.settings.zaiwu.task_foreground_object_ids == ["obj_000009"]
     assert context.config.settings.zaiwu.background_target_frame_id == 1
     assert context.config.settings.zaiwu.background_cleaner == "openai_image_edit"
     assert context.config.settings.zaiwu.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     assert context.config.settings.zaiwu.background_cleaner_model == "gpt-image-2"
     assert context.config.settings.zaiwu.background_cleaner_reference_frame_id == 1
+    assert context.config.settings.zaiwu.background_scene_prompt_profile == "road"
 
 
 def test_load_project_config_overlays_vlm_settings_from_system(tmp_path: Path, monkeypatch) -> None:

@@ -95,8 +95,16 @@ _PHYSICS_SYS = (
     "floor, terrain, pavement, sidewalk, curb, fence, barrier, bridge, tunnel, grass, sky; "
     'true for objects a person could pick up or push; null if uncertain), '
     '"is_rigid_body" (bool or null), "class_name" (string), '
+    '"scene_role" (one of "foreground_object", "robot", "background_support", '
+    '"background_static", "deformable_or_fluid", "uncertain"), '
+    '"is_movable_rigid" (bool or null; true only for independent foreground objects suitable for '
+    'rigid object mesh reconstruction), "mesh_candidate_confidence" (float 0-1), '
     '"material_candidates" (list of {"name": str, "prob": float}), '
     '"confidence" (float 0-1), "rationale" (string). '
+    "For mesh reconstruction, select only movable rigid foreground objects. "
+    "Classify robot arms/grippers as robot, tables/boards/roads/trays/shelves as background_support, "
+    "walls/cabinets/fixed equipment as background_static, and cloth/liquid/cables/shadows/reflections as "
+    "deformable_or_fluid or background_static. "
     "Do not estimate mass, friction, restitution, dimensions, or any metric quantity. "
     "Only return JSON, no extra text."
 )
@@ -106,6 +114,9 @@ _REQUIRED_FIELDS: dict[str, Any] = {
     "is_movable": None,
     "is_rigid_body": None,
     "class_name": "unknown",
+    "scene_role": "uncertain",
+    "is_movable_rigid": None,
+    "mesh_candidate_confidence": None,
     "material_candidates": [],
     "confidence": None,
     "rationale": "",

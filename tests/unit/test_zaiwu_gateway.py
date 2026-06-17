@@ -572,7 +572,133 @@ def test_zaiwu_sam3d_adapter_materializes_job_artifacts(tmp_path: Path) -> None:
     assert mesh_path.exists()
     assert mesh_path.suffix == ".ply"
     assert gateway.jobs[0][1] == "reconstruct_objects"
+    assert gateway.jobs[0][2]["quality"] == "balanced"
     assert gateway.downloads == [("services.sam3d", "outputs/object.ply")]
+
+
+def test_zaiwu_sam3d_adapter_prefers_glb_for_balanced_object_results(tmp_path: Path) -> None:
+    class _GlbPreferredGateway(_FakeJobGateway):
+        def run_service_job(  # type: ignore[override]
+            self,
+            service_id: str,
+            operation: str,
+            payload: dict,
+            *,
+            requested_by: str = "guanwu",
+            execution_labels: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> dict:
+            self.jobs.append((service_id, operation, payload))
+            assert service_id == "services.sam3d"
+            assert operation == "reconstruct_objects"
+            return {
+                "request_id": "sam3d-job",
+                "quality": 0.75,
+                "files": [
+                    {"format": "ply", "file_id": "outputs/object.ply"},
+                    {"format": "glb", "file_id": "outputs/object.glb"},
+                ],
+            }
+
+        def download_bytes(self, service_id: str, file_id: str) -> bytes:  # type: ignore[override]
+            self.downloads.append((service_id, file_id))
+            if file_id.endswith(".ply"):
+                return b"ply\nformat ascii 1.0\nend_header\n"
+            if file_id.endswith(".glb"):
+                return b"glTF"
+            raise AssertionError(f"Unexpected download: {service_id} {file_id}")
+
+    gateway = _GlbPreferredGateway()
+    adapter = ZaiwuSAM3DAdapter(
+        gateway,
+        service_id="services.sam3d",
+        materialization_root=str(tmp_path),
+        materialization_mode="copy",
+    )
+    detections = FrameDetections(
+        frame_idx=3,
+        timestamp=0.2,
+        image_b64="ZmFrZQ==",
+        instances=[
+            DetectedInstance(
+                mask_ref="mask://frame_00003/trk_1",
+                bbox=[1.0, 2.0, 5.0, 7.0],
+                object_id="trk_1",
+                concept_label="cup",
+                segment_kind="object",
+                score=0.95,
+                mask_rle='{"counts":"abc","size":[8,8]}',
+            )
+        ],
+    )
+    best_frames = {"trk_1": (detections, detections.instances[0])}
+    objects = [ObjectNode(object_id="trk_1", label="cup", segment_kind="object")]
+
+    result = adapter.reconstruct_object_meshes(best_frames, objects)
+
+    mesh_path = Path(result["trk_1"]["mesh_path"])
+    assert mesh_path.exists()
+    assert mesh_path.suffix == ".glb"
+    assert result["trk_1"]["sam3d_quality"] == "balanced"
+    assert result["trk_1"]["mesh_format"] == "glb"
+    assert gateway.jobs[0][2]["quality"] == "balanced"
+
+
+def test_zaiwu_sam3d_adapter_does_not_send_quality_to_body_reconstruction(tmp_path: Path) -> None:
+    class _BodyGateway(_FakeJobGateway):
+        def run_service_job(  # type: ignore[override]
+            self,
+            service_id: str,
+            operation: str,
+            payload: dict,
+            *,
+            requested_by: str = "guanwu",
+            execution_labels: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> dict:
+            self.jobs.append((service_id, operation, payload))
+            assert service_id == "services.sam3d"
+            assert operation == "reconstruct_body"
+            return {
+                "request_id": "sam3d-body-job",
+                "quality": 0.75,
+                "files": [{"format": "ply", "file_id": "outputs/body.ply"}],
+            }
+
+        def download_bytes(self, service_id: str, file_id: str) -> bytes:  # type: ignore[override]
+            self.downloads.append((service_id, file_id))
+            return b"ply\nformat ascii 1.0\nend_header\n"
+
+    gateway = _BodyGateway()
+    adapter = ZaiwuSAM3DAdapter(
+        gateway,
+        service_id="services.sam3d",
+        materialization_root=str(tmp_path),
+        materialization_mode="copy",
+    )
+    detections = FrameDetections(
+        frame_idx=3,
+        timestamp=0.2,
+        image_b64="ZmFrZQ==",
+        instances=[
+            DetectedInstance(
+                mask_ref="mask://frame_00003/person_1",
+                bbox=[1.0, 2.0, 5.0, 7.0],
+                object_id="person_1",
+                concept_label="person",
+                segment_kind="body",
+                score=0.95,
+            )
+        ],
+    )
+    best_frames = {"person_1": (detections, detections.instances[0])}
+    objects = [ObjectNode(object_id="person_1", label="person", segment_kind="body")]
+
+    result = adapter.reconstruct_object_meshes(best_frames, objects)
+
+    assert "quality" not in gateway.jobs[0][2]
+    assert result["person_1"]["mesh_format"] == "ply"
+    assert "sam3d_quality" not in result["person_1"]
 
 
 def test_zaiwu_wildgs_requires_camera_poses_artifact(tmp_path: Path) -> None:

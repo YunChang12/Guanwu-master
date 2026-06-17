@@ -97,9 +97,6 @@ class VideoProjectExecutor:
             if str(object_id).strip()
         ]
         context.config.settings.zaiwu.background_mode = workspace.video_pipeline.background_mode
-        context.config.settings.zaiwu.background_disable_road_semantics = (
-            workspace.video_pipeline.background_disable_road_semantics
-        )
         context.config.settings.zaiwu.task_foreground_object_ids = [
             str(object_id).strip()
             for object_id in workspace.video_pipeline.task_foreground_object_ids
@@ -113,6 +110,9 @@ class VideoProjectExecutor:
         context.config.settings.zaiwu.background_cleaner_model = workspace.video_pipeline.background_cleaner_model
         context.config.settings.zaiwu.background_cleaner_reference_frame_id = (
             workspace.video_pipeline.background_cleaner_reference_frame_id
+        )
+        context.config.settings.zaiwu.background_scene_prompt_profile = (
+            workspace.video_pipeline.background_scene_prompt_profile
         )
         save_project_config(context.config, context.paths.config)
         return ProjectContext(context.paths.root)

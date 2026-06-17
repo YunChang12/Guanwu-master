@@ -172,6 +172,18 @@ def test_generic_seed_track_falls_back_to_wildgs_only_when_enabled() -> None:
     assert selected == "/tmp/wildgs/depth_maps"
 
 
+def test_edge_seed_track_respects_aligned_da3_depth_source() -> None:
+    selected = ProjectExecutor._pose_seed_depth_maps_dir_for_strategy(
+        generic_mode=False,
+        pose_depth_source="depth_anything3",
+        da3_depth_maps_dir="/tmp/depth_anything3/depth_maps_aligned",
+        wildgs_depth_maps_dir="/tmp/wildgs/depth_maps",
+        fallback_to_wildgs=False,
+    )
+
+    assert selected == "/tmp/depth_anything3/depth_maps_aligned"
+
+
 def test_pose_track_scale_prior_excludes_low_observability_severe_truncation() -> None:
     anchor_a = _pose_record(frame_id=1, scale=1.0, mask_iou=0.88, bbox_iou=0.88)
     anchor_b = _pose_record(frame_id=2, scale=1.1, mask_iou=0.86, bbox_iou=0.86)
@@ -889,6 +901,30 @@ def test_anchor_temporal_gate_filter_keeps_prior_track_and_skips_remaining_frame
     assert frame_records["frame_000012"]["reason"] == "skipped_after_anchor_temporal_gate_failure"
 
 
+def test_anchor_temporal_gate_filter_can_keep_all_frames_non_blocking() -> None:
+    frame_records: dict[str, dict] = {}
+    selected = [
+        _pose_record(frame_id=10, yaw_deg=-2.4, mask_iou=0.926, bbox_iou=0.923),
+        _pose_record(frame_id=11, yaw_deg=8.4, mask_iou=0.809, bbox_iou=0.776),
+        _pose_record(frame_id=12, yaw_deg=-3.3, mask_iou=0.906, bbox_iou=0.916),
+    ]
+
+    kept, summary = ProjectExecutor._apply_anchor_temporal_gate_to_selected_records(
+        selected,
+        frame_ids=[10, 11, 12],
+        frame_records=frame_records,
+        skip_remaining_frames=False,
+    )
+
+    assert [record["frame_id"] for record in kept] == [10, 11, 12]
+    assert summary["applied"] is True
+    assert summary["blocking"] is False
+    assert summary["failed_frame_id"] == 11
+    assert frame_records["frame_000011"]["status"] == "accepted"
+    assert frame_records["frame_000011"]["anchor_temporal_gate"]["accepted"] is False
+    assert frame_records["frame_000012"]["status"] == "accepted"
+
+
 def test_stable_temporal_anchor_allows_consecutive_handoffs() -> None:
     first_anchor = _pose_record(frame_id=12, yaw_deg=-177.0, scale=2.67, mask_iou=0.923, bbox_iou=0.911)
     first_anchor["metrics"].update({"ground_contact_max_abs_m": 0.11})
@@ -1311,6 +1347,33 @@ def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records
 
     assert summary["skip_entire_object"] is False
     assert summary["accepted_frame_count_before_failure"] == 2
+
+
+def test_truncated_fail_fast_all_frames_can_continue_after_failed_truncated_frame() -> None:
+    fail_fast = {
+        "skip_object": True,
+        "reason": "optimizer_failed",
+        "frame_id": 24,
+        "truncation_severity": "severe",
+        "low_observability": False,
+    }
+    frame_records = {
+        "frame_000001": {"status": "accepted", "reason": "accepted"},
+        "frame_000024": {"status": "failed", "reason": "optimizer_failed"},
+    }
+
+    summary = ProjectExecutor._apply_truncated_object_fail_fast(
+        fail_fast,
+        frame_ids=[1, 24, 25, 26],
+        frame_records=frame_records,
+        accepted_records=[],
+        skip_remaining_frames=False,
+    )
+
+    assert summary["skip_entire_object"] is False
+    assert summary["remaining_frame_count"] == 0
+    assert "frame_000025" not in frame_records
+    assert "frame_000026" not in frame_records
 
 
 def test_usd_visibility_segments_split_contiguous_trajectory_frames() -> None:
@@ -2881,6 +2944,58 @@ def test_all_frames_candidate_pass_can_use_in_memory_temporal_prior() -> None:
     assert prior["pose"]["scale"] == [2.5, 2.5, 2.5]
 
 
+def test_all_frames_candidate_pass_drops_stale_prior_after_bbox_motion() -> None:
+    previous = _pose_record(frame_id=19, x=0.0, yaw_deg=0.0, scale=2.5)
+    previous["metrics"]["detection_bbox"] = [840.0, 210.0, 940.0, 260.0]
+
+    prior = ProjectExecutor._edge_pose_candidate_temporal_prior_payload(
+        previous,
+        all_frames_mode=True,
+        current_frame_id=23,
+        current_bbox=[780.0, 180.0, 880.0, 230.0],
+    )
+
+    assert prior is None
+
+
+def test_all_frames_candidate_pass_keeps_recent_prior_after_bbox_motion() -> None:
+    previous = _pose_record(frame_id=22, x=0.0, yaw_deg=0.0, scale=2.5)
+    previous["metrics"]["detection_bbox"] = [840.0, 210.0, 940.0, 260.0]
+
+    prior = ProjectExecutor._edge_pose_candidate_temporal_prior_payload(
+        previous,
+        all_frames_mode=True,
+        current_frame_id=23,
+        current_bbox=[780.0, 180.0, 880.0, 230.0],
+    )
+
+    assert prior is not None
+    assert prior["frame_id"] == 22
+
+
+def test_edge_pose_acceptance_rejects_hard_temporal_visual_penalty() -> None:
+    report = {
+        "json_bbox": [10.0, 10.0, 110.0, 110.0],
+        "optimized_corrected_pose_world": {
+            "translation_world": [0.0, 0.0, 8.0],
+            "rotation_matrix": np.eye(3).tolist(),
+            "scale": [2.5, 2.5, 2.5],
+        },
+        "metrics": {
+            "mask_iou": 0.80,
+            "bbox_iou": 0.78,
+            "bbox_center_error_px": 12.0,
+            "temporal_anchor_visual_penalty": 1_000_000.0,
+            "temporal_anchor_visual_gate_reason": "visual_degradation_temporal_loss",
+        },
+    }
+
+    decision = ProjectExecutor._pose_optimizer_acceptance(report)
+
+    assert decision["accepted"] is False
+    assert decision["reason"] == "temporal_anchor_visual_gate_rejected:visual_degradation_temporal_loss"
+
+
 def test_all_frames_scale_prior_uses_previous_accepted_records_only() -> None:
     previous_records = [
         _pose_record(frame_id=1, scale=2.50, mask_iou=0.91, bbox_iou=0.93),
@@ -3007,6 +3122,156 @@ def test_pose_road_geometry_falls_back_to_background_manifest_global_plane(tmp_p
     assert plane["selection"]["policy"] == "global_for_fixed_camera"
 
 
+def test_pose_road_geometry_falls_back_to_background_geometry_reference(tmp_path: Path) -> None:
+    reference_path = tmp_path / "tabletop_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "source": "depth_anything3_clean_target_rgb",
+                "reference_type": "support_surface",
+                "target_frame_id": 1,
+                "normal_world": [0.0, -2.0, 0.0],
+                "offset": 0.25,
+                "support_plane_confidence": 0.92,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "target_frame_id": 1,
+                "assets": {
+                    "background_geometry_reference": str(reference_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback({"available": False}, geometry)
+    plane = project_executor.select_road_plane_for_frame(road_geometry, 3)
+
+    assert road_geometry["available"] is True
+    assert road_geometry["source"] == "background_geometry_reference"
+    assert plane is not None
+    assert plane["normal_world"] == [0.0, -1.0, 0.0]
+    assert plane["offset"] == 0.25
+    assert plane["source"] == "depth_anything3_clean_target_rgb"
+    assert plane["selection"]["policy"] == "global_for_fixed_camera"
+
+
+def test_pose_road_geometry_can_prefer_background_geometry_reference_over_wildgs(tmp_path: Path) -> None:
+    reference_path = tmp_path / "background_geometry_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "source": "clean_background_depth",
+                "reference_type": "support_surface",
+                "target_frame_id": 1,
+                "normal_world": [0.0, -3.0, 0.0],
+                "offset": 2.25,
+                "support_plane_confidence": 0.94,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "target_frame_id": 1,
+                "road_plane": {
+                    "source": "legacy_road_plane",
+                    "normal_world": [0.0, -1.0, 0.0],
+                    "offset": 9.0,
+                },
+                "assets": {
+                    "background_geometry_reference": str(reference_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+    wildgs = {
+        "available": True,
+        "source": "wildgs_depth_maps",
+        "default_plane_policy": "global_for_fixed_camera",
+        "global_plane": {
+            "source": "weighted_keyframe_robust_global",
+            "normal_world": [0.0, -1.0, 0.0],
+            "offset": 3.5,
+        },
+    }
+
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback(
+        wildgs,
+        geometry,
+        prefer_background=True,
+    )
+    plane = project_executor.select_road_plane_for_frame(road_geometry, 1)
+
+    assert road_geometry["available"] is True
+    assert road_geometry["source"] == "background_geometry_reference"
+    assert road_geometry["preferred_over"]["source"] == "wildgs_depth_maps"
+    assert plane is not None
+    assert plane["source"] == "clean_background_depth"
+    assert plane["normal_world"] == [0.0, -1.0, 0.0]
+    assert plane["offset"] == 2.25
+    assert plane["selection"]["policy"] == "global_for_fixed_camera"
+
+
+def test_pose_road_geometry_falls_back_to_tabletop_reference_asset(tmp_path: Path) -> None:
+    reference_path = tmp_path / "tabletop_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "source": "clean_depth_background",
+                "reference_type": "support_surface",
+                "target_frame_id": 1,
+                "normal_world": [0.0, 0.0, 3.0],
+                "offset": -1.5,
+                "support_plane_confidence": 0.88,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "target_frame_id": 1,
+                "road_plane": None,
+                "assets": {
+                    "tabletop_reference": str(reference_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback({"available": False}, geometry)
+    plane = project_executor.select_road_plane_for_frame(road_geometry, 2)
+
+    assert road_geometry["available"] is True
+    assert road_geometry["source"] == "background_geometry_reference"
+    assert plane is not None
+    assert plane["normal_world"] == [0.0, 0.0, 1.0]
+    assert plane["offset"] == -1.5
+    assert plane["source"] == "clean_depth_background"
+    assert plane["selection"]["policy"] == "global_for_fixed_camera"
+
+
 def test_vehicle_pose_context_uses_background_manifest_fallback_road_plane(tmp_path: Path) -> None:
     manifest_path = tmp_path / "background_manifest.json"
     manifest_path.write_text(
@@ -3050,6 +3315,69 @@ def test_vehicle_pose_context_uses_background_manifest_fallback_road_plane(tmp_p
 
     assert context["road_plane"]["offset"] == -10.0
     assert context["bbox_bottom_ground"]["point_world"] == [0.0, 20.0, 10.0]
+
+
+def test_vehicle_pose_context_uses_background_geometry_reference_as_road_plane(tmp_path: Path) -> None:
+    reference_path = tmp_path / "background_geometry_reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.background_geometry_reference.v1",
+                "source": "clean_background_depth",
+                "reference_type": "support_surface",
+                "target_frame_id": 1,
+                "normal_world": [0.0, -4.0, 0.0],
+                "offset": 0.5,
+                "support_plane_confidence": 0.9,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "background_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "guanwu.target_frame_background_assets.v2",
+                "target_frame_id": 1,
+                "road_plane": None,
+                "assets": {
+                    "background_geometry_reference": str(reference_path),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    geometry = type("Artifact", (), {"outputs": {"background_assets_manifest": str(manifest_path)}})()
+    road_geometry = ProjectExecutor._road_geometry_with_background_fallback({"available": False}, geometry)
+
+    class DummyExecutor:
+        _vehicle_pose_context_for_task = ProjectExecutor._vehicle_pose_context_for_task
+        _motion_heading_prior_for_track = ProjectExecutor._motion_heading_prior_for_track
+
+        def _get_instance_for_frame(self, obj_id, frame_id, detection_frames):
+            return None
+
+    context = DummyExecutor()._vehicle_pose_context_for_task(
+        obj_id="obj_000001",
+        frame_id=1,
+        bbox_xyxy=[8.0, 12.0, 28.0, 36.0],
+        camera={
+            "fx": 10.0,
+            "fy": 10.0,
+            "cx": 18.0,
+            "cy": 18.0,
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, 0.0],
+        },
+        detection_frames=[],
+        road_geometry=road_geometry,
+        target_window_radius=0,
+    )
+
+    assert context["road_plane"]["normal_world"] == [0.0, -1.0, 0.0]
+    assert context["road_plane"]["offset"] == 0.5
+    assert context["road_plane"]["source"] == "clean_background_depth"
+    assert context["bbox_bottom_ground"]["point_world"] == [0.0, 0.5, 0.2777777777777778]
 
 
 def test_generic_pose_context_includes_background_geometry_reference() -> None:

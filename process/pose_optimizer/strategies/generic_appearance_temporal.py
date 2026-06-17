@@ -98,6 +98,11 @@ GENERIC_CANDIDATE_METRIC_KEYS = [
     "semantic_up_angle_deg",
     "semantic_up_axis_index",
     "semantic_up_axis_sign",
+    "semantic_up_flip_rescue_candidate_used",
+    "semantic_up_flip_variant",
+    "semantic_up_angle_deg_before_flip",
+    "semantic_up_angle_deg_after_flip",
+    "semantic_up_flip_base_source",
     "support_aligned_candidate_used",
     "support_normal_angle_deg_before_alignment",
     "support_normal_angle_deg_after_alignment",
@@ -549,6 +554,44 @@ def semantic_up_orientation_reject_reason(result: dict[str, Any], args: argparse
     if angle_deg > max_angle:
         return "semantic_up_angle_above_threshold"
     return None
+
+
+def _semantic_up_enabled(args: argparse.Namespace) -> bool:
+    enabled_value = str(getattr(args, "semantic_up_constraint_enabled", "auto")).strip().lower()
+    return enabled_value not in {"0", "false", "off", "disabled", "none"}
+
+
+def _semantic_up_target_up_cam(evaluator: Any, args: argparse.Namespace) -> np.ndarray:
+    try:
+        t_world_from_cam = getattr(evaluator, "t_world_from_cam", None)
+        if t_world_from_cam is not None:
+            target = fast.camera_up_vector(
+                np.asarray(t_world_from_cam, dtype=np.float64).reshape(4, 4),
+                str(getattr(args, "world_up_axis", "-y")),
+            )
+        else:
+            target = fast.world_up_vector_from_arg(str(getattr(args, "world_up_axis", "-y")))
+    except Exception:
+        target = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    target = _normalize(np.asarray(target, dtype=np.float64).reshape(3))
+    if float(np.linalg.norm(target)) <= 1e-12:
+        return np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    return target
+
+
+def _semantic_up_flip_variants_from_args(args: argparse.Namespace) -> list[str]:
+    raw_value = getattr(args, "semantic_up_flip_rescue_variants", "cam_z_180,cam_x_180,min_align")
+    if isinstance(raw_value, (list, tuple)):
+        parts = [str(item).strip() for item in raw_value]
+    else:
+        parts = [part.strip() for part in str(raw_value).split(",")]
+    variants: list[str] = []
+    for part in parts:
+        if not part or part in variants:
+            continue
+        if part in {"cam_z_180", "cam_x_180", "min_align"}:
+            variants.append(part)
+    return variants
 
 
 def annotate_candidate_semantic_up_for_ranking(
@@ -2717,6 +2760,13 @@ def _candidate_rank_key(result: dict[str, Any]) -> tuple[float, float, float, fl
     )
 
 
+def _pose_signature_full_rotation(result: dict[str, Any]) -> tuple[float, ...]:
+    translation = np.asarray(result["translation_cam"], dtype=np.float64).reshape(3)
+    rotation = np.asarray(result["rotation_cam"], dtype=np.float64).reshape(3, 3)
+    scale = np.asarray(result["scale"], dtype=np.float64).reshape(3)
+    return tuple(np.round(np.concatenate([translation, rotation.reshape(-1), scale]), 4).tolist())
+
+
 def _candidate_depth_is_reliable(result: dict[str, Any], args: argparse.Namespace) -> bool:
     if not bool(result.get("depth_enabled", False)):
         return False
@@ -2876,6 +2926,7 @@ def merge_depth_snapped_initial_candidates(
         initial_candidates,
         support_aligned_seeds=[],
         depth_snapped_seeds=depth_snapped_seeds,
+        semantic_up_flip_seeds=[],
         args=args,
     )
 
@@ -2885,6 +2936,7 @@ def merge_protected_initial_candidates(
     *,
     support_aligned_seeds: list[dict[str, Any]],
     depth_snapped_seeds: list[dict[str, Any]],
+    semantic_up_flip_seeds: list[dict[str, Any]] | None = None,
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
     """Merge search candidates without losing protected support/depth seeds to score truncation."""
@@ -2892,6 +2944,11 @@ def merge_protected_initial_candidates(
     visual_limit = max(int(getattr(args, "top_k_candidates", 0)), int(getattr(args, "refine_top_k", 0)), 1)
     depth_reserve = max(1, int(getattr(args, "generic_depth_refine_bucket_top_k", 1))) if depth_snapped_seeds else 0
     support_reserve = len(support_aligned_seeds)
+    semantic_up_flip_seeds = semantic_up_flip_seeds or []
+    semantic_up_reserve = min(
+        len(semantic_up_flip_seeds),
+        max(0, int(getattr(args, "semantic_up_flip_rescue_keep_top_k", 3))),
+    )
     visual = merge_pose_candidates(
         initial_candidates,
         limit=visual_limit,
@@ -2915,6 +2972,18 @@ def merge_protected_initial_candidates(
 
     append_unique(support_aligned_seeds, support_reserve)
     append_unique(depth_snapped_seeds, depth_reserve, sort_key=_depth_candidate_key)
+    if semantic_up_reserve > 0:
+        seen_full = {_pose_signature_full_rotation(item) for item in merged}
+        added = 0
+        for item in sorted(semantic_up_flip_seeds, key=_candidate_rank_key, reverse=True):
+            if added >= semantic_up_reserve:
+                break
+            signature = _pose_signature_full_rotation(item)
+            if signature in seen_full:
+                continue
+            seen_full.add(signature)
+            merged.append(item)
+            added += 1
     return merged
 
 
@@ -3074,6 +3143,271 @@ def make_support_aligned_seeds(
         seen.add(signature)
         aligned.append(seed)
     return sorted(aligned, key=_candidate_rank_key, reverse=True)
+
+
+def _semantic_up_flip_visual_passes(result: dict[str, Any], args: argparse.Namespace) -> bool:
+    mask_iou = _finite_float(
+        result.get("visible_mask_iou")
+        or result.get("mask_blend_score")
+        or result.get("soft_mask_iou")
+        or result.get("mask_iou")
+    )
+    bbox_iou = _finite_float(result.get("visible_bbox_iou") or result.get("bbox_iou"))
+    min_mask = float(getattr(args, "semantic_up_flip_rescue_min_mask_iou", 0.55))
+    min_bbox = float(getattr(args, "semantic_up_flip_rescue_min_bbox_iou", 0.70))
+    return (mask_iou is not None and mask_iou >= min_mask) or (bbox_iou is not None and bbox_iou >= min_bbox)
+
+
+def _semantic_up_flip_prior_paths(args: argparse.Namespace) -> list[Path]:
+    raw_value = getattr(args, "semantic_up_flip_rescue_prior_paths", "")
+    if isinstance(raw_value, (list, tuple)):
+        parts = [str(item).strip() for item in raw_value]
+    else:
+        parts = [part.strip() for part in str(raw_value).split(",")]
+    paths: list[Path] = []
+    for part in parts:
+        if not part:
+            continue
+        path = Path(part).expanduser()
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _semantic_up_flip_prior_pose_payload(data: dict[str, Any], path: Path) -> tuple[dict[str, Any] | None, str]:
+    if path.name == "task_with_optimized_corrected_pose.json" and isinstance(data.get("corrected_pose"), dict):
+        return data.get("corrected_pose"), "task_with_optimized_corrected_pose"
+    if isinstance(data.get("optimized_corrected_pose_world"), dict):
+        return data.get("optimized_corrected_pose_world"), "optimization_report"
+    if isinstance(data.get("corrected_pose"), dict):
+        return data.get("corrected_pose"), "corrected_pose"
+    return None, path.name
+
+
+def load_semantic_up_flip_prior_candidates(
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+    t_world_from_cam: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Load explicit prior output poses and re-score them as semantic-up flip sources."""
+
+    if not bool(getattr(args, "semantic_up_flip_rescue_enabled", True)):
+        return []
+    prior_paths = _semantic_up_flip_prior_paths(args)
+    if not prior_paths:
+        return []
+
+    t_world = np.asarray(t_world_from_cam, dtype=np.float64).reshape(4, 4)
+    prior_candidates: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    for path in prior_paths:
+        if path.is_dir():
+            candidates = [
+                path / "optimization_report.json",
+                path / "task_with_optimized_corrected_pose.json",
+            ]
+            path = next((candidate for candidate in candidates if candidate.exists()), path)
+        if not path.exists():
+            continue
+        try:
+            data = fast.read_json(path)
+            pose, pose_source = _semantic_up_flip_prior_pose_payload(data, path)
+            if not isinstance(pose, dict):
+                continue
+            translation_world = np.asarray(pose["translation_world"], dtype=np.float64).reshape(3)
+            rotation_world = np.asarray(pose["rotation_matrix"], dtype=np.float64).reshape(3, 3)
+            scale = fast.make_uniform_scale(
+                fast.scale_to_uniform_scalar(np.asarray(pose.get("scale", [1.0, 1.0, 1.0]), dtype=np.float64))
+            )
+        except Exception:
+            continue
+        translation_cam, rotation_cam = temporal_fast.world_pose_to_camera_pose(
+            t_world,
+            translation_world,
+            rotation_world,
+        )
+
+        evaluator_args = getattr(evaluator, "generic_args", None)
+        original_coarse_scoring = bool(getattr(evaluator_args, "generic_coarse_scoring", False)) if evaluator_args is not None else False
+        if evaluator_args is not None:
+            evaluator_args.generic_coarse_scoring = False
+        try:
+            result = _evaluate_absolute_keep_mask(evaluator, translation_cam, rotation_cam, scale)
+        finally:
+            if evaluator_args is not None:
+                evaluator_args.generic_coarse_scoring = original_coarse_scoring
+        if result.get("projected_bbox") is None:
+            continue
+        metrics = data.get("metrics", {}) if isinstance(data.get("metrics"), dict) else {}
+        metadata = {
+            "source": "semantic_up_flip_prior_pose",
+            "prior_path": str(path),
+            "prior_pose_source": pose_source,
+        }
+        result["initializer_metadata"] = metadata
+        if "mask_iou" in metrics:
+            result["semantic_up_flip_prior_mask_iou"] = metrics.get("mask_iou")
+        if "bbox_iou" in metrics:
+            result["semantic_up_flip_prior_bbox_iou"] = metrics.get("bbox_iou")
+        annotate_candidate_semantic_up_for_ranking(
+            result,
+            getattr(evaluator, "mesh_axis_prior", None),
+            args,
+            t_world_from_cam=t_world,
+        )
+        signature = _pose_signature_full_rotation(result)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        prior_candidates.append(result)
+    return sorted(prior_candidates, key=_candidate_rank_key, reverse=True)
+
+
+def _semantic_up_flip_variant_rotations(
+    base_rotation: np.ndarray,
+    base_candidate: dict[str, Any],
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+) -> list[tuple[str, np.ndarray]]:
+    rotation = _orthonormalize_rotation(np.asarray(base_rotation, dtype=np.float64).reshape(3, 3))
+    variants: list[tuple[str, np.ndarray]] = []
+    for variant in _semantic_up_flip_variants_from_args(args):
+        if variant == "cam_z_180":
+            flipped = np.diag([-1.0, -1.0, 1.0]) @ rotation
+        elif variant == "cam_x_180":
+            flipped = np.diag([1.0, -1.0, -1.0]) @ rotation
+        elif variant == "min_align":
+            mesh_axis_prior = getattr(evaluator, "mesh_axis_prior", None)
+            locked_up_axis = _locked_mesh_up_axis(mesh_axis_prior)
+            if locked_up_axis is None:
+                continue
+            axis_idx, axis_sign = locked_up_axis
+            current_up = _normalize(rotation[:, axis_idx] * axis_sign)
+            target_up = _semantic_up_target_up_cam(evaluator, args)
+            flipped = rotation_align_vector(current_up, target_up) @ rotation
+        else:
+            continue
+        variants.append((variant, _orthonormalize_rotation(flipped)))
+    return variants
+
+
+def make_semantic_up_flip_seed(
+    base_candidate: dict[str, Any],
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+    variant: str,
+) -> dict[str, Any] | None:
+    """Evaluate one semantic-up rescue rotation variant for a visually strong but inverted seed."""
+
+    mesh_axis_prior = getattr(evaluator, "mesh_axis_prior", None)
+    if _locked_mesh_up_axis(mesh_axis_prior) is None:
+        return None
+    try:
+        translation = np.asarray(base_candidate["translation_cam"], dtype=np.float64).reshape(3)
+        rotation = np.asarray(base_candidate["rotation_cam"], dtype=np.float64).reshape(3, 3)
+        scale = np.asarray(base_candidate["scale"], dtype=np.float64).reshape(3)
+    except Exception:
+        return None
+
+    angle_before = _finite_float(base_candidate.get("semantic_up_angle_deg"))
+    for variant_name, variant_rotation in _semantic_up_flip_variant_rotations(rotation, base_candidate, evaluator, args):
+        if variant_name != variant:
+            continue
+        evaluator_args = getattr(evaluator, "generic_args", None)
+        original_coarse_scoring = bool(getattr(evaluator_args, "generic_coarse_scoring", False)) if evaluator_args is not None else False
+        if evaluator_args is not None:
+            evaluator_args.generic_coarse_scoring = False
+        try:
+            result = _evaluate_absolute_keep_mask(evaluator, translation, variant_rotation, scale)
+        finally:
+            if evaluator_args is not None:
+                evaluator_args.generic_coarse_scoring = original_coarse_scoring
+        if result.get("projected_bbox") is None:
+            return None
+        base_meta = dict(base_candidate.get("initializer_metadata") or {})
+        base_source = str(base_meta.get("source", "unknown"))
+        result["initializer_metadata"] = {
+            **base_meta,
+            "source": "semantic_up_flip_rescue_seed",
+            "base_source": base_source,
+            "semantic_up_flip_variant": variant_name,
+        }
+        result["semantic_up_flip_rescue_candidate_used"] = True
+        result["semantic_up_flip_variant"] = variant_name
+        result["semantic_up_angle_deg_before_flip"] = angle_before
+        result["semantic_up_flip_base_source"] = base_source
+        annotate_candidate_semantic_up_for_ranking(
+            result,
+            mesh_axis_prior,
+            args,
+            t_world_from_cam=getattr(evaluator, "t_world_from_cam", None),
+        )
+        result["semantic_up_angle_deg_after_flip"] = result.get("semantic_up_angle_deg")
+        if result.get("semantic_up_candidate_reject_reason"):
+            return None
+        if not _semantic_up_flip_visual_passes(result, args):
+            return None
+        return result
+    return None
+
+
+def make_semantic_up_flip_seeds(
+    candidates: list[dict[str, Any]],
+    evaluator: GenericPoseEvaluator,
+    args: argparse.Namespace,
+    *,
+    temporal_seed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "semantic_up_flip_rescue_enabled", True)):
+        return []
+    if not _semantic_up_enabled(args):
+        return []
+    mesh_axis_prior = getattr(evaluator, "mesh_axis_prior", None)
+    if _locked_mesh_up_axis(mesh_axis_prior) is None:
+        return []
+
+    sources: list[dict[str, Any]] = []
+    if temporal_seed is not None:
+        sources.append(temporal_seed)
+    source_limit = max(0, int(getattr(args, "semantic_up_flip_rescue_source_top_k", 8)))
+    sources.extend(candidates[:source_limit])
+
+    seeds: list[dict[str, Any]] = []
+    seen: set[tuple[float, ...]] = set()
+    max_angle = float(getattr(args, "semantic_up_hard_gate_max_angle_deg", 135.0))
+    for candidate in sources:
+        if not isinstance(candidate, dict):
+            continue
+        annotate_candidate_semantic_up_for_ranking(
+            candidate,
+            mesh_axis_prior,
+            args,
+            t_world_from_cam=getattr(evaluator, "t_world_from_cam", None),
+        )
+        angle_before = _finite_float(candidate.get("semantic_up_angle_deg"))
+        reject_reason = candidate.get("semantic_up_candidate_reject_reason")
+        semantic_rejected = str(reject_reason or "") == "semantic_up_angle_above_threshold"
+        exceeds_gate = angle_before is not None and angle_before > max_angle
+        if not (semantic_rejected or exceeds_gate):
+            continue
+        if not _semantic_up_flip_visual_passes(candidate, args):
+            continue
+        try:
+            rotation = np.asarray(candidate["rotation_cam"], dtype=np.float64).reshape(3, 3)
+        except Exception:
+            continue
+        for variant_name, _rotation in _semantic_up_flip_variant_rotations(rotation, candidate, evaluator, args):
+            seed = make_semantic_up_flip_seed(candidate, evaluator, args, variant_name)
+            if seed is None:
+                continue
+            signature = _pose_signature_full_rotation(seed)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            seeds.append(seed)
+
+    keep_top_k = max(0, int(getattr(args, "semantic_up_flip_rescue_keep_top_k", 3)))
+    return sorted(seeds, key=_candidate_rank_key, reverse=True)[:keep_top_k]
 
 
 def parse_angle_list(value: str | list[Any] | tuple[Any, ...]) -> list[float]:
@@ -3269,6 +3603,7 @@ def select_generic_refine_candidates(
     corrected_seed: dict[str, Any] | None = None,
     temporal_seed: dict[str, Any] | None = None,
     support_aligned_seed: dict[str, Any] | None = None,
+    semantic_up_flip_seed: dict[str, Any] | None = None,
     support_alignment_trigger_deg: float = 6.0,
     support_aligned_seed_score_margin: float = 0.20,
     prefer_temporal_first: bool = False,
@@ -3277,13 +3612,22 @@ def select_generic_refine_candidates(
 ) -> list[dict[str, Any]]:
     """Select high-scoring generic candidates while preserving trusted seeds."""
 
+    def refine_signature(item: dict[str, Any]) -> tuple[float, ...]:
+        metadata = item.get("initializer_metadata") if isinstance(item.get("initializer_metadata"), dict) else {}
+        if metadata.get("source") == "semantic_up_flip_rescue_seed" or item.get("semantic_up_flip_rescue_candidate_used"):
+            return _pose_signature_full_rotation(item)
+        return fast.pose_signature(item)
+
     limit = max(1, int(refine_top_k))
     combined = [item for item in candidates if item is not None]
-    for seed in (corrected_seed, temporal_seed, support_aligned_seed):
+    for seed in (corrected_seed, temporal_seed, support_aligned_seed, semantic_up_flip_seed):
         if seed is not None:
             combined.append(seed)
     if not combined:
         return []
+
+    if limit == 1 and semantic_up_flip_seed is not None:
+        return [semantic_up_flip_seed]
 
     if limit == 1 and temporal_seed is not None:
         if support_aligned_seed is not None:
@@ -3312,7 +3656,7 @@ def select_generic_refine_candidates(
     unique: list[dict[str, Any]] = []
     seen: set[tuple[float, ...]] = set()
     for item in sorted(combined, key=_candidate_rank_key, reverse=True):
-        signature = fast.pose_signature(item)
+        signature = refine_signature(item)
         if signature in seen:
             continue
         seen.add(signature)
@@ -3332,7 +3676,7 @@ def select_generic_refine_candidates(
             )
         if source_item is None:
             return
-        signature = fast.pose_signature(source_item)
+        signature = refine_signature(source_item)
         if signature in required_signatures:
             return
         required_signatures.add(signature)
@@ -3341,6 +3685,7 @@ def select_generic_refine_candidates(
     add_required("task_json_corrected_pose", corrected_seed)
     add_required("temporal_prior", temporal_seed)
     add_required("support_aligned_seed", support_aligned_seed)
+    add_required("semantic_up_flip_rescue_seed", semantic_up_flip_seed)
     if len(required) >= limit:
         if prefer_temporal_first:
             required = sorted(required, key=_temporal_refine_priority)
@@ -3356,7 +3701,7 @@ def select_generic_refine_candidates(
             for item in ordered_items:
                 if len(selected) + len(required) >= limit:
                     break
-                signature = fast.pose_signature(item)
+                signature = refine_signature(item)
                 if signature in selected_signatures:
                     continue
                 selected_signatures.add(signature)
@@ -3385,7 +3730,7 @@ def select_generic_refine_candidates(
     selected: list[dict[str, Any]] = []
     fill_limit = limit - len(required)
     for item in unique:
-        if fast.pose_signature(item) in required_signatures:
+        if refine_signature(item) in required_signatures:
             continue
         selected.append(item)
         if len(selected) >= fill_limit:
@@ -3852,11 +4197,23 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         args,
         temporal_seed=temporal_seed,
     )
-    if support_aligned_seeds:
+    semantic_up_flip_prior_candidates = load_semantic_up_flip_prior_candidates(
+        proxy_evaluator,
+        args,
+        t_world_from_cam,
+    )
+    semantic_up_flip_seeds = make_semantic_up_flip_seeds(
+        semantic_up_flip_prior_candidates + initial_candidates,
+        proxy_evaluator,
+        args,
+        temporal_seed=temporal_seed,
+    )
+    if support_aligned_seeds or semantic_up_flip_seeds:
         initial_candidates = merge_protected_initial_candidates(
             initial_candidates,
             support_aligned_seeds=support_aligned_seeds,
             depth_snapped_seeds=depth_snapped_seeds,
+            semantic_up_flip_seeds=semantic_up_flip_seeds,
             args=args,
         )
     print(f"[generic-search] generated {len(initial_candidates)} candidates")
@@ -3873,6 +4230,7 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
         corrected_seed=corrected_seed,
         temporal_seed=temporal_seed,
         support_aligned_seed=support_aligned_seeds[0] if support_aligned_seeds else None,
+        semantic_up_flip_seed=semantic_up_flip_seeds[0] if semantic_up_flip_seeds else None,
         support_alignment_trigger_deg=float(getattr(args, "support_alignment_trigger_deg", 6.0)),
         support_aligned_seed_score_margin=float(getattr(args, "support_aligned_seed_score_margin", 0.20)),
         prefer_temporal_first=bool(getattr(args, "generic_prefer_temporal_refine_first", True)),
@@ -3900,6 +4258,11 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "support_alignment_axis_index",
             "support_alignment_axis_sign",
             "support_alignment_delta_deg",
+            "semantic_up_flip_rescue_candidate_used",
+            "semantic_up_flip_variant",
+            "semantic_up_angle_deg_before_flip",
+            "semantic_up_angle_deg_after_flip",
+            "semantic_up_flip_base_source",
         ):
             if alignment_key in candidate:
                 refined_result[alignment_key] = candidate.get(alignment_key)
@@ -4138,6 +4501,15 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "semantic_up_score": best_result.get("semantic_up_score"),
             "semantic_up_penalty": best_result.get("semantic_up_penalty"),
             "semantic_up_penalty_eff": best_result.get("semantic_up_penalty_eff"),
+            "semantic_up_flip_rescue_enabled": bool(getattr(args, "semantic_up_flip_rescue_enabled", True)),
+            "semantic_up_flip_rescue_prior_paths": str(getattr(args, "semantic_up_flip_rescue_prior_paths", "")),
+            "semantic_up_flip_rescue_prior_candidate_count": len(semantic_up_flip_prior_candidates),
+            "semantic_up_flip_rescue_seed_count": len(semantic_up_flip_seeds),
+            "semantic_up_flip_rescue_candidate_used": bool(best_result.get("semantic_up_flip_rescue_candidate_used", False)),
+            "semantic_up_flip_variant": best_result.get("semantic_up_flip_variant"),
+            "semantic_up_angle_deg_before_flip": best_result.get("semantic_up_angle_deg_before_flip"),
+            "semantic_up_angle_deg_after_flip": best_result.get("semantic_up_angle_deg_after_flip"),
+            "semantic_up_flip_base_source": best_result.get("semantic_up_flip_base_source"),
         },
         "edge_assist": {
             "enabled": bool(args.edge_score_enabled),
@@ -4328,6 +4700,13 @@ def add_generic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--semantic_up_tolerance_deg", type=float, default=10.0)
     parser.add_argument("--semantic_up_hard_gate_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--semantic_up_hard_gate_max_angle_deg", type=float, default=135.0)
+    parser.add_argument("--semantic_up_flip_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--semantic_up_flip_rescue_source_top_k", type=int, default=8)
+    parser.add_argument("--semantic_up_flip_rescue_min_mask_iou", type=float, default=0.55)
+    parser.add_argument("--semantic_up_flip_rescue_min_bbox_iou", type=float, default=0.70)
+    parser.add_argument("--semantic_up_flip_rescue_keep_top_k", type=int, default=3)
+    parser.add_argument("--semantic_up_flip_rescue_variants", default="cam_z_180,cam_x_180,min_align")
+    parser.add_argument("--semantic_up_flip_rescue_prior_paths", default="")
     parser.add_argument("--generic_visual_rescue_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generic_visual_rescue_min_depth_score", type=float, default=0.90)
     parser.add_argument("--generic_visual_rescue_current_edge_max", type=float, default=0.18)

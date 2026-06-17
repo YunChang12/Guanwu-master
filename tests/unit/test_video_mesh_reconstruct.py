@@ -239,6 +239,86 @@ def test_mesh_reconstruct_attempts_only_zaiwu_moving_rigid_candidates(tmp_path: 
     assert meshes_payload["obj_000005"]["mesh_frame_selection"]["area_px"] == 500.0
 
 
+def test_mesh_reconstruct_vlm_selects_static_foreground_movable_rigid_candidate(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    attr_artifact = executor.context.artifacts.get("object.attr")
+    assert attr_artifact is not None
+
+    attrs_path = Path(attr_artifact.outputs["object_attrs"])
+    attrs = json.loads(attrs_path.read_text(encoding="utf-8"))
+    attrs["obj_000004"].update(
+        {
+            "scene_role": "foreground_object",
+            "is_movable_rigid": True,
+            "mesh_candidate_confidence": 0.92,
+        }
+    )
+    attrs_path.write_text(json.dumps(attrs, indent=2), encoding="utf-8")
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            object_id = objects[0].object_id
+            attempted_ids.append(object_id)
+            return {
+                object_id: {
+                    "instance_id": object_id,
+                    "segment_kind": "object",
+                    "mesh_path": f"/tmp/{object_id}.ply",
+                    "files": [],
+                }
+            }
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+
+    assert "obj_000004" in attempted_ids
+    assert result["summary"]["vlm_foreground_selected_count"] == 1
+
+
+def test_mesh_reconstruct_vlm_excludes_background_support_candidate(tmp_path: Path, monkeypatch) -> None:
+    executor = _build_mesh_reconstruct_executor(tmp_path)
+    attr_artifact = executor.context.artifacts.get("object.attr")
+    assert attr_artifact is not None
+
+    attrs_path = Path(attr_artifact.outputs["object_attrs"])
+    attrs = json.loads(attrs_path.read_text(encoding="utf-8"))
+    attrs["obj_000003"].update(
+        {
+            "scene_role": "background_support",
+            "is_movable_rigid": False,
+            "mesh_candidate_confidence": 0.95,
+        }
+    )
+    attrs_path.write_text(json.dumps(attrs, indent=2), encoding="utf-8")
+    attempted_ids: list[str] = []
+
+    class _FakeAdapter:
+        def reconstruct_object_meshes(self, best_frames, objects):  # type: ignore[no-untyped-def]
+            _ = best_frames
+            object_id = objects[0].object_id
+            attempted_ids.append(object_id)
+            return {
+                object_id: {
+                    "instance_id": object_id,
+                    "segment_kind": "object",
+                    "mesh_path": f"/tmp/{object_id}.ply",
+                    "files": [],
+                }
+            }
+
+    monkeypatch.setattr(executor, "_assert_zaiwu_service_ready", lambda service_id, stage: None)
+    monkeypatch.setattr(executor, "_get_zaiwu_sam3d", lambda: _FakeAdapter())
+
+    result = executor._run_mesh_reconstruct()
+
+    assert attempted_ids == ["obj_000005"]
+    assert result["summary"]["vlm_background_excluded_count"] == 1
+
+
 def test_mesh_reconstruct_limits_candidates_to_configured_object_id_whitelist(tmp_path: Path, monkeypatch) -> None:
     executor = _build_mesh_reconstruct_executor(tmp_path)
     executor.context.config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000003"]

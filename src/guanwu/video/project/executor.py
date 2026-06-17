@@ -42,6 +42,7 @@ from guanwu.video.features.spatial.road_geometry import (
     select_road_plane_for_frame,
 )
 from guanwu.video.features.spatial.scene_background_assets import (
+    ensure_road_plane_fused_background_asset,
     generate_target_frame_background_assets,
     load_background_asset_meshes,
 )
@@ -845,6 +846,31 @@ class ProjectExecutor:
                 return True
         return False
 
+    @staticmethod
+    def _mesh_candidate_vlm_decision(attrs: dict) -> tuple[bool | None, dict[str, Any]]:
+        if not isinstance(attrs, dict):
+            return None, {}
+        role = str(attrs.get("scene_role") or attrs.get("mesh_candidate_scene_role") or "").strip().lower()
+        confidence_raw = attrs.get("mesh_candidate_confidence", attrs.get("confidence"))
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        info = {
+            "scene_role": role or "unknown",
+            "confidence": confidence,
+            "is_movable_rigid": attrs.get("is_movable_rigid"),
+        }
+        if confidence < 0.7 or not role:
+            return None, {**info, "source": "heuristic_fallback", "reason": "missing_or_low_confidence_vlm_role"}
+        if role in {"robot", "background_support", "background_static", "deformable_or_fluid"}:
+            return False, {**info, "source": "vlm", "reason": f"excluded_{role}"}
+        if role == "foreground_object" and attrs.get("is_movable_rigid") is True:
+            return True, {**info, "source": "vlm", "reason": "foreground_movable_rigid"}
+        if role == "foreground_object":
+            return None, {**info, "source": "heuristic_fallback", "reason": "foreground_but_not_confirmed_movable_rigid"}
+        return None, {**info, "source": "heuristic_fallback", "reason": f"uncertain_role_{role}"}
+
     def _select_zaiwu_mesh_candidates(
         self,
         objects: list[ObjectNode],
@@ -941,29 +967,68 @@ class ProjectExecutor:
         detections: FrameDetections,
         objects: list[ObjectNode],
     ) -> dict[str, dict]:
+        def _label_based_priors() -> dict[str, dict[str, object]]:
+            background_labels = {
+                "table", "wall", "floor", "ceiling", "road", "roadway", "street",
+                "sidewalk", "pavement", "curb", "lane", "building", "pole",
+                "traffic light", "traffic sign", "manhole cover",
+            }
+            non_rigid_labels = {
+                "person", "pedestrian", "rider", "bicycle rider", "motorcycle rider",
+                "umbrella", "shadow", "reflection",
+            }
+            rigid_vehicle_tokens = {
+                "car", "bus", "truck", "van", "vehicle", "taxi", "suv",
+                "motorcycle", "bicycle",
+            }
+            priors: dict[str, dict[str, object]] = {}
+            for obj in objects:
+                label = str(obj.label or "unknown").strip().lower()
+                is_vehicle = any(token in label for token in rigid_vehicle_tokens)
+                is_background = label in background_labels or any(token in label for token in background_labels)
+                is_non_rigid = label in non_rigid_labels or any(token in label for token in non_rigid_labels)
+                is_rigid = bool(is_vehicle or (not is_background and not is_non_rigid and label != "unknown"))
+                scene_role = "foreground_object" if is_vehicle else (
+                    "background_static" if is_background else (
+                        "deformable_or_fluid" if is_non_rigid else "uncertain"
+                    )
+                )
+                priors[obj.object_id] = {
+                    "is_movable": bool(is_vehicle),
+                    "is_rigid_body": is_rigid,
+                    "class_name": label,
+                    "scene_role": scene_role,
+                    "is_movable_rigid": bool(is_vehicle and is_rigid),
+                    "mesh_candidate_confidence": 0.8 if is_vehicle else 0.6,
+                    "material_candidates": [],
+                    "confidence": 0.75 if is_vehicle else 0.55,
+                    "rationale": "label_based_fallback",
+                }
+            return priors
+
         mode = self._provider_mode()
         if mode in ("mock", "zaiwu"):
             if mode == "zaiwu":
                 from guanwu.video.features.world_inference.object_attr import ObjectAttrAgent
                 from guanwu.video.core.config import VLMConfig
                 vlm_cfg = self.context.config.settings.vlm
+                vlm_mode = str(getattr(vlm_cfg, "mode", "") or "").strip().lower()
+                if (
+                    vlm_mode == "disabled"
+                    or os.environ.get("GUANWU_OBJECT_ATTR_VLM", "").strip().lower()
+                    in {"0", "false", "no", "off", "disabled"}
+                ):
+                    return _label_based_priors()
                 agent = ObjectAttrAgent(VLMConfig(
+                    mode=vlm_cfg.mode,
+                    backend=vlm_cfg.backend,
                     api_key=vlm_cfg.api_key,
                     base_url=vlm_cfg.base_url,
                     model=vlm_cfg.model,
                     max_retries=vlm_cfg.max_retries,
                 ))
                 return agent.infer_object_physics_priors(detections, objects)
-            priors: dict[str, dict[str, object]] = {}
-            for obj in objects:
-                label = str(obj.label).lower()
-                movable = label not in {"table", "wall", "floor", "ceiling", "road"}
-                priors[obj.object_id] = {
-                    "is_movable": movable,
-                    "is_rigid_body": movable,
-                    "material": "rigid" if movable else "static",
-                }
-            return priors
+            return _label_based_priors()
         return {}
 
     def _latest_frame_detections(self) -> FrameDetections:
@@ -1456,13 +1521,10 @@ class ProjectExecutor:
                     for object_id in (getattr(zaiwu_settings, "mesh_reconstruct_object_ids", []) or [])
                     if str(object_id).strip()
                 ]
-            disable_road_semantics = bool(getattr(zaiwu_settings, "background_disable_road_semantics", False))
-            tabletop_task_mode = background_mode in {"tabletop_task", "task", "manipulation", "robot_task"}
-            if tabletop_task_mode:
-                disable_road_semantics = True
             background_cleaner_config = {
                 "config_path": getattr(zaiwu_settings, "background_cleaner_config_path", None),
                 "model": getattr(zaiwu_settings, "background_cleaner_model", "gpt-image-2"),
+                "scene_prompt_profile": getattr(zaiwu_settings, "background_scene_prompt_profile", "auto"),
             }
             background_target_frame_id = max(1, int(getattr(zaiwu_settings, "background_target_frame_id", 1) or 1))
             background_assets = generate_target_frame_background_assets(
@@ -1475,16 +1537,10 @@ class ProjectExecutor:
                     out_dir / "background_assets",
                     background_mode=background_mode,
                 ),
-                semantic_road_estimator=(
-                    None
-                    if disable_road_semantics
-                    else self._build_semantic_road_estimator(out_dir / "background_assets")
-                ),
                 grid_stride=4,
                 background_mode=background_mode,
                 task_foreground_object_ids=task_foreground_ids,
-                disable_road_semantics=disable_road_semantics,
-                background_cleaner=getattr(zaiwu_settings, "background_cleaner", "temporal"),
+                background_cleaner=getattr(zaiwu_settings, "background_cleaner", "openai_image_edit"),
                 background_cleaner_config=background_cleaner_config,
                 background_cleaner_reference_frame_id=getattr(
                     zaiwu_settings,
@@ -1556,18 +1612,6 @@ class ProjectExecutor:
     def _build_background_clean_depth_estimator(self, output_dir: Path, *, background_mode: str):
         _ = str(background_mode or "auto").strip().lower()
         return self._build_clean_background_depth_estimator(output_dir)
-
-    def _build_semantic_road_estimator(self, output_dir: Path):
-        if self._provider_mode() != "zaiwu":
-            return None
-        settings = self.context.config.settings
-        if not getattr(settings.zaiwu, "enabled", False):
-            return None
-
-        def estimate(clean_rgb_path: Path, *, frame_id: int) -> dict[str, Any] | None:
-            return self._estimate_semantic_road_with_zaiwu(clean_rgb_path, frame_id=frame_id, output_dir=output_dir)
-
-        return estimate
 
     def _estimate_clean_background_depth_with_zaiwu(self, clean_rgb_path: Path, *, output_dir: Path) -> dict[str, Any] | None:
         service_id = str(self.context.config.settings.zaiwu.depth_service or "services.depth_anything3")
@@ -1797,142 +1841,6 @@ class ProjectExecutor:
             return int(fallback_index)
         return max(0, int(frame_id) - 1)
 
-    def _estimate_semantic_road_with_zaiwu(
-        self,
-        clean_rgb_path: Path,
-        *,
-        frame_id: int,
-        output_dir: Path,
-    ) -> dict[str, Any] | None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        service_id = str(self.context.config.settings.zaiwu.grounded_sam2_service or "services.grounding_dino_sam2")
-        mask_path = output_dir / "road_gsam2_mask.png"
-        raw_path = output_dir / "road_gsam2_raw.json"
-        try:
-            image = cv2.imread(str(clean_rgb_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Failed to read clean background RGB for road segmentation: {clean_rgb_path}")
-            ok, encoded = cv2.imencode(".jpg", image)
-            if not ok:
-                raise ValueError(f"Failed to encode clean background RGB for road segmentation: {clean_rgb_path}")
-            image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-            payload = {
-                "frame_idx": int(frame_id),
-                "timestamp": 0.0,
-                "image_base64": image_b64,
-                "text_prompt": "road. roadway. asphalt road. driving lane. lane marking.",
-            }
-            gateway = build_zaiwu_gateway_client(self.context.config.settings)
-            result = gateway.run_service_job(
-                service_id,
-                "gsam2_parse_frame",
-                payload=payload,
-                timeout_sec=max(1800.0, float(self.context.config.settings.zaiwu.job_timeout_sec or 0.0)),
-            )
-            raw_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            mask = self._road_mask_from_grounded_sam2_payload(result, image.shape[:2])
-            if mask is None or not mask.any():
-                _logger.warning("[geometry.lift] GroundedSAM2 returned no usable road mask for clean background")
-                return None
-            cv2.imwrite(str(mask_path), mask.astype(np.uint8) * 255)
-            return {
-                "mask": mask,
-                "mask_path": str(mask_path),
-                "source": "grounding_dino_sam2_clean_target_rgb",
-                "quality": {
-                    "road_service": service_id,
-                    "road_mask_fraction": float(np.mean(mask)),
-                    "raw_result_path": str(raw_path),
-                },
-            }
-        except Exception as exc:
-            _logger.warning("[geometry.lift] GroundedSAM2 clean road segmentation failed; falling back to detection road masks: %s", exc)
-            return None
-
-    @staticmethod
-    def _road_mask_from_grounded_sam2_payload(payload: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        road_masks: list[np.ndarray] = []
-        decoded_masks: list[np.ndarray] = []
-        for inst in payload.get("instances", []) or []:
-            if not isinstance(inst, dict):
-                continue
-            label = str(inst.get("concept_label") or inst.get("label") or "").lower()
-            mask = ProjectExecutor._decode_grounded_sam2_mask(inst, shape)
-            if mask is None:
-                continue
-            decoded_masks.append(mask)
-            if any(token in label for token in ("road", "roadway", "asphalt", "lane", "street", "pavement", "driveway")):
-                road_masks.append(mask)
-        masks = road_masks or decoded_masks
-        if not masks:
-            return None
-        return np.logical_or.reduce(masks).astype(bool)
-
-    @staticmethod
-    def _decode_grounded_sam2_mask(inst: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        raw = inst.get("mask_rle") or inst.get("mask")
-        if raw:
-            try:
-                rle = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                if isinstance(rle.get("counts"), list):
-                    return ProjectExecutor._decode_uncompressed_rle_mask(rle, shape)
-                counts = rle.get("counts")
-                if isinstance(counts, str):
-                    rle["counts"] = counts.encode("ascii")
-                from pycocotools import mask as mask_utils
-
-                decoded = mask_utils.decode(rle)
-                if decoded.ndim == 3:
-                    decoded = decoded[:, :, 0]
-                mask = decoded.astype(bool)
-                if mask.shape == shape:
-                    return mask
-            except Exception:
-                pass
-        bbox = inst.get("bbox")
-        if isinstance(bbox, list) and len(bbox) >= 4:
-            try:
-                height, width = shape
-                x1, y1, x2, y2 = [int(round(float(v))) for v in bbox[:4]]
-                x1 = max(0, min(width, x1))
-                x2 = max(0, min(width, x2))
-                y1 = max(0, min(height, y1))
-                y2 = max(0, min(height, y2))
-            except Exception:
-                return None
-            if x2 > x1 and y2 > y1:
-                mask = np.zeros((height, width), dtype=bool)
-                mask[y1:y2, x1:x2] = True
-                return mask
-        return None
-
-    @staticmethod
-    def _decode_uncompressed_rle_mask(rle: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
-        size = rle.get("size")
-        counts = rle.get("counts")
-        if not (isinstance(size, list) and len(size) >= 2 and isinstance(counts, list)):
-            return None
-        height, width = int(size[0]), int(size[1])
-        if (height, width) != shape:
-            return None
-        values: list[int] = []
-        fill = 0
-        for count in counts:
-            try:
-                run = int(count)
-            except (TypeError, ValueError):
-                return None
-            if run < 0:
-                return None
-            values.extend([fill] * run)
-            fill = 1 - fill
-        expected = height * width
-        if len(values) < expected:
-            values.extend([0] * (expected - len(values)))
-        if len(values) > expected:
-            values = values[:expected]
-        return np.asarray(values, dtype=np.uint8).reshape((height, width), order="F").astype(bool)
-
     @staticmethod
     def _write_single_frame_depth_video(image_path: Path, video_path: Path, *, fps: float = 1.0) -> None:
         rgb = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -2018,26 +1926,73 @@ class ProjectExecutor:
             obj for obj in rigid_objects
             if object_attrs.get(obj.object_id, {}).get("is_bbox_moving") is True
         ]
+        bbox_moving_ids = {obj.object_id for obj in bbox_moving_candidates}
         mesh_object_id_whitelist = {
             str(object_id).strip()
             for object_id in getattr(self.context.config.settings.zaiwu, "mesh_reconstruct_object_ids", [])
             if str(object_id).strip()
         }
+        mesh_candidate_selection: dict[str, dict] = {}
+        vlm_foreground_selected_count = 0
+        vlm_background_excluded_count = 0
         if mesh_object_id_whitelist:
             objects_to_reconstruct = [
                 obj for obj in objects if obj.object_id in mesh_object_id_whitelist
             ]
+            for obj in objects:
+                mesh_candidate_selection[obj.object_id] = {
+                    "selected": obj.object_id in mesh_object_id_whitelist,
+                    "source": "whitelist" if obj.object_id in mesh_object_id_whitelist else "not_whitelisted",
+                    "reason": "configured_mesh_reconstruct_object_ids",
+                    "is_rigid_body": object_attrs.get(obj.object_id, {}).get("is_rigid_body"),
+                    "is_bbox_moving": object_attrs.get(obj.object_id, {}).get("is_bbox_moving"),
+                }
         else:
-            objects_to_reconstruct = bbox_moving_candidates
+            objects_to_reconstruct = []
+            for obj in objects:
+                attrs = object_attrs.get(obj.object_id, {})
+                heuristic_selected = obj.object_id in bbox_moving_ids
+                vlm_decision, vlm_info = self._mesh_candidate_vlm_decision(attrs)
+                if vlm_decision is True:
+                    selected = True
+                    vlm_foreground_selected_count += 1
+                elif vlm_decision is False:
+                    selected = False
+                    vlm_background_excluded_count += 1
+                else:
+                    selected = heuristic_selected
+                if selected:
+                    objects_to_reconstruct.append(obj)
+                mesh_candidate_selection[obj.object_id] = {
+                    "selected": selected,
+                    "source": vlm_info.get("source", "heuristic"),
+                    "reason": vlm_info.get("reason", "rigid_bbox_moving" if heuristic_selected else "not_rigid_bbox_moving"),
+                    "scene_role": vlm_info.get("scene_role"),
+                    "vlm_confidence": vlm_info.get("confidence"),
+                    "is_movable_rigid": attrs.get("is_movable_rigid"),
+                    "is_rigid_body": attrs.get("is_rigid_body"),
+                    "is_bbox_moving": attrs.get("is_bbox_moving"),
+                }
         objects_after_robotic_arm_filter: list[ObjectNode] = []
         robotic_arm_excluded_count = 0
         for obj in objects_to_reconstruct:
             attrs = object_attrs.get(obj.object_id, {})
             if self._is_robotic_arm_mesh_excluded(obj, attrs):
                 robotic_arm_excluded_count += 1
+                mesh_candidate_selection.setdefault(obj.object_id, {})["selected"] = False
+                mesh_candidate_selection[obj.object_id]["reason"] = "excluded_robotic_arm"
                 continue
             objects_after_robotic_arm_filter.append(obj)
         objects_to_reconstruct = objects_after_robotic_arm_filter
+        selection_path = out_dir / "mesh_candidate_selection.json"
+        self._json_dump(
+            selection_path,
+            {
+                "filter_mode": "vlm_with_heuristic_fallback",
+                "confidence_threshold": 0.7,
+                "objects": mesh_candidate_selection,
+            },
+        )
         _logger.info(
             f"mesh.reconstruct: {len(objects_to_reconstruct)}/{len(objects)} objects "
             f"selected (is_rigid_body=True, is_bbox_moving=True)"
@@ -2093,7 +2048,7 @@ class ProjectExecutor:
                     "size_score": selection["size_score"],
                 }
         self._json_dump(meshes_path, meshes)
-        outputs = {"sam3d_meshes": str(meshes_path)}
+        outputs = {"sam3d_meshes": str(meshes_path), "mesh_candidate_selection": str(selection_path)}
         summary = {
             "mesh_count": len(meshes),
             "object_count": len(objects),
@@ -2102,6 +2057,8 @@ class ProjectExecutor:
             "bbox_moving_candidate_count": len(bbox_moving_candidates),
             "rigid_moving_selected_count": len(objects_to_reconstruct),
             "robotic_arm_excluded_count": robotic_arm_excluded_count,
+            "vlm_foreground_selected_count": vlm_foreground_selected_count,
+            "vlm_background_excluded_count": vlm_background_excluded_count,
             **mesh_stats,
         }
         return self._base_result("mesh.reconstruct", summary, outputs)
@@ -2132,7 +2089,11 @@ class ProjectExecutor:
             detection_frames=detection_frames,
             world_up_axis="-y",
         )
-        road_geometry = self._road_geometry_with_background_fallback(road_geometry, geometry)
+        road_geometry = self._road_geometry_with_background_fallback(
+            road_geometry,
+            geometry,
+            prefer_background=True,
+        )
         road_geometry_path = out_dir / "road_geometry.json"
         self._json_dump(road_geometry_path, road_geometry)
         background_geometry_reference = self._tabletop_reference_from_geometry(geometry)
@@ -2602,8 +2563,6 @@ class ProjectExecutor:
         wildgs_depth_maps_dir: str | Path | None,
         fallback_to_wildgs: bool,
     ) -> str | None:
-        if not generic_mode:
-            return str(wildgs_depth_maps_dir) if wildgs_depth_maps_dir else None
         source = str(pose_depth_source or "depth_anything3").strip().lower().replace("-", "_")
         if source in {"da3", "depth_anything", "zaiwu_depth_anything3"}:
             source = "depth_anything3"
@@ -3089,6 +3048,8 @@ class ProjectExecutor:
                 trusted_anchor_prior = self._edge_pose_candidate_temporal_prior_payload(
                     previous_anchor,
                     all_frames_mode=all_frames_mode,
+                    current_frame_id=int(frame_id),
+                    current_bbox=bbox,
                 )
                 if trusted_anchor_prior:
                     trusted_anchor_prior["source"] = "trusted_temporal_anchor_pose"
@@ -3108,6 +3069,8 @@ class ProjectExecutor:
                     temporal_prior_pose=self._edge_pose_candidate_temporal_prior_payload(
                         previous_candidate_prior if all_frames_mode else previous_accepted,
                         all_frames_mode=all_frames_mode,
+                        current_frame_id=int(frame_id),
+                        current_bbox=bbox,
                     ),
                 )
 
@@ -3151,7 +3114,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object"):
+                    if object_fail_fast.get("skip_object") and not all_frames_mode:
                         break
                     continue
 
@@ -3174,7 +3137,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object"):
+                    if object_fail_fast.get("skip_object") and not all_frames_mode:
                         break
                     continue
 
@@ -3339,7 +3302,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object"):
+                    if object_fail_fast.get("skip_object") and not all_frames_mode:
                         break
 
             if object_fail_fast and object_fail_fast.get("skip_object"):
@@ -3348,6 +3311,7 @@ class ProjectExecutor:
                     frame_ids=frame_ids,
                     frame_records=frame_records,
                     accepted_records=accepted_records,
+                    skip_remaining_frames=not all_frames_mode,
                 )
                 if fail_fast_summary.get("skip_entire_object"):
                     manifest["objects"][obj_id] = {
@@ -3385,6 +3349,7 @@ class ProjectExecutor:
                             selected_records,
                             frame_ids=frame_ids,
                             frame_records=frame_records,
+                            skip_remaining_frames=not all_frames_mode,
                         )
                     if anchor_gate_summary.get("applied"):
                         trajectory_selection_summary["anchor_temporal_gate"] = anchor_gate_summary
@@ -3677,7 +3642,13 @@ class ProjectExecutor:
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
-        plane = manifest.get("road_plane")
+        plane = ProjectExecutor._tabletop_reference_from_geometry(geometry)
+        source = "background_geometry_reference"
+        normalize_plane = True
+        if not isinstance(plane, dict):
+            plane = manifest.get("road_plane")
+            source = "background_assets_manifest"
+            normalize_plane = False
         if not isinstance(plane, dict):
             return None
         try:
@@ -3688,6 +3659,12 @@ class ProjectExecutor:
         if len(normal) != 3 or not all(math.isfinite(v) for v in normal) or not math.isfinite(offset):
             return None
         plane = dict(plane)
+        if normalize_plane:
+            normal_arr = np.asarray(normal, dtype=np.float64)
+            norm = float(np.linalg.norm(normal_arr))
+            if norm < 1e-8 or not math.isfinite(norm):
+                return None
+            normal = [float(v) for v in (normal_arr / norm).tolist()]
         plane["normal_world"] = normal
         plane["offset"] = offset
         plane.setdefault("source", "background_assets_manifest")
@@ -3701,7 +3678,7 @@ class ProjectExecutor:
         )
         return {
             "available": True,
-            "source": "background_assets_manifest",
+            "source": source,
             "background_assets_manifest": str(path),
             "default_plane_policy": "global_for_fixed_camera",
             "keyframe_planes": [],
@@ -3710,10 +3687,27 @@ class ProjectExecutor:
         }
 
     @staticmethod
-    def _road_geometry_with_background_fallback(road_geometry: dict | None, geometry) -> dict:
+    def _road_geometry_with_background_fallback(
+        road_geometry: dict | None,
+        geometry,
+        *,
+        prefer_background: bool = False,
+    ) -> dict:
+        fallback = None
+        if prefer_background:
+            fallback = ProjectExecutor._background_road_geometry_from_manifest(geometry)
+            if fallback is not None:
+                if isinstance(road_geometry, dict):
+                    fallback["preferred_over"] = {
+                        key: road_geometry.get(key)
+                        for key in ("available", "reason", "source", "depth_maps_dir")
+                        if key in road_geometry
+                    }
+                return fallback
         if isinstance(road_geometry, dict) and road_geometry.get("available") and road_geometry.get("global_plane"):
             return road_geometry
-        fallback = ProjectExecutor._background_road_geometry_from_manifest(geometry)
+        if fallback is None:
+            fallback = ProjectExecutor._background_road_geometry_from_manifest(geometry)
         if fallback is None:
             return road_geometry if isinstance(road_geometry, dict) else {"available": False, "reason": "missing_road_geometry"}
         if isinstance(road_geometry, dict):
@@ -4699,13 +4693,17 @@ class ProjectExecutor:
 
         wildgs_poses, wildgs_K = self._load_wildgs_poses(geometry)
         bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh"))
-        pose_opt_artifact = self.context.artifacts.get("pose.optimize")
-        pose_road_geometry_path = None if pose_opt_artifact is None else pose_opt_artifact.outputs.get("road_geometry")
-        bg_meshes = load_background_asset_meshes(
-            geometry.outputs.get("background_assets_manifest"),
-            road_geometry_path=pose_road_geometry_path,
-            camera_trajectory_path=geometry.outputs.get("camera_trajectory"),
+        pose_artifact = self.context.artifacts.get("pose.optimize")
+        pose_road_geometry_path = (
+            pose_artifact.outputs.get("road_geometry")
+            if pose_artifact is not None
+            else None
         )
+        ensure_road_plane_fused_background_asset(
+            geometry.outputs.get("background_assets_manifest"),
+            pose_road_geometry_path,
+        )
+        bg_meshes = load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
         if not bg_meshes:
             bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
 
@@ -5931,13 +5929,62 @@ class ProjectExecutor:
         previous: dict | None,
         *,
         all_frames_mode: bool,
+        current_frame_id: int | None = None,
+        current_bbox: object | None = None,
     ) -> dict | None:
         if previous is None:
             return None
         # all_frames still must not read stale result folders from disk during
         # candidate generation, but the current run's last accepted pose is a
         # useful trust-region seed and mirrors the target-window path.
+        if all_frames_mode and ProjectExecutor._edge_pose_temporal_prior_is_stale_for_bbox(
+            previous,
+            current_frame_id=current_frame_id,
+            current_bbox=current_bbox,
+        ):
+            return None
         return ProjectExecutor._edge_pose_temporal_prior_payload(previous)
+
+    @staticmethod
+    def _edge_pose_temporal_prior_is_stale_for_bbox(
+        previous: dict | None,
+        *,
+        current_frame_id: int | None,
+        current_bbox: object | None,
+        max_frame_gap: int = 1,
+        min_bbox_iou: float = 0.25,
+        max_center_delta_px: float = 24.0,
+        max_center_delta_ratio: float = 0.22,
+        max_size_delta_ratio: float = 0.35,
+    ) -> bool:
+        if not isinstance(previous, dict):
+            return False
+        if current_frame_id is None:
+            return False
+        try:
+            frame_gap = int(current_frame_id) - int(previous.get("frame_id") or 0)
+        except Exception:
+            return False
+        if frame_gap <= int(max_frame_gap):
+            return False
+        metrics = previous.get("metrics") if isinstance(previous.get("metrics"), dict) else {}
+        previous_bbox = metrics.get("detection_bbox") or metrics.get("bbox_xyxy") or metrics.get("bbox")
+        bbox_stats = ProjectExecutor._bbox_xyxy_stats(current_bbox, previous_bbox)
+        if not bbox_stats.get("valid"):
+            return False
+        try:
+            bbox_iou = float(bbox_stats.get("iou") or 0.0)
+            center_delta_px = float(bbox_stats.get("center_delta_px") or 0.0)
+            center_delta_ratio = float(bbox_stats.get("center_delta_ratio") or 0.0)
+            size_delta_ratio = float(bbox_stats.get("size_delta_ratio") or 0.0)
+        except Exception:
+            return False
+        return (
+            bbox_iou < float(min_bbox_iou)
+            or center_delta_px > float(max_center_delta_px)
+            or center_delta_ratio > float(max_center_delta_ratio)
+            or size_delta_ratio > float(max_size_delta_ratio)
+        )
 
     @staticmethod
     def _pose_record_updates_temporal_anchor(record: dict) -> bool:
@@ -6274,9 +6321,11 @@ class ProjectExecutor:
         *,
         frame_ids: list[int],
         frame_records: dict[str, dict],
+        skip_remaining_frames: bool = True,
     ) -> tuple[list[dict], dict]:
         kept: list[dict] = []
         anchor: dict | None = None
+        first_rejection: dict | None = None
         sorted_records = sorted(
             [record for record in selected_records if isinstance(record, dict)],
             key=lambda record: int(record.get("frame_id") or 0),
@@ -6286,25 +6335,36 @@ class ProjectExecutor:
             record["anchor_temporal_gate"] = decision
             if not decision.get("accepted"):
                 failed_frame_id = int(record.get("frame_id") or 0)
-                record["status"] = "rejected"
-                record["reason"] = str(decision.get("reason") or "anchor_temporal_gate_rejected")
-                frame_records[f"frame_{failed_frame_id:06d}"] = record
-                remaining_count = 0
-                for remaining_frame_id in sorted({int(fid) for fid in frame_ids if int(fid) > failed_frame_id}):
-                    remaining_count += 1
-                    frame_records[f"frame_{remaining_frame_id:06d}"] = {
-                        "status": "skipped",
-                        "reason": "skipped_after_anchor_temporal_gate_failure",
+                reason = str(decision.get("reason") or "anchor_temporal_gate_rejected")
+                if first_rejection is None:
+                    first_rejection = {
+                        "reason": reason,
                         "failed_frame_id": failed_frame_id,
+                        "accepted_frame_count_before_failure": len(kept),
+                        "gate": decision,
                     }
-                return kept, {
-                    "applied": True,
-                    "reason": record["reason"],
-                    "failed_frame_id": failed_frame_id,
-                    "remaining_frame_count": remaining_count,
-                    "accepted_frame_count_before_failure": len(kept),
-                    "gate": decision,
-                }
+                if skip_remaining_frames:
+                    record["status"] = "rejected"
+                    record["reason"] = reason
+                    frame_records[f"frame_{failed_frame_id:06d}"] = record
+                    remaining_count = 0
+                    for remaining_frame_id in sorted({int(fid) for fid in frame_ids if int(fid) > failed_frame_id}):
+                        remaining_count += 1
+                        frame_records[f"frame_{remaining_frame_id:06d}"] = {
+                            "status": "skipped",
+                            "reason": "skipped_after_anchor_temporal_gate_failure",
+                            "failed_frame_id": failed_frame_id,
+                        }
+                    return kept, {
+                        "applied": True,
+                        "blocking": True,
+                        "reason": reason,
+                        "failed_frame_id": failed_frame_id,
+                        "remaining_frame_count": remaining_count,
+                        "accepted_frame_count_before_failure": len(kept),
+                        "gate": decision,
+                    }
+                record["anchor_temporal_gate_warning"] = reason
             record["status"] = "accepted"
             kept.append(record)
             anchor_kind = ProjectExecutor._pose_temporal_anchor_kind(record)
@@ -6312,6 +6372,16 @@ class ProjectExecutor:
                 record["temporal_anchor_kind"] = anchor_kind
             if anchor_kind:
                 anchor = record
+            frame_id = int(record.get("frame_id") or 0)
+            if frame_id > 0:
+                frame_records[f"frame_{frame_id:06d}"] = record
+        if first_rejection is not None:
+            return kept, {
+                "applied": True,
+                "blocking": False,
+                "remaining_frame_count": 0,
+                **first_rejection,
+            }
         return kept, {"applied": False, "reason": "all_selected_records_passed"}
 
     @staticmethod
@@ -6388,22 +6458,24 @@ class ProjectExecutor:
         frame_ids: list[int],
         frame_records: dict[str, dict],
         accepted_records: list[dict],
+        skip_remaining_frames: bool = True,
     ) -> dict:
         failed_frame_id = int(fail_fast.get("frame_id") or 0)
         remaining_count = 0
-        for remaining_frame_id in frame_ids:
-            remaining_frame_id = int(remaining_frame_id)
-            if failed_frame_id and remaining_frame_id <= failed_frame_id:
-                continue
-            remaining_count += 1
-            frame_key = f"frame_{remaining_frame_id:06d}"
-            if frame_key in frame_records:
-                continue
-            frame_records[frame_key] = {
-                "status": "skipped",
-                "reason": "skipped_after_truncated_object_failure",
-                "failed_frame_id": failed_frame_id,
-            }
+        if skip_remaining_frames:
+            for remaining_frame_id in frame_ids:
+                remaining_frame_id = int(remaining_frame_id)
+                if failed_frame_id and remaining_frame_id <= failed_frame_id:
+                    continue
+                remaining_count += 1
+                frame_key = f"frame_{remaining_frame_id:06d}"
+                if frame_key in frame_records:
+                    continue
+                frame_records[frame_key] = {
+                    "status": "skipped",
+                    "reason": "skipped_after_truncated_object_failure",
+                    "failed_frame_id": failed_frame_id,
+                }
         accepted_count = len([record for record in accepted_records if isinstance(record, dict)])
         if accepted_count <= 0:
             accepted_count = sum(
@@ -8149,6 +8221,19 @@ class ProjectExecutor:
             center_error = float(metrics.get("bbox_center_error_px") or 1e9)
         except Exception:
             return {"accepted": False, "reason": "invalid_metrics"}
+        try:
+            temporal_visual_penalty = float(metrics.get("temporal_anchor_visual_penalty") or 0.0)
+        except Exception:
+            temporal_visual_penalty = 0.0
+        if temporal_visual_penalty >= 100000.0:
+            reason = str(metrics.get("temporal_anchor_visual_gate_reason") or "temporal_anchor_visual_gate_failed")
+            return {"accepted": False, "reason": f"temporal_anchor_visual_gate_rejected:{reason}"}
+        try:
+            score = float(metrics.get("score"))
+        except Exception:
+            score = 0.0
+        if math.isfinite(score) and score <= -100000.0:
+            return {"accepted": False, "reason": f"optimizer_score_hard_rejected:{score:.1f}"}
         if mask_iou < 0.20:
             return {"accepted": False, "reason": f"mask_iou_below_threshold:{mask_iou:.3f}"}
         if bbox_iou < 0.20:
@@ -8589,12 +8674,13 @@ class ProjectExecutor:
         if not raw.exists() or raw.is_file():
             return []
         ordered = [
-            ("road", raw / "road_mesh.obj"),
-            ("structures", raw / "structures_mesh.obj"),
-            ("far", raw / "far_mesh.obj"),
+            ("background", raw / "background_mesh.obj"),
+            ("background", raw / "background_mesh.ply"),
+            ("depth_background", raw / "depth_mesh" / "depth_background.glb"),
+            ("tabletop", raw / "meshes" / "tabletop_background.obj"),
         ]
         out = [(name, path) for name, path in ordered if path.exists()]
-        return out if len(out) >= 2 else []
+        return out[:1]
 
     @staticmethod
     def _background_assets_target_frame_id(geometry) -> int | None:
@@ -11429,17 +11515,12 @@ class ProjectExecutor:
         if compose is not None:
             geometry = self.context.artifacts.get("geometry.lift")
             mesh_art = self.context.artifacts.get("mesh.reconstruct")
+            pose_artifact = self.context.artifacts.get("pose.optimize")
             sam3d_meshes = self._json_load(mesh_art.outputs["sam3d_meshes"])
             corrected_traj = self._json_load(compose.outputs["corrected_trajectories"])
             bg_mesh_path = self._find_bg_mesh(geometry.outputs.get("wildgs_background_mesh")) if geometry else None
-            pose_opt_artifact = self.context.artifacts.get("pose.optimize")
-            pose_road_geometry_path = None if pose_opt_artifact is None else pose_opt_artifact.outputs.get("road_geometry")
             bg_meshes = (
-                load_background_asset_meshes(
-                    geometry.outputs.get("background_assets_manifest"),
-                    road_geometry_path=pose_road_geometry_path,
-                    camera_trajectory_path=geometry.outputs.get("camera_trajectory"),
-                )
+                load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
                 if geometry
                 else []
             )
@@ -11448,6 +11529,19 @@ class ProjectExecutor:
             cam_traj = self._json_load(geometry.outputs["camera_trajectory"]) if geometry else []
             wildgs_poses, _ = self._load_wildgs_poses(geometry) if geometry else ([], None)
             object_visibility_frames = self._object_visibility_frames_from_index()
+            pose_road_geometry_path = (
+                pose_artifact.outputs.get("road_geometry")
+                if pose_artifact is not None
+                else None
+            )
+            if geometry:
+                ensure_road_plane_fused_background_asset(
+                    geometry.outputs.get("background_assets_manifest"),
+                    pose_road_geometry_path,
+                )
+                bg_meshes = load_background_asset_meshes(geometry.outputs.get("background_assets_manifest"))
+                if not bg_meshes:
+                    bg_meshes = self._find_bg_meshes(geometry.outputs.get("wildgs_background_mesh"))
 
             fixed_camera_reference_frame_id, fixed_camera_road_plane = self._scene_export_fixed_camera_grounding_plane(
                 geometry,

@@ -1,0 +1,47 @@
+workspace_root: /root/autodl-tmp/guanwu_zaiwu_workspace
+random_seed: 42
+
+storage:
+  raw_root: raw
+  staging_root: staging
+  canonical_root: canonical
+  export_root: exports
+  catalog_path: catalog/catalog.duckdb
+  project_root: projects
+
+runtime:
+  workers: 8
+  fail_fast: true
+  log_json: true
+  resume: true
+
+policies:
+  default_up_axis: Z
+  unit: meters
+  fail_on_unknown_license: false
+  generate_glb_preview: true
+  generate_mesh_stats: true
+  generate_pointcloud_preview: false
+  keep_raw_forever: true
+  allow_proxy_mesh_generation: true
+
+video_pipeline:
+  provider_mode: zaiwu
+  camera_provider: wildgs
+  export_profile: usd_full
+  default_dataset_id: natural_video
+  zaiwu_gateway_url: https://u785484-vw4m-7adb72c8.westd.seetacloud.com:8443
+  zaiwu_auto_start_workers: true
+  object_detection_backend: seg2track_sam2
+  background_mode: road
+  background_cleaner: openai_image_edit
+  background_cleaner_config_path: /root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml
+  background_cleaner_model: gpt-image-2
+  background_cleaner_reference_frame_id: 1
+  background_scene_prompt_profile: road
+  pose_optimizer_timeout_sec: 1800.0
+  pose_optimize_min_bbox_area_px: 5000.0
+  mesh_proxy_mode: auto
+  mesh_proxy_target_faces: 15000
+  mesh_proxy_use_for_pose: true
+  mesh_proxy_keep_original_for_export: true

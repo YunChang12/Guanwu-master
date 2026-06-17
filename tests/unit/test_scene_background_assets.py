@@ -10,20 +10,16 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import openai
+import pytest
 import trimesh
 from PIL import Image
 
 from guanwu.video.features.spatial.scene_background_assets import (
-    _fill_low_candidate_dynamic_regions,
-    _estimate_global_road_plane_from_semantic_depth,
     _resolve_openai_image_edit_size,
     _resolve_depth_for_frame,
-    _road_surface_mask_for_static_gap,
     build_dynamic_mask,
-    expand_road_mask_with_side_boundaries,
-    build_road_full_mask_from_visible,
-    build_road_visible_mask,
     build_static_guard_mask,
+    ensure_road_plane_fused_background_asset,
     generate_depth_background_mesh_assets,
     generate_target_frame_background_assets,
     load_background_asset_meshes,
@@ -64,15 +60,15 @@ def _mask_instance(object_id: str, label: str, mask: np.ndarray, bbox: list[floa
     }
 
 
-def _project_test_vertices(vertices: np.ndarray, camera: dict) -> tuple[np.ndarray, np.ndarray]:
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    return image_x, image_y
-
-
-def _road_plane_vertex_mask(vertices: np.ndarray, *, plane_z: float = 5.0) -> np.ndarray:
-    return np.abs(vertices[:, 2] - float(plane_z)) < 1e-5
+def _copy_reference_cleaner(**kwargs) -> dict:
+    reference = Image.open(kwargs["image_path"]).convert("RGB")
+    reference.save(kwargs["output_path"])
+    return {
+        "clean_rgb_path": str(kwargs["output_path"]),
+        "raw_output_path": str(kwargs["output_path"]),
+        "model": kwargs["config"].get("model", "gpt-image-2"),
+        "prompt": kwargs["config"].get("prompt", "test clean background"),
+    }
 
 
 def test_resolve_openai_image_edit_size_uses_original_image_dimensions(tmp_path: Path) -> None:
@@ -150,6 +146,7 @@ def test_generate_background_assets_defaults_to_first_frame_and_uses_da3_clean_d
             "depth_path": external_depth,
             "source": "depth_anything3_clean_rgb",
         },
+        background_image_cleaner=_copy_reference_cleaner,
         grid_stride=4,
     )
 
@@ -340,152 +337,34 @@ def test_build_static_guard_mask_uses_static_boundary_categories_not_road() -> N
     assert not guard[10, 14]
 
 
-def test_build_road_visible_mask_uses_semantic_road_labels_only() -> None:
-    road = np.zeros((24, 32), dtype=bool)
-    road[12:23, 6:26] = True
-    sidewalk = np.zeros((24, 32), dtype=bool)
-    sidewalk[12:23, :5] = True
-    car = np.zeros((24, 32), dtype=bool)
-    car[15:20, 12:18] = True
-    detections = {
-        "instances": [
-            _mask_instance("road_1", "asphalt road", road, [6, 12, 26, 23]),
-            _mask_instance("sidewalk_1", "sidewalk", sidewalk, [0, 12, 5, 23]),
-            _mask_instance("car_1", "car", car, [12, 15, 18, 20]),
-        ]
-    }
+def test_generate_background_assets_rejects_removed_temporal_cleaner(tmp_path: Path) -> None:
+    rgb = np.full((24, 32, 3), 128, dtype=np.uint8)
+    frame_path = _write_frame(tmp_path / "frame_000001", 1, rgb, [])
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"frames": [{"frame_idx": 1, "detections": str(frame_path)}]}), encoding="utf-8")
 
-    visible = build_road_visible_mask(detections, (24, 32))
-
-    assert visible[16, 10]
-    assert visible[18, 16]
-    assert not visible[16, 2]
-    assert not visible[5, 16]
+    with pytest.raises(ValueError, match="Legacy temporal/donor background generation has been removed"):
+        generate_target_frame_background_assets(
+            summary_path=summary,
+            output_dir=tmp_path / "background_assets",
+            target_frame_id=1,
+            background_cleaner="temporal",
+            background_image_cleaner=_copy_reference_cleaner,
+        )
 
 
-def test_expand_road_mask_with_side_boundaries_fills_between_left_and_right_edges_without_bottom_edge() -> None:
-    road = np.zeros((40, 80), dtype=bool)
-    for y in range(12, 40):
-        left = int(round(28 - 0.28 * (y - 12)))
-        right = int(round(48 + 0.42 * (y - 12)))
-        road[y, left : right + 1] = True
-    road[25:36, 34:44] = False
-    road[35:40, 12:18] = False
-    static_guard = np.zeros((40, 80), dtype=bool)
-    static_guard[24:40, 56:68] = True
-
-    expanded = expand_road_mask_with_side_boundaries(road, static_guard_mask=static_guard)
-
-    assert expanded[30, 38]
-    assert expanded[39, 20]
-    assert not expanded[30, 58]
-    assert expanded[8, 38]
 
 
-def test_build_road_full_mask_keeps_straight_right_boundary_and_removes_internal_holes() -> None:
-    road = np.zeros((48, 96), dtype=bool)
-    for y in range(12, 48):
-        left = int(round(38 - 0.55 * (y - 12)))
-        right = int(round(58 + 0.62 * (y - 12)))
-        road[y, left : right + 1] = True
-    road[25:31, 45:52] = False
-    road[24:38, 64:78] = False
-    dynamic = np.zeros_like(road)
-
-    full = build_road_full_mask_from_visible(road, dynamic)
-
-    assert full[28, 48]
-    assert full[32, 70]
-    bounds = []
-    for y in range(18, 44):
-        xs = np.flatnonzero(full[y])
-        assert len(xs) > 0
-        bounds.append((y, int(xs.min()), int(xs.max())))
-    rows = np.asarray([item[0] for item in bounds], dtype=np.float64)
-    rights = np.asarray([item[2] for item in bounds], dtype=np.float64)
-    coeff = np.polyfit(rows, rights, 1)
-    fitted = np.polyval(coeff, rows)
-    assert float(np.max(np.abs(rights - fitted))) <= 2.0
 
 
-def test_build_road_full_mask_keeps_perspective_narrow_road_connected_to_top() -> None:
-    road = np.zeros((80, 160), dtype=bool)
-    for y in range(0, 80):
-        left = int(round(78 - 0.55 * y))
-        right = int(round(86 + 0.85 * y))
-        road[y, left : right + 1] = True
-    dynamic = np.zeros_like(road)
-
-    full = build_road_full_mask_from_visible(road, dynamic)
-
-    assert full[0, 80]
-    assert full[0, 85]
-    assert not full[0, 30]
-    assert not full[0, 130]
-    assert full[79, 40]
-    assert full[79, 150]
 
 
-def test_road_surface_mask_covers_static_background_removal_ring() -> None:
-    road = np.zeros((32, 48), dtype=bool)
-    road[8:30, 18:31] = True
-    static_remove = cv2.dilate(road.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
-    static_guard = np.zeros_like(road)
-    static_guard[:, :4] = True
-
-    render_mask = _road_surface_mask_for_static_gap(
-        road_support=road,
-        static_remove=static_remove,
-        static_guard_mask=static_guard,
-    )
-
-    seam_ring = static_remove & ~road & ~static_guard
-    assert np.count_nonzero(seam_ring) > 0
-    assert np.all(render_mask[seam_ring])
-    assert np.all(render_mask[road])
-    assert not render_mask[0, 0]
 
 
-def test_expand_road_mask_with_side_boundaries_ignores_clipped_rows_and_extends_to_bottom() -> None:
-    road = np.zeros((60, 100), dtype=bool)
-    for y in range(10, 60):
-        left = max(0, int(round(42 - 0.78 * (y - 10))))
-        right = min(99, int(round(58 + 1.05 * (y - 10))))
-        road[y, left : right + 1] = True
-    road[28:42, 62:82] = False
-
-    expanded = expand_road_mask_with_side_boundaries(road)
-
-    assert expanded[35, 75]
-    assert expanded[58, 5]
-    assert expanded[58, 98]
-    bounds = []
-    for y in range(14, 46):
-        xs = np.flatnonzero(expanded[y])
-        assert len(xs) > 0
-        bounds.append((y, int(xs.min()), int(xs.max())))
-    rows = np.asarray([item[0] for item in bounds], dtype=np.float64)
-    rights = np.asarray([item[2] for item in bounds], dtype=np.float64)
-    coeff = np.polyfit(rows, rights, 1)
-    fitted = np.polyval(coeff, rows)
-    assert float(np.max(np.abs(rights - fitted))) <= 2.0
 
 
-def test_expand_road_mask_with_side_boundaries_extends_valid_side_lines_to_top() -> None:
-    road = np.zeros((60, 100), dtype=bool)
-    for y in range(18, 60):
-        left = max(0, int(round(28 - 0.35 * (y - 18))))
-        right = min(99, int(round(72 + 0.20 * (y - 18))))
-        road[y, left : right + 1] = True
 
-    expanded = expand_road_mask_with_side_boundaries(road)
 
-    assert expanded[0, 35]
-    assert expanded[0, 66]
-    assert not expanded[0, 15]
-    assert not expanded[0, 90]
-    assert expanded[59, 16]
-    assert expanded[59, 80]
 
 
 def test_build_dynamic_mask_uses_smaller_expansion_for_tiny_objects() -> None:
@@ -499,267 +378,16 @@ def test_build_dynamic_mask_uses_smaller_expansion_for_tiny_objects() -> None:
     assert not dynamic[12, 12]
 
 
-def test_generate_target_frame_background_assets_fills_vehicle_occluded_semantic_road(tmp_path: Path) -> None:
-    frames = []
-    road_full = np.zeros((36, 64), dtype=bool)
-    road_full[18:35, 8:56] = True
-    car_mask = np.zeros((36, 64), dtype=bool)
-    car_mask[23:32, 28:42] = True
-    road_color = np.array([92, 96, 100], dtype=np.uint8)
-    car_color = np.array([230, 20, 20], dtype=np.uint8)
-    for frame_idx in [1, 2, 3]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:, :] = (40, 70, 90)
-        rgb[road_full] = road_color
-        road_visible = road_full.copy()
-        instances = [_mask_instance("road_1", "asphalt road", road_visible, [8, 18, 56, 35])]
-        if frame_idx == 2:
-            rgb[car_mask] = car_color
-            road_visible[car_mask] = False
-            instances = [
-                _mask_instance("road_1", "asphalt road", road_visible, [8, 18, 56, 35]),
-                _mask_instance("car_1", "car", car_mask, [28, 23, 42, 32]),
-            ]
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, instances)),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=2,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    road_visible = cv2.imread(manifest["assets"]["road_visible_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    road_full_mask = cv2.imread(manifest["assets"]["road_full_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    assert not road_visible[26, 34]
-    assert road_full_mask[26, 34]
-    assert road_full_mask[28, 10]
-    assert not road_full_mask[28, 3]
-    assert np.linalg.norm(clean[car_mask].mean(axis=0) - road_color.astype(np.float32)) < 8.0
-    assert manifest["quality"]["road_mask_source"] == "semantic_multiframe"
 
 
-def test_generate_target_frame_background_assets_uses_sidecar_road_masks(tmp_path: Path) -> None:
-    rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-    rgb[:, :] = (40, 70, 90)
-    road = np.zeros((36, 64), dtype=np.uint8)
-    road[18:35, 10:54] = 255
-    frame_dir = tmp_path / "frame_000003"
-    detections = _write_frame(frame_dir, 3, rgb, [])
-    road_dir = frame_dir / "road"
-    road_dir.mkdir()
-    cv2.imwrite(str(road_dir / "road_mask.png"), road)
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": [{"frame_idx": 3, "detections": str(detections)}]}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    road_full = cv2.imread(manifest["assets"]["road_full_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert road_full[24, 20]
-    assert not road_full[24, 5]
-    assert manifest["quality"]["road_mask_source"] == "semantic_multiframe"
 
 
-def test_generate_target_frame_background_assets_uses_semantic_road_estimator_on_clean_target(tmp_path: Path) -> None:
-    rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-    rgb[:, :] = (40, 70, 90)
-    car = np.zeros((36, 64), dtype=bool)
-    car[22:30, 28:40] = True
-    rgb[car] = (220, 20, 20)
-    detections = _write_frame(
-        tmp_path / "frame_000003",
-        3,
-        rgb,
-        [_mask_instance("car_1", "car", car, [28, 22, 40, 30])],
-    )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": [{"frame_idx": 3, "detections": str(detections)}]}), encoding="utf-8")
-    calls: list[Path] = []
-
-    def road_estimator(clean_rgb_path: Path, *, frame_id: int) -> np.ndarray:
-        calls.append(clean_rgb_path)
-        assert frame_id == 3
-        road = np.zeros((36, 64), dtype=bool)
-        road[0:36, 12:52] = True
-        return road
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        semantic_road_estimator=road_estimator,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    road_full = cv2.imread(manifest["assets"]["global_road_full_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert calls == [Path(manifest["assets"]["clean_rgb"])]
-    assert road_full[0, 20]
-    assert road_full[24, 34]
-    assert not road_full[20, 5]
-    assert manifest["quality"]["road_mask_source"] == "semantic_estimator"
 
 
-def test_generate_target_frame_background_assets_estimates_global_road_plane_from_semantic_depth(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:, :] = (80, 90, 100)
-    summary = tmp_path / "summary.json"
-    summary.write_text(
-        json.dumps(
-            {
-                "frames": [
-                    {
-                        "frame_idx": 3,
-                        "detections": str(_write_frame(tmp_path / "frame_000003", 3, rgb, [])),
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": 3,
-                    "K": [[28.0, 0.0, 16.0], [0.0, 28.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    depth_dir = tmp_path / "wildgs_depth"
-    depth_dir.mkdir()
-    np.save(depth_dir / "00003.npy", np.full((24, 32), 6.0, dtype=np.float32))
-
-    def road_estimator(_clean_rgb_path: Path, *, frame_id: int) -> np.ndarray:
-        assert frame_id == 3
-        road = np.zeros((24, 32), dtype=bool)
-        road[8:24, 4:28] = True
-        return road
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        depth_maps_dir=depth_dir,
-        camera_trajectory_path=camera_trajectory,
-        semantic_road_estimator=road_estimator,
-        grid_stride=4,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    plane = manifest["road_plane"]
-    assert plane["source"] == "weighted_keyframe_mean+semantic_bg_depth_tar"
-    assert plane["selection"]["policy"] == "global_for_fixed_camera"
-    assert np.allclose(plane["normal_world"], [0.0, 0.0, 1.0], atol=1e-6)
-    assert abs(float(plane["offset"]) + 6.0) < 1e-6
 
 
-def test_semantic_depth_global_road_plane_normal_points_toward_scene_up(tmp_path: Path) -> None:
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": 1,
-                    "K": [[28.0, 0.0, 16.0], [0.0, 28.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    depth_dir = tmp_path / "wildgs_depth"
-    depth_dir.mkdir()
-    yy, _xx = np.mgrid[0:24, 0:32]
-    depth = (6.0 - (yy - 12.0) * 0.03).astype(np.float32)
-    np.save(depth_dir / "00001.npy", depth)
-    road = np.zeros((24, 32), dtype=bool)
-    road[7:24, 4:28] = True
-
-    plane = _estimate_global_road_plane_from_semantic_depth(
-        road_mask=road,
-        target_frame_id=1,
-        depth_maps_dir=depth_dir,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    assert plane is not None
-    assert float(np.dot(np.asarray(plane["normal_world"]), np.asarray([0.0, -1.0, 0.0]))) > 0.0
 
 
-def test_generate_target_frame_background_assets_writes_split_meshes_and_manifest(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((36, 64), dtype=bool)
-    object_mask[14:24, 24:38] = True
-    for frame_idx, color in [(1, (60, 80, 100)), (2, (90, 110, 130)), (3, (120, 140, 160))]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:, :] = color
-        rgb[20:, :] = (80 + frame_idx * 10, 80 + frame_idx * 10, 80 + frame_idx * 10)
-        rgb[object_mask] = (220, 20, 20)
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(
-                    _write_frame(
-                        tmp_path / f"frame_{frame_idx:06d}",
-                        frame_idx,
-                        rgb,
-                        [_mask_instance("obj_car", "car", object_mask, [24, 14, 38, 24])],
-                    )
-                ),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "keyframe_planes": [
-                    {"frame_id": 3, "normal_world": [0.0, 1.0, 0.0], "offset": 0.0, "quality": {"inlier_ratio": 0.9}}
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        road_geometry_path=road_geometry,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    assert manifest["schema"] == "guanwu.target_frame_background_assets.v1"
-    assert manifest["target_frame_id"] == 3
-    for key in ("road_mesh", "structures_mesh", "far_mesh", "clean_rgb", "dynamic_mask"):
-        assert Path(manifest["assets"][key]).exists()
-    assert manifest["quality"]["source_frame_count"] == 3
-    assert manifest["quality"]["target_dynamic_fraction"] > 0.0
 
 
 def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_path: Path) -> None:
@@ -789,8 +417,19 @@ def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_p
     summary = tmp_path / "summary.json"
     summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
 
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("road estimator should not run for tabletop_task background mode")
+    def fake_cleaner(**kwargs):
+        reference = cv2.cvtColor(cv2.imread(str(kwargs["image_path"])), cv2.COLOR_BGR2RGB)
+        mask_rgba = cv2.imread(str(kwargs["mask_path"]), cv2.IMREAD_UNCHANGED)
+        edit_mask = mask_rgba[:, :, 3] == 0
+        edited = reference.copy()
+        edited[edit_mask] = table_color
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"].get("model", "gpt-image-2"),
+            "prompt": kwargs["config"].get("prompt", "test clean tabletop"),
+        }
 
     result = generate_target_frame_background_assets(
         summary_path=summary,
@@ -798,7 +437,14 @@ def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_p
         target_frame_id=3,
         background_mode="tabletop_task",
         task_foreground_object_ids=["obj_000009"],
-        semantic_road_estimator=fail_if_called,
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "prompt": "remove only the target object",
+            "mask_mode": "target",
+            "use_full_image_output": False,
+            "mask_expand_px": 0,
+        },
+        background_image_cleaner=fake_cleaner,
         grid_stride=8,
     )
 
@@ -807,9 +453,6 @@ def test_generate_tabletop_task_background_assets_only_masks_target_object(tmp_p
     assert manifest["quality"]["background_mode"] == "tabletop_task"
     assert manifest["quality"]["target_foreground_object_ids"] == ["obj_000009"]
     assert "tabletop_mesh" in manifest["assets"]
-    assert "road_mesh" not in manifest["assets"]
-    assert "structures_mesh" not in manifest["assets"]
-    assert "far_mesh" not in manifest["assets"]
 
     foreground = cv2.imread(manifest["assets"]["dynamic_mask"], cv2.IMREAD_GRAYSCALE) > 0
     assert foreground[20, 31]
@@ -879,6 +522,7 @@ def test_generate_tabletop_task_background_assets_writes_tabletop_reference_from
             "depth_path": external_depth,
             "source": "depth_anything3_clean_rgb",
         },
+        background_image_cleaner=_copy_reference_cleaner,
         grid_stride=4,
     )
 
@@ -902,6 +546,202 @@ def test_generate_tabletop_task_background_assets_writes_tabletop_reference_from
     assert geometry_reference["support_surfaces"][0]["offset"] == reference["offset"]
     assert Path(geometry_reference["exclusion"]["foreground_mask_path"]).exists()
     assert load_background_asset_meshes(result["manifest_path"])[0][0] == "depth_background"
+
+
+def test_generate_road_openai_background_assets_use_unified_clean_scene_pipeline(tmp_path: Path) -> None:
+    height, width = 24, 32
+    road_rgb = np.full((height, width, 3), (80, 84, 88), dtype=np.uint8)
+    car_mask = np.zeros((height, width), dtype=bool)
+    car_mask[10:17, 12:21] = True
+    road_mask = np.zeros((height, width), dtype=bool)
+    road_mask[8:23, 4:29] = True
+    rgb = road_rgb.copy()
+    rgb[car_mask] = (210, 20, 20)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "detections": str(
+                            _write_frame(
+                                tmp_path / "frame_000001",
+                                1,
+                                rgb,
+                                [
+                                    _mask_instance("road_1", "asphalt road lane", road_mask, [4, 8, 29, 23]),
+                                    _mask_instance("car_1", "car", car_mask, [12, 10, 21, 17]),
+                                ],
+                            )
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    external_depth = tmp_path / "external_depth.npy"
+    np.save(external_depth, np.full((height, width), 8.0, dtype=np.float32))
+    cleaner_calls: list[dict[str, object]] = []
+
+    def fake_cleaner(**kwargs):
+        cleaner_calls.append(kwargs)
+        edited = np.full((height, width, 3), (82, 86, 90), dtype=np.uint8)
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"]["model"],
+            "prompt": kwargs["config"]["prompt"],
+        }
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary_path,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="road",
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "scene_prompt_profile": "auto",
+            "mask_mode": "prompt_only",
+            "use_full_image_output": True,
+        },
+        background_image_cleaner=fake_cleaner,
+        clean_depth_estimator=lambda _path: {
+            "depth_path": external_depth,
+            "source": "depth_anything3_clean_rgb",
+        },
+        camera_trajectory_path=camera_trajectory,
+        grid_stride=4,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert len(cleaner_calls) == 1
+    assert cleaner_calls[0]["config"]["scene_prompt_profile"] == "road"
+    assert "vehicles" in cleaner_calls[0]["config"]["prompt"].lower()
+    assert "lane markings" in cleaner_calls[0]["config"]["prompt"].lower()
+    assert "wooden board" not in cleaner_calls[0]["config"]["prompt"].lower()
+    assert manifest["quality"]["background_mode"] == "clean_scene_background"
+    assert manifest["quality"]["requested_background_mode"] == "road"
+    assert manifest["quality"]["scene_prompt_profile"] == "road"
+    assert manifest["quality"]["depth_calibration_source"] == "da3_metric_direct"
+    assert "depth_background_glb" in manifest["assets"]
+    assert "tabletop_reference" in manifest["assets"]
+    assert "background_geometry_reference" in manifest["assets"]
+
+
+def test_generate_road_request_uses_openai_clean_scene_pipeline(tmp_path: Path) -> None:
+    height, width = 24, 32
+    road_rgb = np.full((height, width, 3), (80, 84, 88), dtype=np.uint8)
+    car_mask = np.zeros((height, width), dtype=bool)
+    car_mask[10:17, 12:21] = True
+    road_mask = np.zeros((height, width), dtype=bool)
+    road_mask[8:23, 4:29] = True
+    rgb = road_rgb.copy()
+    rgb[car_mask] = (210, 20, 20)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "frame_idx": 1,
+                        "detections": str(
+                            _write_frame(
+                                tmp_path / "frame_000001",
+                                1,
+                                rgb,
+                                [
+                                    _mask_instance("road_1", "asphalt road lane", road_mask, [4, 8, 29, 23]),
+                                    _mask_instance("car_1", "car", car_mask, [12, 10, 21, 17]),
+                                ],
+                            )
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    camera_trajectory = tmp_path / "camera_trajectory.json"
+    camera_trajectory.write_text(
+        json.dumps(
+            [
+                {
+                    "frame_id": 1,
+                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
+                    "R": np.eye(3).tolist(),
+                    "t": [0.0, 0.0, 0.0],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    external_depth = tmp_path / "external_depth.npy"
+    np.save(external_depth, np.full((height, width), 8.0, dtype=np.float32))
+    cleaner_calls: list[dict[str, object]] = []
+
+    def fake_cleaner(**kwargs):
+        cleaner_calls.append(kwargs)
+        edited = np.full((height, width, 3), (82, 86, 90), dtype=np.uint8)
+        Image.fromarray(edited).save(kwargs["output_path"])
+        return {
+            "clean_rgb_path": str(kwargs["output_path"]),
+            "raw_output_path": str(kwargs["output_path"]),
+            "model": kwargs["config"]["model"],
+            "prompt": kwargs["config"]["prompt"],
+        }
+
+    result = generate_target_frame_background_assets(
+        summary_path=summary_path,
+        output_dir=tmp_path / "background_assets",
+        target_frame_id=1,
+        background_mode="road",
+        background_cleaner="openai_image_edit",
+        background_cleaner_config={
+            "model": "gpt-image-2",
+            "scene_prompt_profile": "auto",
+            "mask_mode": "prompt_only",
+            "use_full_image_output": True,
+        },
+        background_image_cleaner=fake_cleaner,
+        clean_depth_estimator=lambda _path: {
+            "depth_path": external_depth,
+            "source": "depth_anything3_clean_rgb",
+        },
+        camera_trajectory_path=camera_trajectory,
+        grid_stride=4,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert len(cleaner_calls) == 1
+    assert cleaner_calls[0]["config"]["scene_prompt_profile"] == "road"
+    assert "vehicles" in cleaner_calls[0]["config"]["prompt"].lower()
+    assert manifest["quality"]["background_mode"] == "clean_scene_background"
+    assert manifest["quality"]["requested_background_mode"] == "road"
+    assert manifest["quality"]["clean_rgb_source"] == "openai_image_edit"
+    assert manifest["quality"]["scene_prompt_profile"] == "road"
+    assert manifest["quality"]["depth_calibration_source"] == "da3_metric_direct"
+    assert "depth_background_glb" in manifest["assets"]
+    assert "tabletop_reference" in manifest["assets"]
+    assert "background_geometry_reference" in manifest["assets"]
 
 
 def test_generate_tabletop_task_background_assets_uses_openai_image_cleaner_on_reference_frame(tmp_path: Path) -> None:
@@ -1347,389 +1187,11 @@ image_edit:
     assert manifest["quality"]["clean_rgb_full_image_output"] is True
 
 
-def test_generate_background_replaces_target_frame_vehicle_pixels_with_donor_road(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((36, 64), dtype=bool)
-    object_mask[18:28, 20:36] = True
-    road_color = np.array([96, 96, 96], dtype=np.uint8)
-    vehicle_color = np.array([230, 20, 20], dtype=np.uint8)
-    for frame_idx in [1, 2, 3, 4, 5]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:] = road_color
-        instances = []
-        if frame_idx == 3:
-            rgb[object_mask] = vehicle_color
-            instances = [_mask_instance("obj_car", "car", object_mask, [20, 18, 36, 28])]
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, instances)),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    replaced = clean[object_mask].mean(axis=0)
-    assert np.linalg.norm(replaced - road_color.astype(np.float32)) < 8.0
-    assert np.linalg.norm(replaced - vehicle_color.astype(np.float32)) > 120.0
-
-
-def test_generate_background_does_not_preserve_unmasked_target_frame_vehicle(tmp_path: Path) -> None:
-    frames = []
-    object_region = np.zeros((36, 64), dtype=bool)
-    object_region[6:14, 44:56] = True
-    road_color = np.array([104, 104, 104], dtype=np.uint8)
-    vehicle_color = np.array([235, 235, 235], dtype=np.uint8)
-    for frame_idx in [1, 2, 3, 4, 5]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:] = road_color
-        if frame_idx == 3:
-            rgb[object_region] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, [])),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    repaired = clean[object_region].mean(axis=0)
-    assert np.linalg.norm(repaired - road_color.astype(np.float32)) < 8.0
-    assert np.linalg.norm(repaired - vehicle_color.astype(np.float32)) > 150.0
-
-
-def test_object_index_masks_small_vehicle_without_detection_mask(tmp_path: Path) -> None:
-    frames = []
-    object_region = np.zeros((36, 64), dtype=bool)
-    object_region[5:11, 44:56] = True
-    road_color = np.array([90, 90, 90], dtype=np.uint8)
-    vehicle_color = np.array([240, 240, 240], dtype=np.uint8)
-    for frame_idx in [1, 2, 3, 4, 5]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:] = road_color
-        if frame_idx == 3:
-            rgb[object_region] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(_write_frame(tmp_path / f"frame_{frame_idx:06d}", frame_idx, rgb, [])),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-    objects = tmp_path / "objects.json"
-    objects.write_text(
-        json.dumps(
-            [
-                {
-                    "object_id": "small_car",
-                    "label": "car",
-                    "frames": [{"frame_idx": 3, "bbox": [44.0, 5.0, 56.0, 11.0]}],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=3,
-        object_index_path=objects,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    dynamic = cv2.imread(manifest["assets"]["dynamic_mask"], cv2.IMREAD_GRAYSCALE)
-    assert dynamic[7, 48] > 0
-    assert np.linalg.norm(clean[object_region].mean(axis=0) - road_color.astype(np.float32)) < 8.0
-
-
-def test_low_candidate_dynamic_region_is_filled_from_neighbors(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((36, 64), dtype=bool)
-    object_mask[8:14, 44:56] = True
-    road_color = np.array([112, 112, 112], dtype=np.uint8)
-    vehicle_color = np.array([245, 245, 245], dtype=np.uint8)
-    for frame_idx in [1, 2, 3]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:] = road_color
-        rgb[object_mask] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(
-                    _write_frame(
-                        tmp_path / f"frame_{frame_idx:06d}",
-                        frame_idx,
-                        rgb,
-                        [_mask_instance("obj_car", "car", object_mask, [44, 8, 56, 14])],
-                    )
-                ),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=2,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    repaired = clean[object_mask].mean(axis=0)
-    assert np.linalg.norm(repaired - road_color.astype(np.float32)) < 16.0
-    assert np.linalg.norm(repaired - vehicle_color.astype(np.float32)) > 150.0
-
-
-def test_low_candidate_far_region_uses_horizontal_neighbor_texture(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((36, 64), dtype=bool)
-    object_mask[1:8, 4:12] = True
-    left_texture = np.array([70, 84, 92], dtype=np.uint8)
-    right_texture = np.array([78, 88, 96], dtype=np.uint8)
-    vehicle_color = np.array([240, 240, 240], dtype=np.uint8)
-    for frame_idx in [1, 2, 3]:
-        rgb = np.zeros((36, 64, 3), dtype=np.uint8)
-        rgb[:, :20] = left_texture
-        rgb[:, 20:] = right_texture
-        rgb[object_mask] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(
-                    _write_frame(
-                        tmp_path / f"frame_{frame_idx:06d}",
-                        frame_idx,
-                        rgb,
-                        [_mask_instance("obj_car", "car", object_mask, [4, 1, 12, 8])],
-                    )
-                ),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=2,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    repaired = clean[object_mask].mean(axis=0)
-    assert np.linalg.norm(repaired - left_texture.astype(np.float32)) < 18.0
-    assert np.linalg.norm(repaired - vehicle_color.astype(np.float32)) > 180.0
-
-
-def test_low_candidate_fill_has_local_texture_variation(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((40, 72), dtype=bool)
-    object_mask[8:18, 30:44] = True
-    vehicle_color = np.array([240, 240, 240], dtype=np.uint8)
-    for frame_idx in [1, 2, 3]:
-        rgb = np.zeros((40, 72, 3), dtype=np.uint8)
-        for x in range(72):
-            rgb[:, x] = (80 + x // 3, 88 + x // 4, 96 + x // 5)
-        rgb[object_mask] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(
-                    _write_frame(
-                        tmp_path / f"frame_{frame_idx:06d}",
-                        frame_idx,
-                        rgb,
-                        [_mask_instance("obj_car", "car", object_mask, [30, 8, 44, 18])],
-                    )
-                ),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=2,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    patch = clean[object_mask]
-    assert float(patch.std()) > 1.0
-    assert np.linalg.norm(patch.mean(axis=0) - vehicle_color.astype(np.float32)) > 180.0
-
-
-def test_low_candidate_fill_avoids_sharp_inpaint_spikes(tmp_path: Path) -> None:
-    frames = []
-    object_mask = np.zeros((40, 72), dtype=bool)
-    object_mask[6:18, 8:26] = True
-    vehicle_color = np.array([245, 245, 245], dtype=np.uint8)
-    for frame_idx in [1, 2, 3]:
-        rgb = np.zeros((40, 72, 3), dtype=np.uint8)
-        for x in range(72):
-            rgb[:, x] = (84 + x // 4, 92 + x // 5, 98 + x // 6)
-        rgb[object_mask] = vehicle_color
-        frames.append(
-            {
-                "frame_idx": frame_idx,
-                "detections": str(
-                    _write_frame(
-                        tmp_path / f"frame_{frame_idx:06d}",
-                        frame_idx,
-                        rgb,
-                        [_mask_instance("obj_car", "car", object_mask, [8, 6, 26, 18])],
-                    )
-                ),
-            }
-        )
-    summary = tmp_path / "summary.json"
-    summary.write_text(json.dumps({"frames": frames}), encoding="utf-8")
-
-    result = generate_target_frame_background_assets(
-        summary_path=summary,
-        output_dir=tmp_path / "background_assets",
-        target_frame_id=2,
-        grid_stride=8,
-    )
-
-    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    clean = cv2.cvtColor(cv2.imread(manifest["assets"]["clean_rgb"]), cv2.COLOR_BGR2RGB)
-    x1, y1, x2, y2 = 8, 6, 26, 18
-    patch = clean[y1:y2, x1:x2].astype(np.float32)
-    grad_x = np.abs(np.diff(patch, axis=1)).max()
-    grad_y = np.abs(np.diff(patch, axis=0)).max()
-    assert max(float(grad_x), float(grad_y)) < 35.0
-    assert np.linalg.norm(patch.mean(axis=(0, 1)) - vehicle_color.astype(np.float32)) > 180.0
-
-
-def test_low_candidate_far_fill_does_not_pull_diagonal_structure_into_vehicle_hole(tmp_path: Path) -> None:
-    clean = np.zeros((80, 160, 3), dtype=np.uint8)
-    for y in range(80):
-        for x in range(160):
-            clean[y, x] = (80 + x // 6 + y // 20, 86 + x // 8, 92 + x // 10)
-    for i in range(20):
-        y = 8 + i
-        x = 48 + i
-        clean[y : y + 2, x : x + 18] = (150, 150, 150)
-    object_mask = np.zeros((80, 160), dtype=bool)
-    object_mask[12:30, 50:88] = True
-    target = clean.copy()
-    target[object_mask] = (245, 245, 245)
-    source_count = np.full((80, 160), 5, dtype=np.uint16)
-    source_count[object_mask] = 0
-
-    filled = _fill_low_candidate_dynamic_regions(clean.copy(), target, object_mask, source_count)
-
-    patch = filled[12:30, 50:88].astype(np.float32)
-    center = filled[21, 69].astype(np.float32)
-    expected_center = (filled[21, 49].astype(np.float32) + filled[21, 88].astype(np.float32)) * 0.5
-    assert np.linalg.norm(center - expected_center) < 10.0
-    assert float(np.percentile(patch[..., 0], 95)) < 120.0
-    assert float(np.abs(np.diff(patch, axis=1)).max()) < 12.0
-
-
-def test_low_candidate_far_fill_does_not_spread_lane_markings_across_hole() -> None:
-    clean = np.zeros((90, 160, 3), dtype=np.uint8)
-    clean[:] = (92, 96, 100)
-    clean[18:22, 49] = (238, 238, 238)
-    clean[18:22, 88] = (238, 238, 238)
-    object_mask = np.zeros((90, 160), dtype=bool)
-    object_mask[12:30, 50:88] = True
-    target = clean.copy()
-    target[object_mask] = (245, 245, 245)
-    source_count = np.full((90, 160), 5, dtype=np.uint16)
-    source_count[object_mask] = 0
-
-    filled = _fill_low_candidate_dynamic_regions(clean.copy(), target, object_mask, source_count)
-
-    patch = filled[12:30, 50:88].astype(np.float32)
-    bright_row = patch[6:10]
-    assert float(np.percentile(bright_row, 95)) < 130.0
-    assert float(np.abs(np.diff(patch, axis=1)).max()) < 20.0
-    assert np.linalg.norm(patch.mean(axis=(0, 1)) - np.array([245, 245, 245], dtype=np.float32)) > 180.0
-
-
-def test_low_candidate_fill_preserves_sparse_real_donor_pixels() -> None:
-    clean = np.zeros((80, 160, 3), dtype=np.uint8)
-    clean[:] = (92, 96, 100)
-    object_mask = np.zeros((80, 160), dtype=bool)
-    object_mask[12:30, 50:88] = True
-    clean[object_mask] = (104, 108, 112)
-    clean[18:22, 50:88] = (68, 72, 76)
-    target = clean.copy()
-    target[object_mask] = (245, 245, 245)
-    source_count = np.full((80, 160), 5, dtype=np.uint16)
-    source_count[object_mask] = 1
-
-    filled = _fill_low_candidate_dynamic_regions(clean.copy(), target, object_mask, source_count)
-
-    assert np.array_equal(filled[object_mask], clean[object_mask])
-
-
-def test_load_background_asset_meshes_prefers_manifest_split_order(tmp_path: Path) -> None:
+def test_load_background_asset_meshes_prefers_unified_background_mesh(tmp_path: Path) -> None:
     assets = tmp_path / "assets"
     assets.mkdir()
-    for name in ("road_mesh.obj", "structures_mesh.obj", "far_mesh.obj"):
-        (assets / name).write_text("o x\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
-    manifest = assets / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v1",
-                "assets": {
-                    "road_mesh": str(assets / "road_mesh.obj"),
-                    "structures_mesh": str(assets / "structures_mesh.obj"),
-                    "far_mesh": str(assets / "far_mesh.obj"),
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(str(manifest))
-
-    assert [(name, path.name) for name, path in meshes] == [
-        ("road", "road_mesh.obj"),
-        ("structures", "structures_mesh.obj"),
-        ("far", "far_mesh.obj"),
-    ]
-
-
-def test_load_background_asset_meshes_prefers_global_fused_background_mesh(tmp_path: Path) -> None:
-    assets = tmp_path / "assets"
-    assets.mkdir()
-    background = assets / "background_global_fused_v1.glb"
+    background = assets / "background_mesh.glb"
     background.write_bytes(b"glb")
-    road = assets / "road_mesh.obj"
-    road.write_text("o x\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
     manifest = assets / "background_manifest.json"
     manifest.write_text(
         json.dumps(
@@ -1737,9 +1199,6 @@ def test_load_background_asset_meshes_prefers_global_fused_background_mesh(tmp_p
                 "schema": "guanwu.target_frame_background_assets.v2",
                 "assets": {
                     "background_mesh": str(background),
-                    "road_mesh": str(road),
-                    "road_surface_mesh": str(assets / "old_road_surface.glb"),
-                    "static_background_mesh": str(assets / "old_static_background.glb"),
                 },
             }
         ),
@@ -1748,10 +1207,7 @@ def test_load_background_asset_meshes_prefers_global_fused_background_mesh(tmp_p
 
     meshes = load_background_asset_meshes(str(manifest))
 
-    assert [(name, path.name) for name, path in meshes] == [("background", "background_global_fused_v1.glb")]
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    assert "road_surface_mesh" not in updated_manifest["assets"]
-    assert "static_background_mesh" not in updated_manifest["assets"]
+    assert [(name, path.name) for name, path in meshes] == [("background", "background_mesh.glb")]
 
 
 def test_generate_depth_background_mesh_assets_writes_colored_glb_and_manifest(tmp_path: Path) -> None:
@@ -1826,6 +1282,98 @@ def test_generate_depth_background_mesh_assets_drops_large_depth_discontinuity_f
     assert manifest["quality"]["discontinuity_faces_removed"] > 0
 
 
+def test_generate_depth_background_mesh_assets_keeps_continuous_ratio_safe_grid(tmp_path: Path) -> None:
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    rgb[:, :] = (80, 100, 120)
+    rgb_path = tmp_path / "clean_target_rgb.png"
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    depth = np.ones((8, 8), dtype=np.float32)
+    depth[:, 1::2] = 1.25
+    depth_path = tmp_path / "clean_target_depth.npy"
+    np.save(depth_path, depth)
+
+    result = generate_depth_background_mesh_assets(
+        clean_rgb_path=rgb_path,
+        depth_path=depth_path,
+        output_dir=tmp_path / "depth_background",
+        camera={
+            "fx": 8.0,
+            "fy": 8.0,
+            "cx": 4.0,
+            "cy": 4.0,
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, 0.0],
+        },
+        grid_stride=1,
+        target_frame_id=3,
+    )
+
+    manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["quality"]["face_count"] == 98
+    assert manifest["quality"]["discontinuity_faces_removed"] == 0
+    assert manifest["quality"]["long_edge_faces_removed"] == 0
+
+
+def test_ensure_road_plane_fused_background_asset_projects_depth_mesh_to_road_plane(tmp_path: Path) -> None:
+    rgb = np.zeros((12, 16, 3), dtype=np.uint8)
+    rgb[:, :] = (80, 100, 120)
+    rgb_path = tmp_path / "clean_target_rgb.png"
+    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    depth_path = tmp_path / "clean_target_depth.npy"
+    np.save(depth_path, np.full((12, 16), 4.0, dtype=np.float32))
+    depth_result = generate_depth_background_mesh_assets(
+        clean_rgb_path=rgb_path,
+        depth_path=depth_path,
+        output_dir=tmp_path / "background_assets" / "depth_mesh",
+        camera={
+            "fx": 16.0,
+            "fy": 16.0,
+            "cx": 8.0,
+            "cy": 6.0,
+            "R": np.eye(3).tolist(),
+            "t": [0.0, 0.0, 0.0],
+        },
+        grid_stride=2,
+        target_frame_id=1,
+    )
+    manifest_path = tmp_path / "background_assets" / "background_manifest.json"
+    manifest = json.loads(Path(depth_result["manifest_path"]).read_text(encoding="utf-8"))
+    manifest["quality"]["requested_background_mode"] = "road"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    road_geometry_path = tmp_path / "road_geometry.json"
+    road_geometry_path.write_text(
+        json.dumps(
+            {
+                "available": True,
+                "default_plane_policy": "global_for_fixed_camera",
+                "global_plane": {
+                    "source": "weighted_keyframe_robust_global",
+                    "normal_world": [0.0, 0.0, 1.0],
+                    "offset": -2.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ensure_road_plane_fused_background_asset(manifest_path, road_geometry_path)
+
+    assert result is not None
+    updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    visual_path = Path(updated["assets"]["background_mesh"])
+    fused_path = Path(updated["assets"]["global_fused_background_mesh"])
+    assert visual_path.name == "depth_background.glb"
+    assert updated["assets"]["visual_background_mesh"] == str(visual_path)
+    assert fused_path.name == "background_global_fused_v1.glb"
+    assert updated["quality"]["background_mode"] == "depth_mesh_with_road_plane_support"
+    assert updated["quality"]["road_depth_source"] == "global_road_plane_support_only"
+    assert load_background_asset_meshes(manifest_path)[0] == ("background", visual_path)
+    mesh = trimesh.load(str(fused_path), force="mesh")
+    vertices = np.asarray(mesh.vertices)
+    distances = vertices @ np.array([0.0, 0.0, 1.0]) - 2.0
+    assert float(np.max(np.abs(distances))) < 1e-6
+
+
 def test_load_background_asset_meshes_prefers_depth_background_over_tabletop_proxy(tmp_path: Path) -> None:
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -1853,603 +1401,16 @@ def test_load_background_asset_meshes_prefers_depth_background_over_tabletop_pro
     assert [(name, path.name) for name, path in meshes] == [("depth_background", "depth_background.glb")]
 
 
-def test_load_background_asset_meshes_builds_multiframe_global_fused_background(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:8, :] = (70, 78, 86)
-    rgb[8:, :] = (110, 112, 116)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    single_frame_depth = np.ones((24, 32), dtype=np.float32) * 8.0
-    single_frame_depth[16:, :] = 3.0
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, single_frame_depth)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-    depth_background = json.loads(Path(depth_result["manifest_path"]).read_text())["assets"]["depth_background_glb"]
-
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[16:, :] = 255
-    dynamic_mask = np.zeros((24, 32), dtype=np.uint8)
-    dynamic_mask[12:20, 10:18] = 255
-    road_mask[dynamic_mask > 0] = 0
-    road_mask_path = tmp_path / "road_mask.png"
-    dynamic_mask_path = tmp_path / "dynamic_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    cv2.imwrite(str(dynamic_mask_path), dynamic_mask)
-
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        depth = np.ones((24, 32), dtype=np.float32) * 8.0
-        depth[8:, :] = 5.0
-        depth[:8, 4:28] = 7.0
-        if index in {1, 2}:
-            depth[12:20, 10:18] = 2.0
-        np.save(depth_maps_dir / f"{index:05d}.npy", depth)
-
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v2",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_mask": str(road_mask_path),
-                    "dynamic_mask": str(dynamic_mask_path),
-                    "depth_background_glb": depth_background,
-                    "road_surface_mesh": str(tmp_path / "old_road_surface.glb"),
-                    "static_background_mesh": str(tmp_path / "old_static_background.glb"),
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "default_plane_policy": "global_for_fixed_camera",
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-                "keyframe_planes": [{"frame_id": 3, "normal_world": [0, 0, 1], "offset": -5.0}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    assert [(name, path.name) for name, path in meshes] == [("background", "background_global_fused_v1.glb")]
-    fused_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(fused_mesh.vertices, dtype=np.float64)
-    assert len(vertices) > 0
-
-    points_cam = (np.asarray(camera["R"], dtype=np.float64).T @ (vertices - np.asarray(camera["t"], dtype=np.float64)).T).T
-    image_y = camera["fy"] * points_cam[:, 1] / points_cam[:, 2] + camera["cy"]
-    image_x = camera["fx"] * points_cam[:, 0] / points_cam[:, 2] + camera["cx"]
-    road_vertices = vertices[image_y >= 16.0]
-    assert len(road_vertices) > 0
-    assert np.max(np.abs(road_vertices[:, 2] - 5.0)) < 1e-5
-    dynamic_road = (image_y >= 12.0) & (image_y < 20.0) & (image_x >= 10.0) & (image_x < 18.0)
-    assert np.any(dynamic_road)
-    assert np.max(np.abs(vertices[dynamic_road, 2] - 5.0)) < 1e-5
-    static_top = vertices[image_y < 8.0]
-    assert len(static_top) > 0
-    assert np.max(static_top[:, 2]) > 6.5
-
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    assert updated_manifest["assets"]["background_mesh"].endswith("background_global_fused_v1.glb")
-    assert updated_manifest["quality"]["background_mode"] == "global_fused_single_mesh"
-    assert updated_manifest["quality"]["road_depth_source"] == "global_road_plane"
-    assert updated_manifest["quality"]["static_depth_source"] == "robust_multiframe_depth"
-    assert updated_manifest["quality"]["background_mesh_vertex_count"] == len(vertices)
-    assert "road_surface_mesh" not in updated_manifest["assets"]
-    assert "static_background_mesh" not in updated_manifest["assets"]
 
 
-def test_multiframe_road_surface_uses_semantic_mask_not_depth_plane_extent(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:8, :] = (70, 78, 86)
-    rgb[8:, :] = (112, 114, 118)
-    rgb[8:, :7] = (150, 158, 162)
-    rgb[8:, 25:] = (70, 104, 68)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, np.ones((24, 32), dtype=np.float32) * 5.0)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[8:, 8:24] = 255
-    road_mask_path = tmp_path / "road_full_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        depth = np.ones((24, 32), dtype=np.float32) * 5.0
-        depth[:8, :] = 7.0
-        np.save(depth_maps_dir / f"{index:05d}.npy", depth)
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v3",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_full_mask": str(road_mask_path),
-                    "depth_background_glb": json.loads(Path(depth_result["manifest_path"]).read_text())["assets"][
-                        "depth_background_glb"
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "default_plane_policy": "global_for_fixed_camera",
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert np.any(road_support[16:, 8:24])
-    assert not np.any(road_support[16:, :7])
-    assert not np.any(road_support[16:, 25:])
 
 
-def test_multiframe_road_surface_uses_global_plane_when_keyframe_differs(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[8:, 8:24] = (112, 114, 118)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, np.ones((24, 32), dtype=np.float32) * 5.0)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[8:, 8:24] = 255
-    road_mask_path = tmp_path / "road_full_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        np.save(depth_maps_dir / f"{index:05d}.npy", np.ones((24, 32), dtype=np.float32) * 5.0)
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v3",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_full_mask": str(road_mask_path),
-                    "depth_background_glb": json.loads(Path(depth_result["manifest_path"]).read_text())["assets"][
-                        "depth_background_glb"
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-                "keyframe_planes": [{"frame_id": 3, "normal_world": [0, 0, 1], "offset": -4.0}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    background_mesh = trimesh.load(str(meshes[0][1]), force="mesh")
-    vertices = np.asarray(background_mesh.vertices, dtype=np.float64)
-    road_vertices = vertices[_road_plane_vertex_mask(vertices)]
-    assert len(road_vertices) > 0
-    assert np.max(np.abs(road_vertices[:, 2] - 5.0)) < 1e-5
 
 
-def test_multiframe_global_road_support_does_not_expand_into_side_nonroad(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:8, :] = (70, 78, 86)
-    rgb[8:, :] = (110, 112, 116)
-    rgb[:, :6] = (80, 90, 95)
-    rgb[:, 26:] = (82, 88, 92)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, np.ones((24, 32), dtype=np.float32) * 5.0)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[8:, 8:24] = 255
-    road_mask_path = tmp_path / "road_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        depth = np.ones((24, 32), dtype=np.float32) * 5.0
-        depth[:8, :] = 7.0
-        np.save(depth_maps_dir / f"{index:05d}.npy", depth)
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v2",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_mask": str(road_mask_path),
-                    "depth_background_glb": json.loads(Path(depth_result["manifest_path"]).read_text())["assets"][
-                        "depth_background_glb"
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "default_plane_policy": "global_for_fixed_camera",
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert np.any(road_support[16:, 8:24])
-    assert not np.any(road_support[16:, :6])
-    assert not np.any(road_support[16:, 26:])
 
 
-def test_multiframe_global_road_support_ignores_unreliable_full_width_seed(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:8, :] = (70, 78, 86)
-    rgb[8:, :] = (112, 114, 118)
-    rgb[8:, :7] = (156, 162, 160)
-    rgb[8:, 25:] = (70, 104, 68)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, np.ones((24, 32), dtype=np.float32) * 5.0)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[8:, 8:24] = 255
-    road_mask_path = tmp_path / "road_full_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        depth = np.ones((24, 32), dtype=np.float32) * 5.0
-        depth[:8, :] = 7.0
-        np.save(depth_maps_dir / f"{index:05d}.npy", depth)
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v2",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_full_mask": str(road_mask_path),
-                    "depth_background_glb": json.loads(Path(depth_result["manifest_path"]).read_text())["assets"][
-                        "depth_background_glb"
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "default_plane_policy": "global_for_fixed_camera",
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert np.any(road_support[16:, 8:24])
-    assert not np.any(road_support[16:, :7])
-    assert not np.any(road_support[16:, 25:])
 
 
-def test_multiframe_global_road_support_excludes_static_guard_regions(tmp_path: Path) -> None:
-    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
-    rgb[:8, :] = (70, 78, 86)
-    rgb[8:, :] = (112, 114, 118)
-    rgb_path = tmp_path / "clean_target_rgb.png"
-    cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    depth_path = tmp_path / "single_frame_clean_depth.npy"
-    np.save(depth_path, np.ones((24, 32), dtype=np.float32) * 5.0)
-    camera = {
-        "fx": 24.0,
-        "fy": 24.0,
-        "cx": 16.0,
-        "cy": 12.0,
-        "R": np.eye(3).tolist(),
-        "t": [0.0, 0.0, 0.0],
-    }
-    depth_result = generate_depth_background_mesh_assets(
-        clean_rgb_path=rgb_path,
-        depth_path=depth_path,
-        output_dir=tmp_path / "depth_background",
-        camera=camera,
-        grid_stride=4,
-        target_frame_id=3,
-    )
-
-    road_mask = np.zeros((24, 32), dtype=np.uint8)
-    road_mask[8:, :] = 255
-    static_guard = np.zeros((24, 32), dtype=np.uint8)
-    static_guard[8:, 24:] = 255
-    road_mask_path = tmp_path / "road_mask.png"
-    static_guard_path = tmp_path / "static_guard_mask.png"
-    cv2.imwrite(str(road_mask_path), road_mask)
-    cv2.imwrite(str(static_guard_path), static_guard)
-    depth_maps_dir = tmp_path / "depth_maps"
-    depth_maps_dir.mkdir()
-    for index in range(4):
-        depth = np.ones((24, 32), dtype=np.float32) * 5.0
-        depth[:8, :] = 7.0
-        np.save(depth_maps_dir / f"{index:05d}.npy", depth)
-    manifest = tmp_path / "background_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schema": "guanwu.target_frame_background_assets.v2",
-                "target_frame_id": 3,
-                "assets": {
-                    "clean_rgb": str(rgb_path),
-                    "road_mask": str(road_mask_path),
-                    "static_guard_mask": str(static_guard_path),
-                    "depth_background_glb": json.loads(Path(depth_result["manifest_path"]).read_text())["assets"][
-                        "depth_background_glb"
-                    ],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    road_geometry = tmp_path / "road_geometry.json"
-    road_geometry.write_text(
-        json.dumps(
-            {
-                "available": True,
-                "default_plane_policy": "global_for_fixed_camera",
-                "depth_maps_dir": str(depth_maps_dir),
-                "global_plane": {"source": "test_global", "normal_world": [0, 0, 1], "offset": -5.0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    camera_trajectory = tmp_path / "camera_trajectory.json"
-    camera_trajectory.write_text(
-        json.dumps(
-            [
-                {
-                    "frame_id": frame_id,
-                    "K": [[24.0, 0.0, 16.0], [0.0, 24.0, 12.0], [0.0, 0.0, 1.0]],
-                    "R": np.eye(3).tolist(),
-                    "t": [0.0, 0.0, 0.0],
-                }
-                for frame_id in range(1, 5)
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    meshes = load_background_asset_meshes(
-        str(manifest),
-        road_geometry_path=road_geometry,
-        camera_trajectory_path=camera_trajectory,
-    )
-
-    updated_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    road_support = cv2.imread(updated_manifest["assets"]["road_support_mask"], cv2.IMREAD_GRAYSCALE) > 0
-    assert np.any(road_support[16:, :24])
-    assert not np.any(road_support[16:, 24:])
 
 
 def test_generate_target_frame_background_assets_prefers_clean_depth_estimator(tmp_path: Path) -> None:
@@ -2513,11 +1474,12 @@ def test_generate_target_frame_background_assets_prefers_clean_depth_estimator(t
         depth_maps_dir=wildgs_depth_dir,
         camera_trajectory_path=camera_trajectory,
         clean_depth_estimator=estimate,
+        background_image_cleaner=_copy_reference_cleaner,
         grid_stride=4,
     )
 
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
-    assert manifest["schema"] == "guanwu.target_frame_background_assets.v2"
+    assert manifest["schema"] == "guanwu.target_frame_background_assets.clean_scene_depth.v2"
     assert manifest["quality"]["depth_background_source"] == "depth_anything3_clean_rgb"
     assert manifest["quality"]["depth_service"] == "fake_depth_anything3"
     depth = np.load(manifest["assets"]["clean_depth"])
@@ -2590,6 +1552,7 @@ def test_clean_depth_estimator_depth_uses_da3_metric_directly_without_wildgs_cal
             "depth_path": external_depth,
             "source": "depth_anything3_clean_rgb",
         },
+        background_image_cleaner=_copy_reference_cleaner,
         grid_stride=4,
     )
 

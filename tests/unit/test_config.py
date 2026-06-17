@@ -20,13 +20,13 @@ def test_default_config():
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is True
     assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
     assert cfg.video_pipeline.background_mode == "auto"
-    assert cfg.video_pipeline.background_disable_road_semantics is False
     assert cfg.video_pipeline.task_foreground_object_ids == []
     assert cfg.video_pipeline.background_target_frame_id == 1
-    assert cfg.video_pipeline.background_cleaner == "temporal"
+    assert cfg.video_pipeline.background_cleaner == "openai_image_edit"
     assert cfg.video_pipeline.background_cleaner_config_path is None
     assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"
     assert cfg.video_pipeline.background_cleaner_reference_frame_id == 1
+    assert cfg.video_pipeline.background_scene_prompt_profile == "auto"
 
 
 def test_resolve_paths():
@@ -55,7 +55,6 @@ video_pipeline:
   mesh_proxy_use_for_pose: false
   mesh_proxy_keep_original_for_export: true
   background_mode: tabletop_task
-  background_disable_road_semantics: true
   task_foreground_object_ids:
     - obj_000009
   background_target_frame_id: 1
@@ -63,6 +62,7 @@ video_pipeline:
   background_cleaner_config_path: /root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml
   background_cleaner_model: gpt-image-2
   background_cleaner_reference_frame_id: 1
+  background_scene_prompt_profile: road
 datasets:
   scannetpp:
     enabled: true
@@ -84,13 +84,13 @@ datasets:
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is False
     assert cfg.video_pipeline.mesh_proxy_keep_original_for_export is True
     assert cfg.video_pipeline.background_mode == "tabletop_task"
-    assert cfg.video_pipeline.background_disable_road_semantics is True
     assert cfg.video_pipeline.task_foreground_object_ids == ["obj_000009"]
     assert cfg.video_pipeline.background_target_frame_id == 1
     assert cfg.video_pipeline.background_cleaner == "openai_image_edit"
     assert cfg.video_pipeline.background_cleaner_config_path == "/root/autodl-fs/Qcp/Guanwu-master/configs/openai-image-cleaner.yaml"
     assert cfg.video_pipeline.background_cleaner_model == "gpt-image-2"
     assert cfg.video_pipeline.background_cleaner_reference_frame_id == 1
+    assert cfg.video_pipeline.background_scene_prompt_profile == "road"
     assert "scannetpp" in cfg.datasets
     assert cfg.datasets["scannetpp"].source.path == "/data/scannetpp"
 

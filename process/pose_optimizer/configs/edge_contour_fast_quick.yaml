@@ -27,7 +27,7 @@ fast_float32: true
 save_full_history: false
 profile_timings: false
 world_up_axis: "-y"
-proxy_face_count: 1800
+proxy_face_count: 15000
 top_k_candidates: 16
 refine_top_k: 4
 early_stop_mask_iou: 0.94

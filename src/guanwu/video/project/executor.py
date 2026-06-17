@@ -5222,15 +5222,36 @@ class ProjectExecutor:
                 if existing_bbox and not isinstance(frame.get("trajectory_smoothing"), dict):
                     continue
                 source = str(frame.get("source") or frame.get("pose_source") or frame.get("geometry_status") or "pose_optimize")
-                bbox_size = existing_bbox.get("size") if ProjectExecutor._valid_vec3_like(existing_bbox.get("size")) else frame["scale"]
-                bbox_3d = ProjectExecutor._bbox3d_from_pose(
-                    center=frame["centroid_world"],
-                    scale=bbox_size,
-                    rotation_matrix=rotation,
-                    orientation_quat=frame.get("orientation_quat"),
-                    source=source,
-                    confidence=frame.get("confidence"),
-                )
+                local_center = existing_bbox.get("local_center") if isinstance(existing_bbox, dict) else None
+                local_size = existing_bbox.get("local_size") if isinstance(existing_bbox, dict) else None
+                if ProjectExecutor._valid_vec3_like(local_center) and ProjectExecutor._valid_vec3_like(local_size):
+                    local_center_arr = np.asarray(local_center, dtype=np.float64).reshape(3)
+                    local_half = 0.5 * np.asarray(local_size, dtype=np.float64).reshape(3)
+                    local_offsets = [
+                        local_center_arr + np.array([sx * local_half[0], sy * local_half[1], sz * local_half[2]], dtype=np.float64)
+                        for sz in (-1.0, 1.0)
+                        for sy in (-1.0, 1.0)
+                        for sx in (-1.0, 1.0)
+                    ]
+                    bbox_3d = ProjectExecutor._bbox3d_from_pose(
+                        center=frame["centroid_world"],
+                        scale=frame["scale"],
+                        rotation_matrix=rotation,
+                        orientation_quat=frame.get("orientation_quat"),
+                        source=source,
+                        confidence=frame.get("confidence"),
+                        vertices=local_offsets,
+                    )
+                else:
+                    bbox_size = existing_bbox.get("size") if ProjectExecutor._valid_vec3_like(existing_bbox.get("size")) else frame["scale"]
+                    bbox_3d = ProjectExecutor._bbox3d_from_pose(
+                        center=frame["centroid_world"],
+                        scale=bbox_size,
+                        rotation_matrix=rotation,
+                        orientation_quat=frame.get("orientation_quat"),
+                        source=source,
+                        confidence=frame.get("confidence"),
+                    )
                 if bbox_3d is not None:
                     frame["bbox_3d"] = bbox_3d
 
@@ -6026,6 +6047,7 @@ class ProjectExecutor:
             local_max = np.max(verts_arr, axis=0)
             local_center = 0.5 * (local_min + local_max)
             local_half = 0.5 * (local_max - local_min)
+            local_size = local_max - local_min
             size = np.abs((local_max - local_min) * scale_arr)
             bbox_center = center_arr + rotation @ (local_center * scale_arr)
             local_offsets = [
@@ -6060,6 +6082,9 @@ class ProjectExecutor:
             "frame": "world",
             "source": str(source or "pose_optimize"),
         }
+        if verts_arr is not None:
+            bbox["local_center"] = [float(v) for v in local_center.tolist()]
+            bbox["local_size"] = [float(v) for v in local_size.tolist()]
         try:
             conf = float(confidence) if confidence is not None else None
         except Exception:

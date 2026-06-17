@@ -32,6 +32,8 @@ class BBox3D(BaseModel):
     size: list[float] = Field(..., min_length=3, max_length=3)
     orientation_quat: list[float] | None = Field(default=None, min_length=4, max_length=4)
     corners: list[list[float]] | None = Field(default=None, min_length=8, max_length=8)
+    local_center: list[float] | None = Field(default=None, min_length=3, max_length=3)
+    local_size: list[float] | None = Field(default=None, min_length=3, max_length=3)
     frame: str = "world"
     source: str = "unknown"
     confidence: float | None = None

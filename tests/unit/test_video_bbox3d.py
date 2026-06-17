@@ -50,6 +50,22 @@ def test_geometry_accepts_explicit_3d_bbox() -> None:
     assert len(dumped["bbox_3d"]["corners"]) == 8
 
 
+def test_geometry_preserves_mesh_local_bbox_metadata() -> None:
+    bbox = BBox3D(
+        type="obb",
+        center=[1.0, 2.0, 3.0],
+        size=[2.0, 4.0, 6.0],
+        local_center=[0.5, 0.0, 0.0],
+        local_size=[1.0, 2.0, 3.0],
+        source="mesh_vertices",
+    )
+
+    dumped = Geometry(bbox_3d=bbox).model_dump(mode="json")
+
+    assert dumped["bbox_3d"]["local_center"] == [0.5, 0.0, 0.0]
+    assert dumped["bbox_3d"]["local_size"] == [1.0, 2.0, 3.0]
+
+
 def test_state_estimator_emits_bbox3d_for_metric_geometry() -> None:
     estimator = StateEstimationAgent(camera_provider="none", depth_provider="wildgs")
     estimator._depth_provider_impl = _FakeMetricDepthProvider()
@@ -205,3 +221,40 @@ def test_corrected_trajectory_bbox3d_refreshes_from_current_pose() -> None:
     assert bbox["center"] == [4.0, 5.0, 6.0]
     assert bbox["size"] == [1.0, 1.0, 1.0]
     assert bbox["corners"][0] == pytest.approx([3.5, 4.5, 5.5])
+
+
+def test_corrected_trajectory_bbox3d_refresh_preserves_mesh_local_bounds() -> None:
+    trajectories = {
+        "obj_000001": {
+            "frames": [
+                {
+                    "frame_id": 1,
+                    "centroid_world": [10.0, 0.0, 0.0],
+                    "rotation_matrix": [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "orientation_quat": [0.0, 0.0, 0.0, 1.0],
+                    "scale": [2.0, 3.0, 4.0],
+                    "trajectory_smoothing": {"applied": True},
+                    "bbox_3d": {
+                        "type": "obb",
+                        "center": [10.0, 0.0, 0.0],
+                        "size": [4.0, 6.0, 8.0],
+                        "local_center": [1.0, 0.0, 0.0],
+                        "local_size": [2.0, 2.0, 2.0],
+                        "source": "mesh_vertices",
+                    },
+                }
+            ]
+        }
+    }
+
+    ProjectExecutor._refresh_corrected_trajectory_bbox3d(trajectories)
+    bbox = trajectories["obj_000001"]["frames"][0]["bbox_3d"]
+
+    assert bbox["center"] == pytest.approx([12.0, 0.0, 0.0])
+    assert bbox["size"] == pytest.approx([4.0, 6.0, 8.0])
+    assert bbox["local_center"] == [1.0, 0.0, 0.0]
+    assert bbox["local_size"] == [2.0, 2.0, 2.0]

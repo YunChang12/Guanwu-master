@@ -96,6 +96,7 @@ class VideoProjectExecutor:
             for object_id in workspace.video_pipeline.mesh_reconstruct_object_ids
             if str(object_id).strip()
         ]
+        context.config.settings.zaiwu.mesh_reconstruct_top_k = workspace.video_pipeline.mesh_reconstruct_top_k
         context.config.settings.zaiwu.background_mode = workspace.video_pipeline.background_mode
         context.config.settings.zaiwu.task_foreground_object_ids = [
             str(object_id).strip()

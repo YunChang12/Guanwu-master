@@ -15,6 +15,7 @@ def test_default_config():
     assert cfg.runtime.workers == 8
     assert cfg.video_pipeline.object_detection_backend == "seg2track_sam2"
     assert cfg.video_pipeline.mesh_reconstruct_object_ids == []
+    assert cfg.video_pipeline.mesh_reconstruct_top_k == 8
     assert cfg.video_pipeline.mesh_proxy_mode == "auto"
     assert cfg.video_pipeline.mesh_proxy_target_faces == 1500
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is True
@@ -50,6 +51,7 @@ video_pipeline:
   mesh_reconstruct_object_ids:
     - obj_000007
     - obj_000012
+  mesh_reconstruct_top_k: 6
   mesh_proxy_mode: simplify
   mesh_proxy_target_faces: 2400
   mesh_proxy_use_for_pose: false
@@ -79,6 +81,7 @@ datasets:
     assert cfg.runtime.workers == 4
     assert cfg.runtime.fail_fast is True
     assert cfg.video_pipeline.mesh_reconstruct_object_ids == ["obj_000007", "obj_000012"]
+    assert cfg.video_pipeline.mesh_reconstruct_top_k == 6
     assert cfg.video_pipeline.mesh_proxy_mode == "simplify"
     assert cfg.video_pipeline.mesh_proxy_target_faces == 2400
     assert cfg.video_pipeline.mesh_proxy_use_for_pose is False

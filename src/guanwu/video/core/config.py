@@ -144,6 +144,7 @@ class ZaiwuConfig(BaseModel):
     seg2track_sam2_service: str = "services.seg2track_sam2"
     sam3d_service: str = "services.sam3d"
     mesh_reconstruct_object_ids: list[str] = Field(default_factory=list)
+    mesh_reconstruct_top_k: int | None = 8
     pose_optimizer_timeout_sec: float = 1800.0
     pose_optimize_min_bbox_area_px: float = 5000.0
     mesh_proxy_mode: str = "auto"

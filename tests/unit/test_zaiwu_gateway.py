@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import fcntl
+import os
 import tarfile
 
 import httpx
@@ -8,10 +10,12 @@ import httpx
 from guanwu.core.config import StorageConfig, WorkspaceConfig
 from guanwu.video.clients.zaiwu import (
     ZaiwuGatewayClient,
+    ZaiwuDepthProvider,
     ZaiwuGroundedSAM2Detector,
     ZaiwuSAM3DAdapter,
     ZaiwuWildGSAdapter,
     normalize_service_id,
+    zaiwu_service_stage_lock,
 )
 from guanwu.video.core.schema import ObjectNode
 from guanwu.video.core.types import DetectedInstance, FrameDetections
@@ -744,3 +748,91 @@ def test_zaiwu_wildgs_requires_camera_poses_artifact(tmp_path: Path) -> None:
 def test_normalize_service_id_accepts_legacy_mcps_prefix() -> None:
     assert normalize_service_id("mcps.sam3d") == "services.sam3d"
     assert normalize_service_id("services.sam3d") == "services.sam3d"
+
+
+def test_depth_anything3_is_metric_when_direct_sse_is_unreachable() -> None:
+    class _NoDirectSSEGateway(ZaiwuGatewayClient):
+        def __init__(self) -> None:
+            super().__init__(gateway_url="http://zaiwu.local:8181", auto_start_workers=False)
+
+        def service_sse_url(self, service_id: str) -> str:  # type: ignore[override]
+            raise RuntimeError(f"direct worker SSE is not reachable for {service_id}")
+
+    provider = ZaiwuDepthProvider(_NoDirectSSEGateway(), service_id="services.depth_anything3")
+
+    assert provider.is_metric is True
+
+
+def test_run_service_job_holds_env_enabled_service_lock(tmp_path: Path, monkeypatch) -> None:
+    class _LockProbeGateway(ZaiwuGatewayClient):
+        def __init__(self) -> None:
+            super().__init__(gateway_url="http://zaiwu.local:8181", auto_start_workers=False)
+            self.lock_was_held = False
+
+        def ensure_service(self, service_id: str, *, timeout_sec: float = 60.0):  # type: ignore[override]
+            return self._service_cache.setdefault(
+                service_id,
+                type(
+                    "Endpoint",
+                    (),
+                    {"base_url": "http://zaiwu.local:19000", "sse_url": "http://zaiwu.local:19000/sse"},
+                )(),
+            )
+
+        def run_job(self, **kwargs):  # type: ignore[override]
+            lock_path = tmp_path / "services_sam3d.lock"
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.lock_was_held = True
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return {"ok": True}
+
+    monkeypatch.setenv("GUANWU_ZAIWU_SERVICE_LOCKS", "1")
+    monkeypatch.setenv("GUANWU_ZAIWU_SERVICE_LOCK_DIR", os.fspath(tmp_path))
+
+    gateway = _LockProbeGateway()
+    result = gateway.run_service_job("services.sam3d", "reconstruct_objects", {})
+
+    assert result == {"ok": True}
+    assert gateway.lock_was_held
+
+
+def test_run_service_job_reuses_already_held_stage_lock(tmp_path: Path, monkeypatch) -> None:
+    class _NestedLockProbeGateway(ZaiwuGatewayClient):
+        def __init__(self) -> None:
+            super().__init__(gateway_url="http://zaiwu.local:8181", auto_start_workers=False)
+            self.outer_lock_was_held = False
+
+        def ensure_service(self, service_id: str, *, timeout_sec: float = 60.0):  # type: ignore[override]
+            return self._service_cache.setdefault(
+                service_id,
+                type(
+                    "Endpoint",
+                    (),
+                    {"base_url": "http://zaiwu.local:19000", "sse_url": "http://zaiwu.local:19000/sse"},
+                )(),
+            )
+
+        def run_job(self, **kwargs):  # type: ignore[override]
+            lock_path = tmp_path / "services_sam3d.lock"
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.outer_lock_was_held = True
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return {"ok": True}
+
+    monkeypatch.setenv("GUANWU_ZAIWU_SERVICE_LOCKS", "1")
+    monkeypatch.setenv("GUANWU_ZAIWU_SERVICE_LOCK_DIR", os.fspath(tmp_path))
+
+    gateway = _NestedLockProbeGateway()
+    with zaiwu_service_stage_lock("services.sam3d", label="mesh.reconstruct"):
+        result = gateway.run_service_job("services.sam3d", "reconstruct_objects", {})
+
+    assert result == {"ok": True}
+    assert gateway.outer_lock_was_held

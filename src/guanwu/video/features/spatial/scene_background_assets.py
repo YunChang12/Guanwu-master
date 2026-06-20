@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import math
 import os
+import time
 import zlib
 from pathlib import Path
 from typing import Any, Callable
 
 import cv2
+import fcntl
 import numpy as np
 from PIL import Image
 
@@ -776,6 +779,32 @@ def _load_system_vlm_openai_defaults() -> dict[str, Any]:
     return defaults
 
 
+def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+@contextlib.contextmanager
+def _maybe_openai_image_edit_lock():
+    if not _env_flag_enabled("GUANWU_OPENAI_IMAGE_EDIT_LOCK"):
+        yield
+        return
+    lock_path = Path(os.environ.get("GUANWU_OPENAI_IMAGE_EDIT_LOCK_PATH") or "/tmp/guanwu_openai_image_edit.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        print(f"[BackgroundCleaner] Waiting for OpenAI image edit lock {lock_path}", flush=True)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        print(f"[BackgroundCleaner] Acquired OpenAI image edit lock after {time.time() - start:.2f}s", flush=True)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            print("[BackgroundCleaner] Released OpenAI image edit lock", flush=True)
+
+
 def run_openai_image_edit_background_cleaner(
     *,
     image_path: str | Path,
@@ -822,7 +851,8 @@ def run_openai_image_edit_background_cleaner(
     if not prompt_only_mode:
         request_kwargs["mask"] = open(mask_path, "rb")
     try:
-        response = client.images.edit(**request_kwargs)
+        with _maybe_openai_image_edit_lock():
+            response = client.images.edit(**request_kwargs)
     finally:
         try:
             request_kwargs["image"].close()

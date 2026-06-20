@@ -178,7 +178,12 @@ class IsaacSyncAgent:
         # deactivated specs that cause DefinePrim failures on child paths.
         if path.exists():
             path.unlink()
-        stage = Usd.Stage.CreateNew(str(path))
+        existing_layer = Sdf.Layer.Find(str(path))
+        if existing_layer is not None:
+            existing_layer.Clear()
+            stage = Usd.Stage.Open(existing_layer)
+        else:
+            stage = Usd.Stage.CreateNew(str(path))
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         UsdGeom.Xform.Define(stage, "/World")
         UsdGeom.Xform.Define(stage, "/World/Objects")

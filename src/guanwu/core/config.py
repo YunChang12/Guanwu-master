@@ -42,6 +42,7 @@ class VideoPipelineConfig(BaseModel):
     pose_optimizer_timeout_sec: float = 1800.0
     pose_optimize_min_bbox_area_px: float = 5000.0
     mesh_reconstruct_object_ids: list[str] = Field(default_factory=list)
+    mesh_reconstruct_top_k: int | None = 8
     mesh_proxy_mode: str = "auto"
     mesh_proxy_target_faces: int = 1500
     mesh_proxy_use_for_pose: bool = True

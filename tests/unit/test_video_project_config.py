@@ -77,13 +77,16 @@ def test_project_config_persists_mesh_reconstruct_object_id_whitelist(tmp_path: 
         ),
     )
     config.settings.zaiwu.mesh_reconstruct_object_ids = ["obj_000007"]
+    config.settings.zaiwu.mesh_reconstruct_top_k = 6
 
     save_project_config(config, config_path)
     saved = config_path.read_text(encoding="utf-8")
     loaded = load_project_config(config_path)
 
     assert "mesh_reconstruct_object_ids" in saved
+    assert "mesh_reconstruct_top_k" in saved
     assert loaded.settings.zaiwu.mesh_reconstruct_object_ids == ["obj_000007"]
+    assert loaded.settings.zaiwu.mesh_reconstruct_top_k == 6
 
 
 def test_project_config_persists_tabletop_task_background_settings(tmp_path: Path) -> None:

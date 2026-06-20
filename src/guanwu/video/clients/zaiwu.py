@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import io
 import json
 import os
@@ -19,6 +21,7 @@ from guanwu.video.core.config import SPWMSettings
 from guanwu.video.core.logger import get_logger
 
 logger = get_logger(__name__)
+_ACTIVE_SERVICE_LOCKS: dict[str, int] = {}
 
 
 def normalize_provider_mode(value: str | None) -> str:
@@ -68,6 +71,69 @@ def _is_retryable_job_poll_error(exc: Exception) -> bool:
             "gateway error 404",
         )
     )
+
+
+def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _service_lock_enabled(service_id: str) -> bool:
+    if not _env_flag_enabled("GUANWU_ZAIWU_SERVICE_LOCKS"):
+        return False
+    configured = os.environ.get("GUANWU_ZAIWU_LOCK_SERVICES")
+    if not configured:
+        return True
+    allowed = {normalize_service_id(item) for item in configured.split(",") if item.strip()}
+    return normalize_service_id(service_id) in allowed
+
+
+def _service_lock_path(service_id: str) -> Path:
+    root = Path(os.environ.get("GUANWU_ZAIWU_SERVICE_LOCK_DIR") or "/tmp/guanwu_zaiwu_service_locks")
+    safe_name = normalize_service_id(service_id).replace("/", "_").replace(".", "_")
+    return root / f"{safe_name}.lock"
+
+
+@contextlib.contextmanager
+def _maybe_zaiwu_service_lock(service_id: str):
+    service_id = normalize_service_id(service_id)
+    if not _service_lock_enabled(service_id):
+        yield
+        return
+    if _ACTIVE_SERVICE_LOCKS.get(service_id, 0) > 0:
+        yield
+        return
+
+    lock_path = _service_lock_path(service_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        logger.info("[Zaiwu] Waiting for service lock %s (%s)", service_id, lock_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        waited = time.time() - start
+        logger.info("[Zaiwu] Acquired service lock %s after %.2fs", service_id, waited)
+        _ACTIVE_SERVICE_LOCKS[service_id] = _ACTIVE_SERVICE_LOCKS.get(service_id, 0) + 1
+        try:
+            yield
+        finally:
+            active_count = _ACTIVE_SERVICE_LOCKS.get(service_id, 0) - 1
+            if active_count > 0:
+                _ACTIVE_SERVICE_LOCKS[service_id] = active_count
+            else:
+                _ACTIVE_SERVICE_LOCKS.pop(service_id, None)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            logger.info("[Zaiwu] Released service lock %s", service_id)
+
+
+@contextlib.contextmanager
+def zaiwu_service_stage_lock(service_id: str, *, label: str | None = None):
+    normalized = normalize_service_id(service_id)
+    if label:
+        logger.info("[Zaiwu] Entering stage lock %s for %s", normalized, label)
+    with _maybe_zaiwu_service_lock(normalized):
+        yield
 
 
 @dataclass(frozen=True)
@@ -304,13 +370,14 @@ class ZaiwuGatewayClient:
         labels = {"service_id": service_id}
         if execution_labels:
             labels.update({str(key): str(value) for key, value in execution_labels.items()})
-        return self.run_job(
-            handler=f"{service_id}.{operation}",
-            payload=payload,
-            requested_by=requested_by,
-            execution_labels=labels,
-            timeout_sec=timeout_sec,
-        )
+        with _maybe_zaiwu_service_lock(service_id):
+            return self.run_job(
+                handler=f"{service_id}.{operation}",
+                payload=payload,
+                requested_by=requested_by,
+                execution_labels=labels,
+                timeout_sec=timeout_sec,
+            )
 
     def submit_job(
         self,
@@ -1350,16 +1417,25 @@ class ZaiwuDepthProvider:
             self._load_from_video(self.video_path)
 
     def _query_depth_info(self) -> None:
-        from guanwu.video.clients.mcp_backend import sync_call_mcp
-
         try:
+            from guanwu.video.clients.mcp_backend import sync_call_mcp
+
             url = self.gateway.service_sse_url(self.service_id)
             info = sync_call_mcp(url, "depth_info", {})
             model_name = str(info.get("model_name", "")).upper()
-            self._is_metric = "METRIC" in model_name
+            self._is_metric = "METRIC" in model_name or "DA3" in model_name
         except Exception as exc:
-            logger.warning("[ZaiwuDepthProvider] depth_info query failed, assuming relative depth: %s", exc)
-            self._is_metric = False
+            service_id = normalize_service_id(self.service_id)
+            if service_id == "services.depth_anything3":
+                logger.warning(
+                    "[ZaiwuDepthProvider] depth_info query failed for %s, assuming metric DA3 depth: %s",
+                    service_id,
+                    exc,
+                )
+                self._is_metric = True
+            else:
+                logger.warning("[ZaiwuDepthProvider] depth_info query failed, assuming relative depth: %s", exc)
+                self._is_metric = False
 
     def _load_from_video(self, video_path: str) -> None:
         import io

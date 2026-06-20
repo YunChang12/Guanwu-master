@@ -111,6 +111,15 @@ TEMPORAL_EXTRA_HISTORY_KEYS = [
     "trusted_anchor_penalty",
     "truncated_anchor_gate_passed",
     "truncated_anchor_gate_reasons",
+    "catastrophic_temporal_jump",
+    "catastrophic_temporal_jump_reasons",
+    "catastrophic_orientation_jump_deg",
+    "catastrophic_scale_ratio",
+    "catastrophic_temporal_yaw_limit_deg",
+    "catastrophic_temporal_rotation_limit_deg",
+    "catastrophic_temporal_scale_ratio_limit",
+    "catastrophic_temporal_loss",
+    "catastrophic_track_scale_prior_score",
     "scale_ratio_from_anchor",
     "yaw_jump_from_anchor_deg",
     "final_score",
@@ -3558,6 +3567,69 @@ def front_sign_rank_score(result: dict[str, Any]) -> float:
     return float(result.get("score", -1e9)) - front_sign_selection_penalty(result)
 
 
+def candidate_has_catastrophic_temporal_jump(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if not bool(getattr(args, "catastrophic_temporal_jump_enabled", True)):
+        return {
+            "catastrophic_temporal_jump": False,
+            "catastrophic_temporal_jump_reasons": [],
+        }
+
+    yaw_jump = _finite_float(result.get("yaw_jump_from_anchor_deg"))
+    if yaw_jump is None:
+        yaw_jump = _finite_float(result.get("delta_yaw_deg"))
+    rotation_jump = _finite_float(result.get("delta_rotation_deg"))
+    orientation_jump = max(
+        value
+        for value in (yaw_jump, rotation_jump, 0.0)
+        if value is not None
+    )
+
+    scale_ratio = _finite_float(result.get("scale_ratio_from_anchor"))
+    if scale_ratio is None:
+        scale_ratio = _finite_float(result.get("scale_ratio_from_trusted_anchor"))
+    if scale_ratio is None:
+        delta_log = _finite_float(result.get("track_scale_prior_delta_log"))
+        if delta_log is not None:
+            scale_ratio = math.exp(abs(delta_log))
+    if scale_ratio is not None and scale_ratio > 0.0:
+        scale_ratio = max(scale_ratio, 1.0 / scale_ratio)
+
+    yaw_limit = float(getattr(args, "catastrophic_temporal_yaw_deg", 60.0))
+    rotation_limit = float(getattr(args, "catastrophic_temporal_rotation_deg", 75.0))
+    scale_limit = max(1.0 + 1e-6, float(getattr(args, "catastrophic_temporal_scale_ratio", 1.35)))
+
+    orientation_bad = (
+        (yaw_jump is not None and yaw_jump >= yaw_limit)
+        or (rotation_jump is not None and rotation_jump >= rotation_limit)
+    )
+    scale_bad = scale_ratio is not None and scale_ratio >= scale_limit
+    reasons: list[str] = []
+    if orientation_bad:
+        reasons.append("orientation_jump")
+    if scale_bad:
+        reasons.append("scale_jump")
+
+    temporal_loss = _finite_float(result.get("temporal_loss"))
+    track_scale_prior_score = _finite_float(result.get("track_scale_prior_score"))
+    if temporal_loss is not None:
+        result["catastrophic_temporal_loss"] = float(temporal_loss)
+    if track_scale_prior_score is not None:
+        result["catastrophic_track_scale_prior_score"] = float(track_scale_prior_score)
+
+    return {
+        "catastrophic_temporal_jump": bool(orientation_bad and scale_bad),
+        "catastrophic_temporal_jump_reasons": reasons if orientation_bad and scale_bad else [],
+        "catastrophic_orientation_jump_deg": float(orientation_jump),
+        "catastrophic_scale_ratio": float(scale_ratio) if scale_ratio is not None else None,
+        "catastrophic_temporal_yaw_limit_deg": float(yaw_limit),
+        "catastrophic_temporal_rotation_limit_deg": float(rotation_limit),
+        "catastrophic_temporal_scale_ratio_limit": float(scale_limit),
+    }
+
+
 def choose_best_refined_result(
     refined_results: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -3565,18 +3637,22 @@ def choose_best_refined_result(
 ) -> dict[str, Any] | None:
     if not refined_results:
         return None
+    for item in refined_results:
+        item.update(candidate_has_catastrophic_temporal_jump(item, args))
+    non_catastrophic = [item for item in refined_results if not bool(item.get("catastrophic_temporal_jump"))]
+    selection_results = non_catastrophic or refined_results
     if not (
         bool(getattr(args, "final_ground_constrained_selection_enabled", True))
         and bool(truncation_info.get("is_truncated"))
     ):
-        selected = max(refined_results, key=front_sign_rank_score)
+        selected = max(selection_results, key=front_sign_rank_score)
         selected["final_front_sign_rank_score"] = front_sign_rank_score(selected)
         selected["final_front_sign_selection_penalty"] = front_sign_selection_penalty(selected)
         selected["final_selection_mode"] = "front_sign_consistent_rank"
         return selected
-    feasible = [item for item in refined_results if candidate_satisfies_ground_constraint(item, args)]
+    feasible = [item for item in selection_results if candidate_satisfies_ground_constraint(item, args)]
     if not feasible:
-        selected = max(refined_results, key=lambda item: float(item.get("score", -1e9)))
+        selected = max(selection_results, key=lambda item: float(item.get("score", -1e9)))
         selected["final_selection_mode"] = "score_no_ground_feasible"
         selected["final_ground_constrained_selected"] = False
         return selected
@@ -3828,6 +3904,15 @@ def refined_pose_candidate_summary(
         "trusted_anchor_penalty",
         "truncated_anchor_gate_passed",
         "truncated_anchor_gate_reasons",
+        "catastrophic_temporal_jump",
+        "catastrophic_temporal_jump_reasons",
+        "catastrophic_orientation_jump_deg",
+        "catastrophic_scale_ratio",
+        "catastrophic_temporal_yaw_limit_deg",
+        "catastrophic_temporal_rotation_limit_deg",
+        "catastrophic_temporal_scale_ratio_limit",
+        "catastrophic_temporal_loss",
+        "catastrophic_track_scale_prior_score",
         "scale_ratio_from_anchor",
         "yaw_jump_from_anchor_deg",
         "final_selection_mode",
@@ -4546,6 +4631,15 @@ def optimize_sample(args: argparse.Namespace) -> dict[str, Any]:
             "truncated_anchor_gate_yaw_limit_deg": best_result.get("truncated_anchor_gate_yaw_limit_deg"),
             "truncated_anchor_gate_scale_ratio_limit": best_result.get("truncated_anchor_gate_scale_ratio_limit"),
             "truncated_anchor_gate_temporal_loss_limit": best_result.get("truncated_anchor_gate_temporal_loss_limit"),
+            "catastrophic_temporal_jump": best_result.get("catastrophic_temporal_jump"),
+            "catastrophic_temporal_jump_reasons": best_result.get("catastrophic_temporal_jump_reasons"),
+            "catastrophic_orientation_jump_deg": best_result.get("catastrophic_orientation_jump_deg"),
+            "catastrophic_scale_ratio": best_result.get("catastrophic_scale_ratio"),
+            "catastrophic_temporal_yaw_limit_deg": best_result.get("catastrophic_temporal_yaw_limit_deg"),
+            "catastrophic_temporal_rotation_limit_deg": best_result.get("catastrophic_temporal_rotation_limit_deg"),
+            "catastrophic_temporal_scale_ratio_limit": best_result.get("catastrophic_temporal_scale_ratio_limit"),
+            "catastrophic_temporal_loss": best_result.get("catastrophic_temporal_loss"),
+            "catastrophic_track_scale_prior_score": best_result.get("catastrophic_track_scale_prior_score"),
             "scale_ratio_from_anchor": best_result.get("scale_ratio_from_anchor"),
             "yaw_jump_from_anchor_deg": best_result.get("yaw_jump_from_anchor_deg"),
             "visible_projected_bbox": best_result.get("visible_projected_bbox"),
@@ -4675,6 +4769,10 @@ def add_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--track_scale_prior_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track_scale_prior_weight", type=float, default=0.18)
     parser.add_argument("--track_scale_prior_sigma", type=float, default=0.10)
+    parser.add_argument("--catastrophic_temporal_jump_enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--catastrophic_temporal_yaw_deg", type=float, default=60.0)
+    parser.add_argument("--catastrophic_temporal_rotation_deg", type=float, default=75.0)
+    parser.add_argument("--catastrophic_temporal_scale_ratio", type=float, default=1.35)
 
     parser.add_argument("--partial_visibility_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--truncation_border_margin", type=int, default=3)

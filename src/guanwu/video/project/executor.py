@@ -2,6 +2,7 @@ import logging as _logging
 _logger = _logging.getLogger(__name__)
 
 import base64
+import contextlib
 import json
 import math
 import os
@@ -27,6 +28,7 @@ from guanwu.video.clients.zaiwu import (
     build_zaiwu_sam3d_adapter,
     build_zaiwu_wildgs_adapter,
     normalize_provider_mode,
+    zaiwu_service_stage_lock,
 )
 from guanwu.video.core.instance_matching import deduplicate_instances
 from guanwu.video.core.schema import Event, ObjectNode, RelationEdge, WorldState
@@ -119,10 +121,21 @@ _EDGE_POSE_TRUNCATION_METRIC_KEYS = (
     "truncation_observability_reasons",
     "visible_target_fraction",
     "visible_target_area_px",
+    "visible_mask_iou",
+    "visible_bbox_iou",
     "visible_contour_mean_distance_px",
     "visible_profile_mean_distance_px",
     "truncated_visual_quality_gate",
+    "truncated_visual_quality_gate_floor",
     "truncated_visual_quality_reason",
+    "truncated_visual_bbox_factor",
+    "truncated_visual_center_factor",
+    "truncated_visual_mask_factor",
+    "truncated_visual_contour_factor",
+    "truncated_visual_profile_factor",
+    "truncated_visual_overflow_factor",
+    "truncated_visual_overflow_loss",
+    "truncated_visual_quality_penalty",
     "severe_truncation_gate_passed",
     "severe_truncation_gate_reasons",
 )
@@ -567,6 +580,13 @@ class ProjectExecutor:
             except (TypeError, ValueError):
                 return None, None
 
+        image_size = get_value("image_size")
+        if isinstance(image_size, (list, tuple)) and len(image_size) >= 2:
+            try:
+                return float(image_size[0]), float(image_size[1])
+            except (TypeError, ValueError):
+                return None, None
+
         mask_rle = get_value("mask_rle")
         if mask_rle is None:
             return None, None
@@ -808,12 +828,28 @@ class ProjectExecutor:
 
     def _assert_zaiwu_service_ready(self, service_id: str, *, stage: str) -> None:
         gateway = build_zaiwu_gateway_client(self.context.config.settings)
-        try:
-            endpoint = gateway.get_ready_service(service_id)
-        except Exception as exc:
+        last_exc: Exception | None = None
+        endpoint = None
+        for attempt in range(1, 6):
+            try:
+                endpoint = gateway.get_ready_service(service_id)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 5:
+                    break
+                _logger.warning(
+                    "%s could not verify Zaiwu service %s on attempt %d/5: %s",
+                    stage,
+                    service_id,
+                    attempt,
+                    exc,
+                )
+                time.sleep(5.0)
+        if last_exc is not None and endpoint is None:
             raise RuntimeError(
-                f"{stage} could not verify Zaiwu service {service_id}: {exc}"
-            ) from exc
+                f"{stage} could not verify Zaiwu service {service_id}: {last_exc}"
+            ) from last_exc
         if endpoint is None:
             raise RuntimeError(
                 f"{stage} requires Zaiwu service {service_id} to already be running, "
@@ -1984,15 +2020,15 @@ class ProjectExecutor:
                 continue
             objects_after_robotic_arm_filter.append(obj)
         objects_to_reconstruct = objects_after_robotic_arm_filter
+        pre_top_k_selected_count = len(objects_to_reconstruct)
+        top_k_raw = getattr(self.context.config.settings.zaiwu, "mesh_reconstruct_top_k", 0)
+        try:
+            mesh_reconstruct_top_k = int(top_k_raw or 0)
+        except (TypeError, ValueError):
+            mesh_reconstruct_top_k = 0
+        mesh_reconstruct_top_k = max(mesh_reconstruct_top_k, 0)
+        top_k_applied = False
         selection_path = out_dir / "mesh_candidate_selection.json"
-        self._json_dump(
-            selection_path,
-            {
-                "filter_mode": "vlm_with_heuristic_fallback",
-                "confidence_threshold": 0.7,
-                "objects": mesh_candidate_selection,
-            },
-        )
         _logger.info(
             f"mesh.reconstruct: {len(objects_to_reconstruct)}/{len(objects)} objects "
             f"selected (is_rigid_body=True, is_bbox_moving=True)"
@@ -2002,21 +2038,71 @@ class ProjectExecutor:
         _logger.info(
             f"mesh.reconstruct: best frames found for {len(best_frames)}/{len(object_ids)} objects"
         )
+        ranked_for_top_k: list[tuple[float, ObjectNode]] = []
+        for obj in objects_to_reconstruct:
+            frame_data = best_frames.get(obj.object_id)
+            if frame_data is None:
+                mesh_candidate_selection.setdefault(obj.object_id, {})["selected"] = False
+                mesh_candidate_selection[obj.object_id]["reason"] = "missing_best_reconstruction_frame"
+                continue
+            ranked_for_top_k.append((self._mesh_reconstruction_priority(obj, frame_data), obj))
+        ranked_for_top_k.sort(key=lambda item: item[0], reverse=True)
+        for rank, (priority_score, obj) in enumerate(ranked_for_top_k, start=1):
+            selection_entry = mesh_candidate_selection.setdefault(obj.object_id, {})
+            selection_entry["rank"] = rank
+            selection_entry["priority_score"] = float(priority_score)
+        if not mesh_object_id_whitelist and mesh_reconstruct_top_k > 0 and len(ranked_for_top_k) > mesh_reconstruct_top_k:
+            top_k_applied = True
+            kept_ids = {obj.object_id for _, obj in ranked_for_top_k[:mesh_reconstruct_top_k]}
+            objects_to_reconstruct = [obj for _, obj in ranked_for_top_k[:mesh_reconstruct_top_k]]
+            for _priority_score, obj in ranked_for_top_k[mesh_reconstruct_top_k:]:
+                selection_entry = mesh_candidate_selection.setdefault(obj.object_id, {})
+                selection_entry["selected"] = False
+                selection_entry["reason_before_top_k"] = selection_entry.get("reason")
+                selection_entry["reason"] = "excluded_by_top_k"
+            for obj_id in kept_ids:
+                selection_entry = mesh_candidate_selection.setdefault(obj_id, {})
+                selection_entry["selected"] = True
+                selection_entry["reason_before_top_k"] = selection_entry.get("reason")
+                selection_entry["reason"] = "top_k_selected"
+        self._json_dump(
+            selection_path,
+            {
+                "filter_mode": "vlm_with_heuristic_fallback_top_k",
+                "confidence_threshold": 0.7,
+                "top_k": mesh_reconstruct_top_k,
+                "top_k_applied": top_k_applied,
+                "pre_top_k_selected_count": pre_top_k_selected_count,
+                "post_top_k_selected_count": len(objects_to_reconstruct),
+                "objects": mesh_candidate_selection,
+            },
+        )
         meshes_path = out_dir / "sam3d_meshes.json"
         meshes: dict[str, dict] = {}
         self._json_dump(meshes_path, meshes)
 
         mode = self._provider_mode()
         if mode == "zaiwu":
+            sam3d_service_id = self.context.config.settings.zaiwu.sam3d_service
             self._assert_zaiwu_service_ready(
-                self.context.config.settings.zaiwu.sam3d_service,
+                sam3d_service_id,
                 stage="mesh.reconstruct",
             )
-            meshes, mesh_stats = self._run_zaiwu_mesh_reconstruct(
-                objects_to_reconstruct,
-                best_frames,
-                meshes_path,
+            stage_lock_env = os.environ.get("GUANWU_SAM3D_STAGE_LOCK")
+            if stage_lock_env is None:
+                stage_lock_env = os.environ.get("GUANWU_ZAIWU_SERVICE_LOCKS")
+            use_stage_lock = str(stage_lock_env or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            stage_lock = (
+                zaiwu_service_stage_lock(sam3d_service_id, label="mesh.reconstruct")
+                if use_stage_lock
+                else contextlib.nullcontext()
             )
+            with stage_lock:
+                meshes, mesh_stats = self._run_zaiwu_mesh_reconstruct(
+                    objects_to_reconstruct,
+                    best_frames,
+                    meshes_path,
+                )
         else:
             meshes = self._reconstruct_object_meshes(best_frames, objects_to_reconstruct)
             self._json_dump(meshes_path, meshes)
@@ -2054,6 +2140,10 @@ class ProjectExecutor:
             "object_count": len(objects),
             "reconstructed_count": len(objects_to_reconstruct),
             "mesh_reconstruct_object_ids": sorted(mesh_object_id_whitelist),
+            "mesh_reconstruct_top_k": mesh_reconstruct_top_k,
+            "top_k_applied": top_k_applied,
+            "pre_top_k_selected_count": pre_top_k_selected_count,
+            "post_top_k_selected_count": len(objects_to_reconstruct),
             "bbox_moving_candidate_count": len(bbox_moving_candidates),
             "rigid_moving_selected_count": len(objects_to_reconstruct),
             "robotic_arm_excluded_count": robotic_arm_excluded_count,
@@ -2875,6 +2965,12 @@ class ProjectExecutor:
                 if image is None:
                     frame_records[f"frame_{int(frame_id):06d}"] = {"status": "skipped", "reason": "missing_frame_image"}
                     continue
+                if isinstance(inst, dict) and not (
+                    (inst.get("image_width") is not None and inst.get("image_height") is not None)
+                    or inst.get("image_size") is not None
+                ):
+                    inst = dict(inst)
+                    inst["image_size"] = [int(image.shape[1]), int(image.shape[0])]
                 mask = self._mask_from_detection(inst, image.shape[:2])
                 if mask is None or int(mask.sum()) <= 0:
                     frame_records[f"frame_{int(frame_id):06d}"] = {"status": "skipped", "reason": "missing_mask"}
@@ -2884,22 +2980,26 @@ class ProjectExecutor:
                     frame_records[f"frame_{int(frame_id):06d}"] = {"status": "skipped", "reason": "missing_camera"}
                     continue
 
-                if generic_mode:
-                    object_fail_fast = self._generic_followup_severe_truncation_skip_decision(
-                        inst,
-                        frame_id=int(frame_id),
-                        has_temporal_prior=bool(previous_candidate_prior if all_frames_mode else previous_accepted),
-                    )
-                    if object_fail_fast.get("skip_object"):
-                        frame_records[f"frame_{int(frame_id):06d}"] = {
-                            "status": "skipped",
-                            "reason": object_fail_fast.get("reason"),
-                            "frame_id": int(frame_id),
-                            "truncation_severity": object_fail_fast.get("truncation_severity"),
-                            "low_observability": object_fail_fast.get("low_observability"),
-                            "truncated_sides": object_fail_fast.get("truncated_sides", []),
-                        }
-                        break
+                temporal_prior_record = self._pose_temporal_prior_record(
+                    previous_candidate_prior,
+                    previous_accepted,
+                    all_frames_mode=all_frames_mode,
+                )
+                object_fail_fast = self._generic_followup_severe_truncation_skip_decision(
+                    inst,
+                    frame_id=int(frame_id),
+                    has_temporal_prior=bool(temporal_prior_record),
+                )
+                if object_fail_fast.get("skip_object"):
+                    frame_records[f"frame_{int(frame_id):06d}"] = {
+                        "status": "skipped",
+                        "reason": object_fail_fast.get("reason"),
+                        "frame_id": int(frame_id),
+                        "truncation_severity": object_fail_fast.get("truncation_severity"),
+                        "low_observability": object_fail_fast.get("low_observability"),
+                        "truncated_sides": object_fail_fast.get("truncated_sides", []),
+                    }
+                    break
 
                 task_id = f"{obj_id}@{int(frame_id):06d}"
                 task_dir = tasks_dir / task_id
@@ -2990,7 +3090,7 @@ class ProjectExecutor:
                     reuse_decision = self._generic_static_pose_reuse_decision(
                         frame_id=int(frame_id),
                         generic_phase=generic_phase,
-                        previous_accepted=previous_candidate_prior if all_frames_mode else previous_accepted,
+                        previous_accepted=temporal_prior_record,
                         inst=inst,
                         current_mask_area_px=int(np.count_nonzero(mask)),
                         track_scale_prior=track_scale_prior,
@@ -3000,7 +3100,7 @@ class ProjectExecutor:
                         reuse_record = self._reused_generic_pose_record(
                             obj_id=obj_id,
                             frame_id=int(frame_id),
-                            previous_record=previous_candidate_prior if all_frames_mode else previous_accepted,
+                            previous_record=temporal_prior_record,
                             inst=inst,
                             current_mask_area_px=int(np.count_nonzero(mask)),
                             timestamp_sec=self._timestamp_for_frame(seed_track, int(frame_id)),
@@ -3016,6 +3116,7 @@ class ProjectExecutor:
                             static_reused_frames += 1
                             object_static_reused += 1
                             if all_frames_mode:
+                                previous_accepted = reuse_record
                                 if self._pose_record_updates_temporal_anchor(reuse_record):
                                     previous_candidate_prior = reuse_record
                                     stable_temporal_streak = 0
@@ -3054,6 +3155,16 @@ class ProjectExecutor:
                 if trusted_anchor_prior:
                     trusted_anchor_prior["source"] = "trusted_temporal_anchor_pose"
                     vehicle_pose_context["trusted_temporal_anchor_pose"] = trusted_anchor_prior
+                temporal_prior_pose, temporal_prior_selection = self._edge_pose_temporal_prior_payload_for_task(
+                    previous_candidate_prior=previous_candidate_prior,
+                    previous_accepted=previous_accepted,
+                    previous_anchor=previous_anchor,
+                    all_frames_mode=all_frames_mode,
+                    current_frame_id=int(frame_id),
+                    current_bbox=bbox,
+                )
+                if temporal_prior_selection:
+                    vehicle_pose_context["temporal_prior_selection"] = temporal_prior_selection
                 task_path = self._write_pose_optimizer_sample(
                     task_dir=task_dir,
                     obj_id=obj_id,
@@ -3066,12 +3177,7 @@ class ProjectExecutor:
                     object_node=object_nodes.get(obj_id),
                     object_track=local_seed_track,
                     vehicle_pose_context=vehicle_pose_context,
-                    temporal_prior_pose=self._edge_pose_candidate_temporal_prior_payload(
-                        previous_candidate_prior if all_frames_mode else previous_accepted,
-                        all_frames_mode=all_frames_mode,
-                        current_frame_id=int(frame_id),
-                        current_bbox=bbox,
-                    ),
+                    temporal_prior_pose=temporal_prior_pose,
                 )
 
                 attempted_frames += 1
@@ -3114,7 +3220,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object") and not all_frames_mode:
+                    if object_fail_fast.get("skip_object"):
                         break
                     continue
 
@@ -3137,7 +3243,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object") and not all_frames_mode:
+                    if object_fail_fast.get("skip_object"):
                         break
                     continue
 
@@ -3227,6 +3333,7 @@ class ProjectExecutor:
                     if anchor_kind:
                         pose_record["temporal_anchor_kind"] = anchor_kind
                     if all_frames_mode:
+                        previous_accepted = pose_record
                         if self._pose_record_updates_temporal_anchor(pose_record):
                             previous_candidate_prior = pose_record
                             stable_temporal_streak = 0
@@ -3279,6 +3386,12 @@ class ProjectExecutor:
                             if updated_scale_prior:
                                 track_scale_prior = updated_scale_prior
                     frame_records[f"frame_{int(frame_id):06d}"] = pose_record
+                    object_fail_fast = self._pose_truncated_observation_stop_decision(
+                        pose_record,
+                        frame_id=int(frame_id),
+                    )
+                    if object_fail_fast.get("skip_object"):
+                        break
                 else:
                     rejected_frames += 1
                     object_rejected += 1
@@ -3302,7 +3415,7 @@ class ProjectExecutor:
                         inst=inst,
                         frame_id=int(frame_id),
                     )
-                    if object_fail_fast.get("skip_object") and not all_frames_mode:
+                    if object_fail_fast.get("skip_object"):
                         break
 
             if object_fail_fast and object_fail_fast.get("skip_object"):
@@ -3311,7 +3424,7 @@ class ProjectExecutor:
                     frame_ids=frame_ids,
                     frame_records=frame_records,
                     accepted_records=accepted_records,
-                    skip_remaining_frames=not all_frames_mode,
+                    skip_remaining_frames=True,
                 )
                 if fail_fast_summary.get("skip_entire_object"):
                     manifest["objects"][obj_id] = {
@@ -3896,6 +4009,10 @@ class ProjectExecutor:
                             height, width = int(size[0]), int(size[1])
                     except Exception:
                         pass
+                if (width is None or height is None) and inst.get("image_size"):
+                    image_size = inst.get("image_size")
+                    if isinstance(image_size, (list, tuple)) and len(image_size) >= 2:
+                        width, height = image_size[0], image_size[1]
                 if width is not None and height is not None:
                     w = float(width)
                     h = float(height)
@@ -5540,6 +5657,17 @@ class ProjectExecutor:
         }
 
     @staticmethod
+    def _pose_temporal_prior_record(
+        previous_candidate_prior: dict | None,
+        previous_accepted: dict | None,
+        *,
+        all_frames_mode: bool,
+    ) -> dict | None:
+        if all_frames_mode and isinstance(previous_candidate_prior, dict):
+            return previous_candidate_prior
+        return previous_accepted if isinstance(previous_accepted, dict) else None
+
+    @staticmethod
     def _pose_optimizer_temporal_jump_acceptance(
         report: dict,
         previous: dict | None,
@@ -5644,6 +5772,7 @@ class ProjectExecutor:
                 "scale": pose.get("scale"),
             },
             "metrics": record_metrics,
+            "partial_visibility": report.get("partial_visibility", {}),
             **run_info,
         }
 
@@ -5720,6 +5849,7 @@ class ProjectExecutor:
                     "scale": pose.get("scale"),
                 },
                 "metrics": record_metrics,
+                "partial_visibility": report.get("partial_visibility", {}),
                 "candidate_index": int(index),
                 "candidate_rank": candidate.get("candidate_rank"),
                 "initializer_metadata": candidate.get("initializer_metadata", {}),
@@ -5944,6 +6074,120 @@ class ProjectExecutor:
         ):
             return None
         return ProjectExecutor._edge_pose_temporal_prior_payload(previous)
+
+    @staticmethod
+    def _edge_pose_temporal_prior_payload_for_task(
+        *,
+        previous_candidate_prior: dict | None,
+        previous_accepted: dict | None,
+        previous_anchor: dict | None,
+        all_frames_mode: bool,
+        current_frame_id: int | None = None,
+        current_bbox: object | None = None,
+    ) -> tuple[dict | None, dict]:
+        rejected: list[dict] = []
+
+        def bbox_stats_for(record: dict | None) -> dict | None:
+            if not isinstance(record, dict):
+                return None
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            previous_bbox = metrics.get("detection_bbox") or metrics.get("bbox_xyxy") or metrics.get("bbox")
+            stats = ProjectExecutor._bbox_xyxy_stats(current_bbox, previous_bbox)
+            if not stats.get("valid"):
+                return None
+            return {
+                key: stats.get(key)
+                for key in ("iou", "center_delta_px", "center_delta_ratio", "size_delta_ratio")
+            }
+
+        def reject(source: str, record: dict | None, reason: str) -> None:
+            item = {"source": source, "reason": reason}
+            if isinstance(record, dict):
+                item["frame_id"] = int(record.get("frame_id") or 0)
+                stats = bbox_stats_for(record)
+                if stats:
+                    item["bbox_stats"] = stats
+            rejected.append(item)
+
+        def payload_from(
+            source: str,
+            record: dict | None,
+            *,
+            payload_source: str | None = None,
+            allow_continuity_seed: bool = False,
+        ) -> dict | None:
+            if not isinstance(record, dict):
+                return None
+            if all_frames_mode and ProjectExecutor._edge_pose_temporal_prior_is_stale_for_bbox(
+                record,
+                current_frame_id=current_frame_id,
+                current_bbox=current_bbox,
+            ):
+                reject(source, record, "stale_for_bbox")
+                return None
+            payload = ProjectExecutor._edge_pose_temporal_prior_payload(record)
+            if payload is None:
+                reject(source, record, "invalid_pose")
+                return None
+            if payload_source:
+                payload["source"] = payload_source
+            if allow_continuity_seed:
+                payload["continuity_seed"] = True
+            return payload
+
+        candidate_payload = None
+        if all_frames_mode:
+            candidate_payload = payload_from("previous_candidate_prior", previous_candidate_prior)
+            if candidate_payload is not None:
+                return candidate_payload, {
+                    "selected_source": "previous_candidate_prior",
+                    "selected_frame_id": candidate_payload.get("frame_id"),
+                    "fallback_used": False,
+                    "rejected_candidates": rejected,
+                }
+
+        accepted_payload = payload_from(
+            "previous_accepted_continuity_seed",
+            previous_accepted,
+            allow_continuity_seed=True,
+        )
+        if accepted_payload is not None:
+            return accepted_payload, {
+                "selected_source": "previous_accepted_continuity_seed",
+                "selected_frame_id": accepted_payload.get("frame_id"),
+                "fallback_used": all_frames_mode and isinstance(previous_candidate_prior, dict),
+                "rejected_candidates": rejected,
+            }
+
+        if not all_frames_mode:
+            candidate_payload = payload_from("previous_candidate_prior", previous_candidate_prior)
+            if candidate_payload is not None:
+                return candidate_payload, {
+                    "selected_source": "previous_candidate_prior",
+                    "selected_frame_id": candidate_payload.get("frame_id"),
+                    "fallback_used": True,
+                    "rejected_candidates": rejected,
+                }
+
+        anchor_payload = payload_from(
+            "trusted_temporal_anchor_pose",
+            previous_anchor,
+            payload_source="trusted_temporal_anchor_pose",
+        )
+        if anchor_payload is not None:
+            return anchor_payload, {
+                "selected_source": "trusted_temporal_anchor_pose",
+                "selected_frame_id": anchor_payload.get("frame_id"),
+                "fallback_used": isinstance(previous_candidate_prior, dict) or isinstance(previous_accepted, dict),
+                "rejected_candidates": rejected,
+            }
+
+        return None, {
+            "selected_source": None,
+            "selected_frame_id": None,
+            "fallback_used": False,
+            "rejected_candidates": rejected,
+        }
 
     @staticmethod
     def _edge_pose_temporal_prior_is_stale_for_bbox(
@@ -6452,6 +6696,96 @@ class ProjectExecutor:
         }
 
     @staticmethod
+    def _pose_truncated_observation_stop_decision(record: dict, *, frame_id: int) -> dict:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        partial_visibility = (
+            record.get("partial_visibility")
+            if isinstance(record.get("partial_visibility"), dict)
+            else {}
+        )
+        status = str(record.get("status") or "").lower()
+        if status and status != "accepted":
+            return {"skip_object": False, "reason": "not_accepted_observation"}
+
+        severity = str(
+            metrics.get("truncation_severity")
+            or partial_visibility.get("truncation_severity")
+            or ""
+        ).lower()
+        low_observability = bool(
+            metrics.get("low_observability")
+            or partial_visibility.get("low_observability")
+        )
+        raw_sides = (
+            partial_visibility.get("truncation_sides")
+            or partial_visibility.get("sides")
+            or metrics.get("truncation_sides")
+            or []
+        )
+        if isinstance(raw_sides, str):
+            raw_sides = [raw_sides]
+        sides = {
+            str(side).strip().lower()
+            for side in raw_sides
+            if str(side).strip()
+        } if isinstance(raw_sides, (list, tuple, set)) else set()
+        is_truncated = bool(partial_visibility.get("is_truncated")) or bool(sides) or severity in {
+            "light",
+            "moderate",
+            "severe",
+            "critical",
+        } or low_observability
+        if not is_truncated or "bottom" not in sides:
+            return {"skip_object": False, "reason": "not_bottom_truncated_observation"}
+
+        def finite_float(value) -> float | None:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(numeric):
+                return None
+            return numeric
+
+        gate = finite_float(metrics.get("truncated_visual_quality_gate"))
+        if gate is None:
+            return {"skip_object": False, "reason": "missing_truncated_visual_quality_gate"}
+        floor = finite_float(metrics.get("truncated_visual_quality_gate_floor"))
+        if floor is None:
+            floor = 0.25
+        if gate > floor + 1e-6:
+            return {"skip_object": False, "reason": "truncated_visual_quality_above_floor"}
+
+        reason_text = str(metrics.get("truncated_visual_quality_reason") or "")
+        reasons = {
+            item.strip().lower()
+            for item in reason_text.split(",")
+            if item.strip()
+        }
+        has_border_overflow = "border_overflow" in reasons
+        has_visible_alignment_failure = bool({"visible_bbox", "visible_center"} & reasons)
+        overflow_loss = finite_float(metrics.get("truncated_visual_overflow_loss"))
+        overflow_factor = finite_float(metrics.get("truncated_visual_overflow_factor"))
+        overflow_is_material = (
+            (overflow_loss is not None and overflow_loss >= 1.0)
+            or (overflow_factor is not None and overflow_factor <= 0.25)
+        )
+        if not (has_border_overflow and has_visible_alignment_failure and overflow_is_material):
+            return {"skip_object": False, "reason": "truncated_visual_quality_floor_not_border_overflow"}
+
+        return {
+            "skip_object": True,
+            "reason": "truncated_observation_quality_floor",
+            "frame_id": int(frame_id),
+            "status": status or "accepted",
+            "truncation_severity": severity or ("severe" if low_observability else "unknown"),
+            "low_observability": bool(low_observability),
+            "truncated_sides": sorted(sides),
+            "truncated_visual_quality_gate": gate,
+            "truncated_visual_quality_reason": reason_text,
+        }
+
+    @staticmethod
     def _apply_truncated_object_fail_fast(
         fail_fast: dict,
         *,
@@ -6462,6 +6796,9 @@ class ProjectExecutor:
     ) -> dict:
         failed_frame_id = int(fail_fast.get("frame_id") or 0)
         remaining_count = 0
+        severity = str(fail_fast.get("truncation_severity") or "").lower()
+        force_skip_remaining = severity in {"severe", "critical"} or bool(fail_fast.get("low_observability"))
+        skip_remaining_frames = bool(skip_remaining_frames or force_skip_remaining)
         if skip_remaining_frames:
             for remaining_frame_id in frame_ids:
                 remaining_frame_id = int(remaining_frame_id)
@@ -8228,6 +8565,13 @@ class ProjectExecutor:
         if temporal_visual_penalty >= 100000.0:
             reason = str(metrics.get("temporal_anchor_visual_gate_reason") or "temporal_anchor_visual_gate_failed")
             return {"accepted": False, "reason": f"temporal_anchor_visual_gate_rejected:{reason}"}
+        if bool(metrics.get("catastrophic_temporal_jump")):
+            raw_reasons = metrics.get("catastrophic_temporal_jump_reasons")
+            if isinstance(raw_reasons, (list, tuple)):
+                reason = ",".join(str(item) for item in raw_reasons if str(item))
+            else:
+                reason = str(raw_reasons or "orientation_and_scale_jump")
+            return {"accepted": False, "reason": f"catastrophic_temporal_jump:{reason}"}
         try:
             score = float(metrics.get("score"))
         except Exception:
@@ -10704,6 +11048,33 @@ class ProjectExecutor:
                 vis_attr.Set(UsdGeom.Tokens.invisible, Usd.TimeCode(float(end + 1)))
         return segments
 
+    @staticmethod
+    def _usd_visibility_frames_for_object(
+        obj_id: str,
+        frames: list[dict],
+        object_visibility_frames: dict[str, list[int]] | None,
+    ) -> list[int]:
+        trajectory_frames: list[int] = []
+        for rec in frames or []:
+            try:
+                frame_id = int(float(rec.get("frame_id", 0)))
+            except (TypeError, ValueError):
+                continue
+            if frame_id > 0:
+                trajectory_frames.append(frame_id)
+        if trajectory_frames:
+            return sorted(set(trajectory_frames))
+
+        fallback_frames: list[int] = []
+        for frame_id in ((object_visibility_frames or {}).get(obj_id) or []):
+            try:
+                numeric = int(float(frame_id))
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                fallback_frames.append(numeric)
+        return sorted(set(fallback_frames))
+
     def _export_usdc(
         self,
         usdc_path,
@@ -10881,13 +11252,6 @@ class ProjectExecutor:
             for f in all_frames
             if int(float(f.get("frame_id", 0))) > 0
         ]
-        visibility_frame_numbers = [
-            int(float(frame_id))
-            for frames in (object_visibility_frames or {}).values()
-            for frame_id in (frames or [])
-            if int(float(frame_id)) > 0
-        ]
-        frame_numbers.extend(visibility_frame_numbers)
         min_frame = min(frame_numbers, default=1)
         max_frame = max(frame_numbers, default=min_frame)
         stage.SetStartTimeCode(min_frame)
@@ -11113,13 +11477,11 @@ class ProjectExecutor:
             vis_xf = UsdGeom.Xformable(visual.GetPrim())
             vis_orient = vis_xf.AddOrientOp()
             vis_scale = vis_xf.AddScaleOp()
-            visibility_frames = [
-                int(float(frame_id))
-                for frame_id in ((object_visibility_frames or {}).get(obj_id) or [])
-                if int(float(frame_id)) > 0
-            ]
-            if not visibility_frames:
-                visibility_frames = [int(float(rec.get("frame_id", 0))) for rec in frames]
+            visibility_frames = self._usd_visibility_frames_for_object(
+                obj_id,
+                frames,
+                object_visibility_frames,
+            )
             self._apply_trajectory_visibility_samples(
                 imageable,
                 visibility_frames,

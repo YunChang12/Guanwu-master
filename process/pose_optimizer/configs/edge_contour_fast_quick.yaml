@@ -69,6 +69,10 @@ temporal_search_output_suffixes: "_edge_contour_fast_quick,_temporal_fast_quick,
 track_scale_prior_enabled: true
 track_scale_prior_weight: 0.18
 track_scale_prior_sigma: 0.10
+catastrophic_temporal_jump_enabled: true
+catastrophic_temporal_yaw_deg: 60.0
+catastrophic_temporal_rotation_deg: 75.0
+catastrophic_temporal_scale_ratio: 1.35
 
 partial_visibility_enabled: true
 truncation_border_margin: 3

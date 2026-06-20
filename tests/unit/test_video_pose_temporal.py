@@ -11,6 +11,7 @@ import pytest
 import guanwu.video.project.executor as project_executor
 from guanwu.video.project.executor import ProjectExecutor
 from process.pose_optimizer.strategies.temporal_fast import (
+    candidate_has_catastrophic_temporal_jump,
     classify_truncation_observability,
     compute_visible_bbox_score,
     compute_truncated_visual_quality_gate,
@@ -1324,6 +1325,106 @@ def test_generic_followup_bottom_only_border_touch_does_not_pre_skip() -> None:
     assert followup["reason"] == "truncation_not_severe_bottom"
 
 
+def test_bottom_truncation_bbox_height_ratio_does_not_upgrade_severity() -> None:
+    inst = {
+        "bbox_xyxy": [553.0, 423.0, 724.0, 539.0],
+        "image_size": [960, 540],
+    }
+
+    decision = ProjectExecutor._pose_first_frame_truncation_skip_decision(inst, frame_id=16)
+    followup = ProjectExecutor._generic_followup_severe_truncation_skip_decision(
+        inst,
+        frame_id=16,
+        has_temporal_prior=True,
+    )
+
+    assert decision["skip_object"] is True
+    assert decision["truncated_sides"] == ["bottom"]
+    assert decision["truncation_severity"] == "light"
+    assert decision["low_observability"] is False
+    assert followup["skip_object"] is False
+    assert followup["reason"] == "truncation_not_severe_bottom"
+
+
+def test_truncated_observation_stop_uses_visual_quality_floor() -> None:
+    record = {
+        "status": "accepted",
+        "reason": "accepted",
+        "frame_id": 16,
+        "partial_visibility": {
+            "is_truncated": True,
+            "truncation_sides": ["bottom"],
+            "truncation_severity": "light",
+            "low_observability": False,
+        },
+        "metrics": {
+            "truncation_severity": "light",
+            "low_observability": False,
+            "visible_target_fraction": 0.8481763677,
+            "visible_bbox_iou": 0.7641256464,
+            "bbox_iou": 0.2525402198,
+            "truncated_visual_quality_gate": 0.25,
+            "truncated_visual_quality_gate_floor": 0.25,
+            "truncated_visual_quality_reason": "visible_bbox,visible_center,border_overflow",
+            "truncated_visual_overflow_factor": 0.003785,
+            "truncated_visual_overflow_loss": 5.5767,
+        },
+    }
+
+    decision = ProjectExecutor._pose_truncated_observation_stop_decision(record, frame_id=16)
+
+    assert decision["skip_object"] is True
+    assert decision["reason"] == "truncated_observation_quality_floor"
+    assert decision["frame_id"] == 16
+    assert decision["truncation_severity"] == "light"
+    assert decision["low_observability"] is False
+    assert decision["truncated_sides"] == ["bottom"]
+
+
+def test_edge_pose_record_preserves_truncated_visual_quality_metrics_and_partial_visibility(tmp_path: Path) -> None:
+    executor = ProjectExecutor.__new__(ProjectExecutor)
+    report = {
+        "json_bbox": [553.0, 423.0, 724.0, 539.0],
+        "optimized_corrected_pose_world": {
+            "translation_world": [0.0, 0.0, 8.0],
+            "rotation_matrix": np.eye(3).tolist(),
+            "scale": [1.0, 1.0, 1.0],
+        },
+        "partial_visibility": {
+            "is_truncated": True,
+            "truncation_sides": ["bottom"],
+            "truncation_severity": "light",
+            "low_observability": False,
+        },
+        "metrics": {
+            "score": 1.0,
+            "mask_iou": 0.8,
+            "bbox_iou": 0.2525402198,
+            "visible_bbox_iou": 0.7641256464,
+            "truncated_visual_quality_gate": 0.25,
+            "truncated_visual_quality_gate_floor": 0.25,
+            "truncated_visual_quality_reason": "visible_bbox,visible_center,border_overflow",
+            "truncated_visual_overflow_factor": 0.003785,
+            "truncated_visual_overflow_loss": 5.5767,
+        },
+    }
+
+    record = executor._edge_pose_record_from_report(
+        obj_id="obj_000001",
+        frame_id=16,
+        report=report,
+        report_path=tmp_path / "optimization_report.json",
+        result_dir=tmp_path,
+        task_path=tmp_path / "task.json",
+        timestamp_sec=0.5,
+        run_info={"returncode": 0},
+    )
+
+    assert record["partial_visibility"]["truncation_sides"] == ["bottom"]
+    assert record["metrics"]["visible_bbox_iou"] == pytest.approx(0.7641256464)
+    assert record["metrics"]["truncated_visual_overflow_loss"] == pytest.approx(5.5767)
+
+
 def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records() -> None:
     fail_fast = {
         "skip_object": True,
@@ -1349,7 +1450,7 @@ def test_truncated_fail_fast_keeps_all_frames_object_with_accepted_frame_records
     assert summary["accepted_frame_count_before_failure"] == 2
 
 
-def test_truncated_fail_fast_all_frames_can_continue_after_failed_truncated_frame() -> None:
+def test_truncated_fail_fast_all_frames_skips_followups_after_failed_truncated_frame() -> None:
     fail_fast = {
         "skip_object": True,
         "reason": "optimizer_failed",
@@ -1371,9 +1472,9 @@ def test_truncated_fail_fast_all_frames_can_continue_after_failed_truncated_fram
     )
 
     assert summary["skip_entire_object"] is False
-    assert summary["remaining_frame_count"] == 0
-    assert "frame_000025" not in frame_records
-    assert "frame_000026" not in frame_records
+    assert summary["remaining_frame_count"] == 2
+    assert frame_records["frame_000025"]["status"] == "skipped"
+    assert frame_records["frame_000026"]["failed_frame_id"] == 24
 
 
 def test_usd_visibility_segments_split_contiguous_trajectory_frames() -> None:
@@ -1382,6 +1483,30 @@ def test_usd_visibility_segments_split_contiguous_trajectory_frames() -> None:
         (10, 11),
         (15, 15),
     ]
+
+
+def test_usd_visibility_prefers_actual_trajectory_frames_over_object_index() -> None:
+    frames = [{"frame_id": frame_id, "centroid_world": [0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]} for frame_id in range(6, 50)]
+
+    visibility_frames = ProjectExecutor._usd_visibility_frames_for_object(
+        "obj_000007",
+        frames,
+        {"obj_000007": list(range(6, 51))},
+    )
+
+    assert visibility_frames[0] == 6
+    assert visibility_frames[-1] == 49
+    assert 50 not in visibility_frames
+
+
+def test_usd_visibility_falls_back_to_object_index_without_trajectory_frames() -> None:
+    visibility_frames = ProjectExecutor._usd_visibility_frames_for_object(
+        "obj_000007",
+        [],
+        {"obj_000007": [6, 7, 8]},
+    )
+
+    assert visibility_frames == [6, 7, 8]
 
 
 def test_apply_usd_visibility_samples_shows_track_from_first_frame() -> None:
@@ -1614,7 +1739,7 @@ def test_usd_export_starts_at_first_object_pose_frame(tmp_path: Path) -> None:
     assert obj.ComputeVisibility(Usd.TimeCode(stage.GetStartTimeCode())) == UsdGeom.Tokens.inherited
 
 
-def test_usd_export_uses_object_visibility_frames_when_available(tmp_path: Path) -> None:
+def test_usd_export_limits_visibility_to_actual_trajectory_frames(tmp_path: Path) -> None:
     pytest.importorskip("pxr", reason="usd-core required for USD timeline checks")
     from pxr import Usd, UsdGeom
 
@@ -1659,11 +1784,12 @@ def test_usd_export_uses_object_visibility_frames_when_available(tmp_path: Path)
     stage = Usd.Stage.Open(str(usdc_path))
     obj = UsdGeom.Imageable(stage.GetPrimAtPath("/World/Objects/obj_000009"))
 
-    assert stage.GetStartTimeCode() == 1.0
-    assert stage.GetEndTimeCode() == 32.0
-    assert obj.GetVisibilityAttr().GetTimeSamples() == [1.0]
-    assert obj.ComputeVisibility(Usd.TimeCode(1.0)) == UsdGeom.Tokens.inherited
-    assert obj.ComputeVisibility(Usd.TimeCode(32.0)) == UsdGeom.Tokens.inherited
+    assert stage.GetStartTimeCode() == 19.0
+    assert stage.GetEndTimeCode() == 23.0
+    assert obj.GetVisibilityAttr().GetTimeSamples() == [19.0, 20.0, 23.0]
+    assert obj.ComputeVisibility(Usd.TimeCode(19.0)) == UsdGeom.Tokens.inherited
+    assert obj.ComputeVisibility(Usd.TimeCode(21.0)) == UsdGeom.Tokens.invisible
+    assert obj.ComputeVisibility(Usd.TimeCode(23.0)) == UsdGeom.Tokens.inherited
 
 
 def test_temporal_candidate_trajectory_prefers_smooth_pose_over_visual_outlier() -> None:
@@ -2264,6 +2390,128 @@ def test_truncated_final_selection_prefers_anchor_consistent_temporal_candidate(
     assert selected is temporal_prior
     assert flipped_coarse["truncated_anchor_gate_passed"] is False
     assert "yaw_jump" in flipped_coarse["truncated_anchor_gate_reasons"]
+
+
+def test_catastrophic_temporal_jump_requires_orientation_and_scale() -> None:
+    args = SimpleNamespace(
+        catastrophic_temporal_jump_enabled=True,
+        catastrophic_temporal_yaw_deg=60.0,
+        catastrophic_temporal_rotation_deg=75.0,
+        catastrophic_temporal_scale_ratio=1.35,
+    )
+
+    both = candidate_has_catastrophic_temporal_jump(
+        {
+            "yaw_jump_from_anchor_deg": 106.0,
+            "delta_rotation_deg": 106.0,
+            "scale_ratio_from_anchor": 2.02,
+            "temporal_loss": 189.0,
+            "track_scale_prior_score": 1.0e-20,
+        },
+        args,
+    )
+    yaw_only = candidate_has_catastrophic_temporal_jump(
+        {
+            "yaw_jump_from_anchor_deg": 106.0,
+            "delta_rotation_deg": 106.0,
+            "scale_ratio_from_anchor": 1.02,
+            "temporal_loss": 189.0,
+        },
+        args,
+    )
+    scale_only = candidate_has_catastrophic_temporal_jump(
+        {
+            "yaw_jump_from_anchor_deg": 5.0,
+            "delta_rotation_deg": 5.0,
+            "scale_ratio_from_anchor": 2.02,
+            "temporal_loss": 189.0,
+        },
+        args,
+    )
+
+    assert both["catastrophic_temporal_jump"] is True
+    assert set(both["catastrophic_temporal_jump_reasons"]) >= {"orientation_jump", "scale_jump"}
+    assert yaw_only["catastrophic_temporal_jump"] is False
+    assert scale_only["catastrophic_temporal_jump"] is False
+
+
+def test_truncated_final_selection_avoids_catastrophic_candidate_when_single_jump_alternative_exists() -> None:
+    args = SimpleNamespace(
+        final_ground_constrained_selection_enabled=True,
+        final_ground_select_mean_max_m=0.09,
+        final_ground_select_max_max_m=0.16,
+        truncated_final_visual_selection_enabled=True,
+        truncated_final_visual_min_bbox_iou=0.88,
+        truncated_final_visual_min_quality_gate=0.80,
+        truncated_final_visual_mask_weight=1.0,
+        truncated_final_visual_contour_weight=0.35,
+        truncated_final_visual_bbox_weight=0.08,
+        severe_truncated_final_visual_bbox_weight=0.02,
+        truncated_final_visual_quality_weight=0.05,
+        truncated_final_visual_ground_mean_weight=0.25,
+        truncated_final_visual_ground_max_weight=0.10,
+        truncated_final_visual_score_weight=0.03,
+        truncated_final_visual_temporal_weight=0.18,
+        truncated_final_visual_temporal_loss_weight=0.02,
+        truncated_final_visual_heading_weight=0.02,
+        truncated_final_visual_prefer_temporal_seed_bonus=0.04,
+        truncated_final_visual_scale_jump_weight=0.20,
+        truncated_final_visual_anchor_yaw_weight=0.01,
+        truncated_final_visual_front_flip_penalty=0.80,
+        truncated_anchor_gate_enabled=True,
+        truncated_anchor_gate_yaw_jump_deg=12.0,
+        truncated_anchor_gate_scale_ratio=1.08,
+        truncated_anchor_gate_temporal_loss_max=2.0,
+        low_observability_anchor_gate_yaw_jump_deg=8.0,
+        low_observability_anchor_gate_scale_ratio=1.04,
+        low_observability_anchor_gate_temporal_loss_max=1.0,
+        catastrophic_temporal_jump_enabled=True,
+        catastrophic_temporal_yaw_deg=60.0,
+        catastrophic_temporal_rotation_deg=75.0,
+        catastrophic_temporal_scale_ratio=1.35,
+    )
+    catastrophic = {
+        "score": 2.5,
+        "visible_mask_iou": 0.90,
+        "visible_bbox_iou": 0.99,
+        "visible_contour_score": 0.5,
+        "visible_contour_mean_distance_px": 2.0,
+        "truncated_visual_quality_gate": 1.0,
+        "ground_contact_mean_abs_m": 0.03,
+        "ground_contact_max_abs_m": 0.05,
+        "temporal_score": 0.0,
+        "temporal_loss": 189.0,
+        "heading_prior_angle_error_deg": 40.0,
+        "scale_ratio_from_anchor": 2.02,
+        "yaw_jump_from_anchor_deg": 106.0,
+        "initializer_metadata": {"source": "coarse_search"},
+    }
+    yaw_only = {
+        "score": 1.0,
+        "visible_mask_iou": 0.96,
+        "visible_bbox_iou": 0.53,
+        "visible_contour_score": 0.75,
+        "visible_contour_mean_distance_px": 1.0,
+        "truncated_visual_quality_gate": 0.25,
+        "ground_contact_mean_abs_m": 0.03,
+        "ground_contact_max_abs_m": 0.05,
+        "temporal_score": 0.5,
+        "temporal_loss": 50.0,
+        "heading_prior_angle_error_deg": 40.0,
+        "scale_ratio_from_anchor": 1.01,
+        "yaw_jump_from_anchor_deg": 75.0,
+        "initializer_metadata": {"source": "temporal_prior"},
+    }
+
+    selected = choose_best_refined_result(
+        [catastrophic, yaw_only],
+        args,
+        {"is_truncated": True, "truncation_sides": ["top"], "truncation_severity": "light"},
+    )
+
+    assert catastrophic["catastrophic_temporal_jump"] is True
+    assert yaw_only["catastrophic_temporal_jump"] is False
+    assert selected is yaw_only
 
 
 def test_truncated_final_selection_does_not_discard_strong_temporal_for_slight_ground_excess() -> None:
@@ -2973,6 +3221,104 @@ def test_all_frames_candidate_pass_keeps_recent_prior_after_bbox_motion() -> Non
     assert prior["frame_id"] == 22
 
 
+def test_all_frames_temporal_prior_falls_back_to_last_accepted_pose() -> None:
+    candidate_prior = _pose_record(frame_id=7, x=7.0)
+    previous_accepted = _pose_record(frame_id=8, x=8.0)
+
+    assert (
+        ProjectExecutor._pose_temporal_prior_record(
+            candidate_prior,
+            previous_accepted,
+            all_frames_mode=True,
+        )
+        is candidate_prior
+    )
+    assert (
+        ProjectExecutor._pose_temporal_prior_record(
+            None,
+            previous_accepted,
+            all_frames_mode=True,
+        )
+        is previous_accepted
+    )
+    assert (
+        ProjectExecutor._pose_temporal_prior_record(
+            candidate_prior,
+            previous_accepted,
+            all_frames_mode=False,
+        )
+        is previous_accepted
+    )
+
+
+def test_all_frames_temporal_prior_selection_falls_back_when_candidate_stale() -> None:
+    candidate_prior = _pose_record(frame_id=3, x=3.0)
+    candidate_prior["metrics"]["detection_bbox"] = [100.0, 100.0, 200.0, 180.0]
+    previous_accepted = _pose_record(frame_id=5, x=5.0, yaw_deg=-5.0)
+    previous_accepted["metrics"]["detection_bbox"] = [116.0, 100.0, 216.0, 180.0]
+    previous_anchor = _pose_record(frame_id=4, x=4.0, yaw_deg=-4.0)
+    previous_anchor["metrics"]["detection_bbox"] = [110.0, 100.0, 210.0, 180.0]
+
+    payload, selection = ProjectExecutor._edge_pose_temporal_prior_payload_for_task(
+        previous_candidate_prior=candidate_prior,
+        previous_accepted=previous_accepted,
+        previous_anchor=previous_anchor,
+        all_frames_mode=True,
+        current_frame_id=6,
+        current_bbox=[126.0, 100.0, 226.0, 180.0],
+    )
+
+    assert payload is not None
+    assert payload["frame_id"] == 5
+    assert payload["source"] == "previous_accepted_pose_in_memory"
+    assert selection["selected_source"] == "previous_accepted_continuity_seed"
+    assert selection["fallback_used"] is True
+    assert selection["rejected_candidates"][0]["source"] == "previous_candidate_prior"
+    assert selection["rejected_candidates"][0]["reason"] == "stale_for_bbox"
+
+
+def test_all_frames_temporal_prior_selection_falls_back_to_anchor_when_accepted_stale() -> None:
+    candidate_prior = _pose_record(frame_id=3, x=3.0)
+    candidate_prior["metrics"]["detection_bbox"] = [100.0, 100.0, 200.0, 180.0]
+    previous_accepted = _pose_record(frame_id=4, x=4.0, yaw_deg=-5.0)
+    previous_accepted["metrics"]["detection_bbox"] = [96.0, 100.0, 196.0, 180.0]
+    previous_anchor = _pose_record(frame_id=5, x=5.0, yaw_deg=-4.0)
+    previous_anchor["metrics"]["detection_bbox"] = [116.0, 100.0, 216.0, 180.0]
+
+    payload, selection = ProjectExecutor._edge_pose_temporal_prior_payload_for_task(
+        previous_candidate_prior=candidate_prior,
+        previous_accepted=previous_accepted,
+        previous_anchor=previous_anchor,
+        all_frames_mode=True,
+        current_frame_id=6,
+        current_bbox=[126.0, 100.0, 226.0, 180.0],
+    )
+
+    assert payload is not None
+    assert payload["frame_id"] == 5
+    assert payload["source"] == "trusted_temporal_anchor_pose"
+    assert selection["selected_source"] == "trusted_temporal_anchor_pose"
+    assert selection["fallback_used"] is True
+
+
+def test_target_window_temporal_prior_selection_prefers_previous_accepted() -> None:
+    candidate_prior = _pose_record(frame_id=7, x=7.0)
+    previous_accepted = _pose_record(frame_id=8, x=8.0)
+
+    payload, selection = ProjectExecutor._edge_pose_temporal_prior_payload_for_task(
+        previous_candidate_prior=candidate_prior,
+        previous_accepted=previous_accepted,
+        previous_anchor=None,
+        all_frames_mode=False,
+        current_frame_id=9,
+        current_bbox=None,
+    )
+
+    assert payload is not None
+    assert payload["frame_id"] == 8
+    assert selection["selected_source"] == "previous_accepted_continuity_seed"
+
+
 def test_edge_pose_acceptance_rejects_hard_temporal_visual_penalty() -> None:
     report = {
         "json_bbox": [10.0, 10.0, 110.0, 110.0],
@@ -2994,6 +3340,29 @@ def test_edge_pose_acceptance_rejects_hard_temporal_visual_penalty() -> None:
 
     assert decision["accepted"] is False
     assert decision["reason"] == "temporal_anchor_visual_gate_rejected:visual_degradation_temporal_loss"
+
+
+def test_edge_pose_acceptance_rejects_catastrophic_temporal_jump() -> None:
+    report = {
+        "json_bbox": [10.0, 10.0, 110.0, 110.0],
+        "optimized_corrected_pose_world": {
+            "translation_world": [0.0, 0.0, 8.0],
+            "rotation_matrix": np.eye(3).tolist(),
+            "scale": [1.3, 1.3, 1.3],
+        },
+        "metrics": {
+            "mask_iou": 0.80,
+            "bbox_iou": 0.78,
+            "bbox_center_error_px": 12.0,
+            "catastrophic_temporal_jump": True,
+            "catastrophic_temporal_jump_reasons": ["orientation_jump", "scale_jump"],
+        },
+    }
+
+    decision = ProjectExecutor._pose_optimizer_acceptance(report)
+
+    assert decision["accepted"] is False
+    assert decision["reason"] == "catastrophic_temporal_jump:orientation_jump,scale_jump"
 
 
 def test_all_frames_scale_prior_uses_previous_accepted_records_only() -> None:
